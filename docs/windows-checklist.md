@@ -139,6 +139,14 @@ relay/logs.sh             # 看日志，Ctrl+C 退出
 - [ ] 120 fps 档位：采集 fps 能到 120 说明 DXGI 帧率跟得上；否则退回 60。
 - [ ] 观众端 4K60 HEVC 10-bit 的 d3d11va 解码在 RTX 30/40、RX 6000+、Intel Arc 上没问题；老机器降到 1440p。
 
+## 10. 只有在分享「旋转过的显示器」时才需要看
+
+shader 里 90° 与 270° 的映射（`desk_to_src`）互为逆运算，DXGI 文档没写清 `DXGI_MODE_ROTATION_ROTATE90` 到底对应哪一个，只能实测：
+
+- [ ] 把某块屏在 Windows 显示设置里转成「横向（翻转）」以外的 90°/270°，用 `scripts\dump-check.cmd` 抓一帧看 `frame1-sdr-tonemapped.png`。
+- [ ] 画面方向正确即可；若上下颠倒 90°（即转了 180° 的样子），把 `shared/Capture/ConvertShaderSource.cs` 里 `desk_to_src` 的 `rotation == 1` 与 `rotation == 3` 两行对调。
+- 180° 那条已确认正确；不旋转的显示器走 `FlagExact` 路径，与此无关。
+
 ## 10. 出问题时看哪里
 
 - 日志：`%APPDATA%\HdrCast\logs\`（sender / receiver / capture / ffmpeg / mpv 分文件，按天）。

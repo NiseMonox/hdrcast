@@ -93,30 +93,24 @@ namespace HdrCast.Sender.Capture
                 ? FrameSink.CreateFile(_args.DumpPath, 4)
                 : FrameSink.CreatePipe(_args.VideoPipe, 32 << 20, 4);
 
-            // Audio first: the caller (and ffmpeg) can only see that we are ready once BOTH pipes exist, and
-            // the video pipe below blocks until ffmpeg connects — creating the audio pipe after that would
-            // deadlock the two sides against each other.
+            // The audio PIPE has to exist before the video pipe blocks for its client: ffmpeg opens both
+            // inputs, so waiting for ffmpeg first would deadlock the two sides. Recording itself starts later,
+            // once the consumer is there, so the two streams share a start time.
             if (_args.Audio && _args.DumpPath == null)
             {
-                // Start the clock before the audio so the alignment starts from zero (the frame pacer starts
-                // from whatever the clock reads a moment later, which it handles).
-                _clock.Start();
                 try
                 {
                     _audio = new AudioCapture(_args.AudioPipe, _args.AudioDevice, _clock);
-                    _audio.Start();
+                    _audio.CreatePipe();
                 }
                 catch (Exception ex)
                 {
-                    // AudioCapture.Start already degrades to silence internally; reaching here means even the
-                    // pipe could not be created, and ffmpeg is waiting for that pipe — so this is fatal.
+                    // ffmpeg is waiting for this pipe, so failing to create it is fatal.
                     Log.Error("capture: cannot create the audio pipe: " + ex.Message);
                     _audio?.Dispose();
                     _audio = null;
                     return ExitCodes.PipeBroken;
                 }
-                if (_audio.Degraded)
-                    Log.Warn("capture: desktop audio is unavailable; the stream carries silence");
             }
 
             if (_sink.IsPipe)
@@ -133,6 +127,15 @@ namespace HdrCast.Sender.Capture
                 Log.Info("capture: video pipe connected");
             }
             _sink.Start();
+
+            if (_audio != null)
+            {
+                // From here the audio clock and the frame pacer measure the same wall clock.
+                _clock.Start();
+                _audio.BeginCapture();
+                if (_audio.Degraded)
+                    Log.Warn("capture: desktop audio is unavailable; the stream carries silence");
+            }
 
             return Loop(format, dstW, dstH);
         }

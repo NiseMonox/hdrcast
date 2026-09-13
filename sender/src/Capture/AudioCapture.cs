@@ -70,12 +70,32 @@ namespace HdrCast.Sender.Capture
         /// </summary>
         public void Start()
         {
+            CreatePipe();
+            BeginCapture();
+        }
+
+        /// <summary>
+        /// Creates the pipe and its writer thread. Done early, before the video pipe waits for ffmpeg: ffmpeg
+        /// opens both inputs, so both pipes have to exist or the two sides wait for each other forever.
+        /// </summary>
+        public void CreatePipe()
+        {
+            if (_pipe != null) return;
             _pipe = new NamedPipeServerStream(_pipeName, PipeDirection.Out, 1, PipeTransmissionMode.Byte,
                                               PipeOptions.Asynchronous, 0, 8 << 20);
             _running = true;
             _writerThread = new Thread(WriterLoop) { IsBackground = true, Name = "audio-pipe-writer" };
             _writerThread.Start();
+        }
 
+        /// <summary>
+        /// Opens the audio endpoint and starts recording. Called once the video consumer is connected so the
+        /// audio timeline starts with the video one; starting it earlier would leave the first seconds of audio
+        /// sitting in the ring buffer and the two streams offset by the connect delay.
+        /// </summary>
+        public void BeginCapture()
+        {
+            if (_capture != null || Degraded) return;
             try
             {
                 _device = ResolveDevice(_deviceId);
