@@ -1,0 +1,41 @@
+<Project>
+  <!--
+    Merges SharpDX and NAudio into HdrCastSender.exe so the sender ships as a single file.
+
+    This replaces the default target from ILRepack.Lib.MSBuild.Task (the package imports this file and then
+    disables its own targets). The default one takes its inputs from bin\ and afterwards deletes the dependency
+    DLLs from there; MSBuild's CopyComplete marker then believes bin\ is up to date, so the NEXT incremental
+    build does not restore them and ILRepack fails with "Could not find file ... NAudio.Wasapi.dll".
+
+    Two changes fix that: the inputs come from the NuGet package paths (@ReferenceCopyLocalPaths) so the state
+    of bin\ does not matter, and the CopyComplete marker is deleted along with the DLLs so a later build starts
+    from a clean slate. TargetPlatformDirectory has to point at the net48 reference assemblies because the task
+    otherwise looks for the framework inside the .NET Core shared directory and fails on Linux.
+  -->
+  <PropertyGroup>
+    <ILRepackReferenceAssemblies>$(NuGetPackageRoot)microsoft.netframework.referenceassemblies.net48/1.0.3/build/.NETFramework/v4.8</ILRepackReferenceAssemblies>
+  </PropertyGroup>
+
+  <Target Name="HdrCastILRepack" AfterTargets="Build"
+          Condition="'$(Configuration)' == 'Release' and '$(HdrCastMergeAssemblies)' != 'false'">
+    <ItemGroup>
+      <HdrCastMergeInput Include="$(OutputPath)$(TargetName)$(TargetExt)" />
+      <HdrCastMergeInput Include="@(ReferenceCopyLocalPaths)" Condition="'%(Extension)' == '.dll'" />
+    </ItemGroup>
+
+    <Message Importance="normal" Text="ILRepack: merging @(HdrCastMergeInput->Count()) assemblies into $(TargetName)$(TargetExt)" />
+    <ILRepack Parallel="true"
+              DebugInfo="false"
+              AllowDuplicateResources="false"
+              InputAssemblies="@(HdrCastMergeInput)"
+              TargetKind="SameAsPrimaryAssembly"
+              LibraryPath="$(OutputPath)"
+              TargetPlatformDirectory="$(ILRepackReferenceAssemblies)"
+              KeyFile="$(KeyFile)"
+              OutputFile="$(OutputPath)$(TargetName)$(TargetExt)" />
+
+    <!-- The merged exe no longer needs the loose DLLs; clearing the marker keeps rebuilds working. -->
+    <Delete Files="@(ReferenceCopyLocalPaths->'$(OutDir)%(DestinationSubDirectory)%(Filename)%(Extension)')" />
+    <Delete Files="$(IntermediateOutputPath)$(MSBuildProjectFile).CopyComplete" />
+  </Target>
+</Project>

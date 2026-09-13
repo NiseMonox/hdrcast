@@ -89,6 +89,7 @@ Linux（本机：Debian 13 + .NET 10 SDK）或 Windows 都可以；Linux 上用 
 ```bash
 ./build.sh              # dotnet build 两个 exe (Release) → dotnet test → 打包 dist/HdrCast-0.1.0/
 ./build.sh --no-test    # 跳过测试
+./build.sh --e2e        # 额外跑 docker 中继回环：用代码生成的 URL 与 ffmpeg 参数推到 MediaMTX 再读回校验
 ```
 
 产物 `dist/HdrCast-<版本>/`：两个 exe（及可能的 DLL）、`relay/`（不含密码文件）、`scripts/`、`docs/`、README、LICENSE、空的 `tools/`。把整个目录复制到 Windows，ffmpeg.exe / mpv.exe 放进 `tools\` 即可。

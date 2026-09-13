@@ -6,6 +6,7 @@
 # the exit code is non-zero if anything failed.
 #   ./build.sh            full run
 #   ./build.sh --no-test  skip dotnet test
+#   ./build.sh --e2e      also run the docker-backed relay round-trip test (needs docker + a free UDP 18899)
 #   ./build.sh --clean    remove dist/ first
 set -uo pipefail
 export DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1
@@ -17,6 +18,7 @@ RUN_TESTS=1
 for a in "$@"; do
   case "$a" in
     --no-test) RUN_TESTS=0 ;;
+    --e2e) export HDRCAST_E2E=1 ;;
     --clean) rm -rf "$ROOT/dist" ;;
     -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $a" >&2; exit 2 ;;
@@ -51,6 +53,7 @@ build_proj receiver "$ROOT/receiver/HdrCast.Receiver.csproj" && RECEIVER_OK=1
 
 if [ "$RUN_TESTS" = 1 ]; then
   step "test (tests/HdrCast.Tests.csproj, net10.0)"
+  [ "${HDRCAST_E2E:-0}" = "1" ] && echo "  (including the docker relay round-trip)"
   if dotnet test "$ROOT/tests/HdrCast.Tests.csproj" -c Release 2>&1 | tee "$LOGDIR/test.log" | grep -E 'Passed!|Failed!|error|Total tests|Passed:|Failed:|Skipped:|Duration' | tail -n 12; then :; fi
   if ! grep -qE 'Passed!|Test Run Successful|Passed: *[0-9]+, *Failed: *0' "$LOGDIR/test.log" || grep -qE 'Failed!|error [A-Z]+[0-9]+' "$LOGDIR/test.log"; then
     echo "!! tests FAILED (see $LOGDIR/test.log)"; FAILED+=("tests")
