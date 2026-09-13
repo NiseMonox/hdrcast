@@ -34,25 +34,31 @@ displays  list-outputs 的输出（见下一步）
 在 `HdrCast\` 打开终端运行。预期每个显示器一行，例如：
 
 ```
-0  \\.\DISPLAY1  AW3225QF   3840x2160 @ 240 Hz  HDR: yes  MaxLuminance ~1000 nit
-1  \\.\DISPLAY2  ...        2560x1440 @ 165 Hz  HDR: no
+idx  device         name                      size        pos          hz     hdr  colorspace  bits  maxnit  maxffl  minnit  adapter
+0    \\.\DISPLAY1   AW3225QF                  3840x2160   0,0          239.76 on   12          10    1000    400     0.0001  NVIDIA GeForce RTX 4090
+1    \\.\DISPLAY2   AW2523HF                  1920x1080   3840,0       360    off  8           8     0       0       0       NVIDIA GeForce RTX 4090
 ```
 
-- [ ] HDR 显示器的 `HDR: yes`（判定依据是 DXGI `ColorSpace == RGB_FULL_G2084_NONE_P2020`，即 Windows HDR 已开）。关掉 Windows HDR 再跑一次应变成 `no`。
+- [ ] HDR 显示器那一行 `hdr = on`（`colorspace = 12` 即 DXGI `RGB_FULL_G2084_NONE_P2020`）。关掉 Windows HDR 再跑一次应变成 `off`。
 - [ ] `--json` 也能输出同样内容（GUI 用的就是它）。
 - [ ] 索引是跨显卡的全局编号，记住要分享的那个索引（下文用 0）。
 
 ## 3. `HdrCastSender.exe capture --selftest`
 
-不需要显示器，只跑 compute shader。预期：编译成功，对合成灰阶打印转换结果并退出码 0。核对几个关键值（与 `docs/design.md` §2.3 的 zscale 实测一致，允许 ±2）：
+不需要显示器，只跑 compute shader，把 GPU 的结果和 C# 参考实现逐个比对，末尾打印 PASS / FAIL。
+预期退出码 0、每行 `ok`。参考值（sdr-white 80，limited range 10 bit，程序内允许 ±2）：
 
-| scRGB 输入（sdr-white 80） | 亮度 | 期望 Y10 |
+| scRGB 输入 | 亮度 | 期望 Y10 |
 |---|---|---|
 | 0.0 | 0 nit | 64 |
-| 1.0 | 80 nit | ≈ 491 |
-| 2.5 | 200 nit | ≈ 573 |
-| 12.5 | 1000 nit | ≈ 769 |
-| 125 | 10000 nit | 940 |
+| 0.5 | 40 nit | 431 |
+| 1.0 | 80 nit | 490 |
+| 2.5 | 200 nit | 571 |
+| 12.5 | 1000 nit | 723 |
+| 125 | 10000 nit | 940（限幅） |
+
+> 这些是 ST.2084 的教科书值。本机 ffmpeg 的 zscale（npl=80）给的是 491 / 573 / 943，差 ≤3 码值
+> —— zimg 的取整方式与限幅上限略有不同，不影响观感；selftest 比的是 GPU 与 C# 是否一致。
 
 - [ ] 中性灰的 Cb/Cr ≈ 512。
 - [ ] 报错 `d3dcompiler_47` 找不到 → 这台 Windows 缺 DirectX 运行时（Win10 1903+ 自带，理论上不会发生）。
@@ -62,7 +68,7 @@ displays  list-outputs 的输出（见下一步）
 先用记事本把脚本开头的 `OUTPUT` 改成第 2 步的索引，`SIZE` 改成该显示器的原生分辨率（如 `3840x2160`）。运行后在 `scripts\dump\` 生成：
 
 - [ ] `frames.p010` 大小 = W×H×3 字节 × 帧数（4K：24 883 200 B/帧 × 30 fps × 3 s ≈ 2.2 GB；嫌大就先用 `SIZE=1920x1080` 测）。
-- [ ] 终端打印 `YMIN/YAVG/YMAX`：普通桌面（白色窗口）`YMAX ≈ 491`，屏幕上有 HDR 内容（HDR 视频/游戏）时才会 > 500；`YMIN` 接近 64。若 `YMAX` 总是 940 或全部相同 → 转换错了。
+- [ ] 终端打印 `YMIN/YAVG/YMAX`：普通桌面（白色窗口）`YMAX ≈ 490`，屏幕上有 HDR 内容（HDR 视频/游戏）时才会 > 500；`YMIN` 接近 64。若 `YMAX` 总是 940 或全部相同 → 转换错了。
 - [ ] `frame1-pq-raw.png`：整体发灰、发平——**正常**，这是 PQ 编码直接当 sRGB 看的效果，证明数据不是黑屏或乱码。
 - [ ] `frame1-sdr-tonemapped.png`：看起来就是你的桌面，颜色不偏（红绿蓝方向正确，肤色正常），鼠标指针在正确位置。若色相错乱 → BT.709→BT.2020 矩阵或 UV 顺序有误；若整体过暗 → `sdr-white` 与实际不符（Windows 的 SDR 亮度滑块不影响这里，规范值就是 80）。
 - [ ] 把 `FORMAT` 改成 `nv12` 再跑一次（可先关闭 Windows HDR），`frame1-sdr.png` 应同样正确。
