@@ -1,0 +1,53 @@
+# MediaMTX 1.21.0 - HdrCast relay template.
+# relay/setup.sh replaces the double-underscore placeholders below and writes relay/mediamtx.yml (git-ignored, holds secrets).
+# Validated with `mediamtx --validate-conf` and run end-to-end with 50/100 Mbps HEVC Main10 (see docs/research/srt-mediamtx.research.json).
+logLevel: info
+readTimeout: 10s
+writeTimeout: 10s
+writeQueueSize: 2048            # default 512; larger avoids "reader is too slow" drops at 50-100 Mbps
+udpMaxPayloadSize: 1452         # -> SRT payload 1316 = 7 x 188 TS packets
+udpReadBufferSize: 4000000      # MUST be <= host net.core.rmem_max (sysctl -w net.core.rmem_max=16777216), otherwise MediaMTX fails to start the SRT listener
+
+# Disable what you do not use (fewer open ports).
+rtsp: no
+rtmp: no
+webrtc: no
+moq: no
+playback: no
+
+api: yes
+apiAddress: :9997
+
+hls: yes                        # browser SDR fallback; HLS supports AV1/VP9/H265/H264 + Opus/FLAC/AAC
+hlsAddress: :8888
+hlsVariant: lowLatency          # fMP4 segments (needed for HEVC); mpegts variant would not carry HEVC 10-bit for browsers
+hlsSegmentDuration: 1s
+hlsPartDuration: 200ms
+
+srt: yes
+srtAddress: :8890
+
+authMethod: internal
+authInternalUsers:
+  - user: sender                # publisher credentials (streamid=publish:screen:sender:<pass>)
+    pass: __SENDER_PW__
+    permissions:
+      - action: publish
+        path: screen
+  - user: viewer                # reader credentials (streamid=read:screen:viewer:<pass>) and HLS basic auth
+    pass: __VIEWER_PW__
+    permissions:
+      - action: read
+        path: screen
+  - user: any                   # API only from localhost / docker bridge (localhost clients appear as 172.17.0.1 through docker-proxy)
+    pass:
+    ips: ["127.0.0.1", "::1", "172.16.0.0/12"]
+    permissions:
+      - action: api
+
+paths:
+  screen:
+    source: publisher
+    overridePublisher: yes
+    srtPublishPassphrase: __PUBLISH_PASSPHRASE__   # SRT AES key for the sender leg (10-79 chars)
+    srtReadPassphrase: __READ_PASSPHRASE__         # SRT AES key for the receiver leg (10-79 chars, may differ)

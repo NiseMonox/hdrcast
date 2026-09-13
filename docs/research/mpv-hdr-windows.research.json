@@ -1,0 +1,251 @@
+{
+ "topic": "mpv-hdr-windows",
+ "summary": "Scope: mpv 0.40.0 (2025-03-25) plus what changed in 0.41.0 (2025-12-21)/master, because the Windows nightlies (shinchiro / zhongfly) that ship libsrt are git-master builds.\n\nHDR passthrough on Windows. The only VO that does HDR passthrough is --vo=gpu-next; the switch is --target-colorspace-hint. Use --gpu-api=d3d11. On d3d11 the hint makes libplacebo call IDXGISwapChain3::SetColorSpace1(RGB_FULL_G2084_NONE_P2020) with an R10G10B10A2_UNORM back buffer and IDXGISwapChain4::SetHDRMetaData(HDR10). In 0.40 the default is 'no'; 'auto' only hints when the DXGI output reports an HDR colorspace (i.e. Windows HDR is ON) and that probe exists ONLY for the d3d11 swapchain in 0.40 — on winvk 'auto' behaves like 'yes' (code assumes PQ). 0.41 flipped the default to 'auto', added winvk probing and --target-colorspace-hint-mode=target|source|source-dynamic (default 'target': mpv adapts content to the display's reported peak/primaries; 'source' = classic passthrough where DWM does the mapping and honours the Windows SDR-brightness slider). mpv never toggles Windows HDR mode itself: the user must enable it (Win+Alt+B); NVIDIA drivers >= R560 removed the old Vulkan auto-toggle hack, so posts about 'mpv turns HDR on' are obsolete. In 0.40 the hint's max_luma is replaced by --target-peak or the display's reported MaxLuminance, so libplacebo still tone-maps if content exceeds the display; --hdr-compute-peak therefore still matters even in passthrough. --icc-profile-auto (default no) must stay off (ICC takes precedence over the hint); --gamma-auto is deprecated macOS/vo=gpu only; --d3d11-output-csp/--d3d11-output-format are overridden by libplacebo once gpu-next runs. Windowed vs fullscreen: the picture is correct HDR in a window (DWM composites in HDR when Windows HDR is on), but Windows only forwards the HDR10 static metadata (MaxCLL/mastering) to the display when the swapchain covers the whole screen (open issue #10628, Nevcairiel: Windows limitation). For screen sharing that metadata is meaningless anyway. One recent report (#17570, master Jan 2026, RTX 4070) of a brief black flash on resize/fullscreen toggle with hint=yes; maintainer: DWM tone-map in windowed vs direct scan-out in fullscreen, nothing mpv can do. --wid: mpv creates its own WS_CHILD window inside the given HWND; mpv's fullscreen handling is disabled when parented, so the WinForms host must resize/border-less its own form. mpv.net (WinForms + libmpv + wid) users report correct HDR with d3d11+hint, so embedded HDR is expected to work (no primary proof). Vulkan (winvk) can do HDR10 swapchains too (VK_EXT_swapchain_colorspace + VK_EXT_hdr_metadata) but has open vendor bugs and no d3d11va zero-copy interop; nvdec interop only exists for OpenGL/Vulkan, so with d3d11 nvdec degrades to nvdec-copy. Recommendation: d3d11 + d3d11va.\n\nSDR display: keep --target-colorspace-hint=auto (no hint when Windows HDR is off) → mpv tone-maps with --tone-mapping (auto = spline on gpu-next; bt.2390 available), --target-peak auto = 203 nits, --hdr-compute-peak=auto/yes. Never force hint=yes on an SDR monitor with d3d11: Windows exposes an HDR swapchain anyway and DWM does poor tone-mapping (#15268, which is why 'auto' was added).\n\nlibsrt: shinchiro/mpv-winbuild-cmake configures FFmpeg with --enable-libsrt (static libsrt from Haivision/srt + OpenSSL); zhongfly/mpv-winbuild is a GitHub-Actions wrapper cloning that repo and lists libsrt; SourceForge mpv-player-windows is shinchiro's mirror (latest 2026-08-30). srt is in mpv's safe protocol list, so 'mpv srt://host:port?...' works. Options: the ?query is parsed by FFmpeg's libsrt.c (latency, rcvlatency, peerlatency, passphrase, pbkeylen, streamid, mode, tlpktdrop, pkt_size, maxbw, transtype, ...; times in MICROseconds). --stream-lavf-o=k=v,... sets the same AVOptions on the protocol before open (query wins); --demuxer-lavf-o goes to the demuxer (fflags=+nobuffer). Verified on the Linux box with an ffmpeg SRT listener → mpv caller loopback.\n\nLive buffering: cache=yes, cache-pause-initial=yes + cache-pause-wait=N (N = initial latency budget), cache-secs/demuxer-max-bytes cap read-ahead (100 Mbps = 12.5 MB/s), demuxer-hysteresis-secs=0, video-sync=audio (display-resample would speed-shift playback relative to the live source), interpolation=no, framedrop=vo, demuxer-lavf-probe-info=nostreams, demuxer-lavf-analyzeduration small, demuxer-lavf-o-add=fflags=+nobuffer (all from the builtin low-latency profile). mpv has no native live catch-up; use a Lua script or the host process nudging 'speed' from demuxer-cache-duration. Stats: 'i'/'I' overlay (pages 1-5; shows source and target primaries/transfer and HDR10 metadata), --osd-level=3 + --osd-status-msg, JSON IPC over \\\\.\\pipe\\name (manual names .NET NamedPipeClientStream); properties verified live: demuxer-cache-duration, demuxer-cache-time, demuxer-cache-state (node incl. raw-input-rate, fw-bytes, underrun), cache-buffering-state, paused-for-cache, cache-speed, frame-drop-count, decoder-frame-drop-count, hwdec-current, video-params/{gamma,primaries,pixelformat,max-luma}, video-target-params, estimated-vf-fps.\n\nhwdec: autoprobe order d3d11va → d3d11va-copy → dxva2-copy → nvdec → nvdec-copy → vulkan; hwdec_d3d11va works with gpu-next whenever the ra context is d3d11 (manual text 'requires --vo=gpu' is stale) and supports NV12/P010 → HEVC Main10 and AV1 10-bit (FFmpeg dxva2_av1.c, D3D11 pix fmts). --d3d11va-zero-copy is off by default (one GPU copy; safest).\n\nFallback 'ffmpeg -i srt://… -c copy -f mpegts - | mpv - --demuxer-lavf-format=mpegts' verified on Linux; mpv sets stdin to O_BINARY on Windows.\n\nlibmpv: mpv-dev-*.7z from both builds contain libmpv-2.dll (mpv.cmake -Dlibmpv=true); MPV_CLIENT_API_VERSION is 2.5 in both 0.40.0 and 0.41.0. Mpv.NET is deprecated on NuGet (1.1.1, 2019) and its repo now 404s; HanumanInstitute.LibMpv 0.10.1 (2026-05-29, net10/netstandard2.0, needs libmpv >= 0.40, MpvApi P/Invoke + MpvContext, Avalonia view only) is the maintained option; for WinForms the simplest robust route is mpv.exe --wid=<panel.Handle> + JSON IPC named pipe (same property API, no interop).",
+ "findings": [
+  {
+   "claim": "mpv 0.40.0 --target-colorspace-hint=<auto|yes|no>, default 'no'; 'auto' sets the target colorspace only if the display signals HDR support; requires --vo=gpu-next. HDR passthrough is a gpu-next-only feature (added in 0.35.0).",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/mpv-player/mpv/v0.40.0/DOCS/man/options.rst (target-colorspace-hint); https://raw.githubusercontent.com/mpv-player/mpv/v0.35.0/RELEASE_NOTES; local `mpv --list-options` (0.40.0)",
+   "design_impact": "critical"
+  },
+  {
+   "claim": "In 0.40 the 'auto' probe (ra_swapchain_fns.target_csp) is implemented only by the d3d11 swapchain (d3d11_target_color_space reads DXGI_OUTPUT_DESC1.ColorSpace/MaxLuminance/MinLuminance/primaries); vo_gpu_next assumes PQ when the probe is missing, so on winvk 'auto' behaves like 'yes'. Maintainer confirmation 2025-05-03: 'auto only works on d3d11'.",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/mpv-player/mpv/v0.40.0/video/out/d3d11/context.c (line 495 .target_csp) ; https://raw.githubusercontent.com/mpv-player/mpv/v0.40.0/video/out/vo_gpu_next.c lines 975-1009; https://github.com/mpv-player/mpv/issues/15268",
+   "design_impact": "critical"
+  },
+  {
+   "claim": "On d3d11 an HDR hint makes libplacebo (v7.349) set the swapchain to DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 with DXGI_FORMAT_R10G10B10A2_UNORM via IDXGISwapChain3::SetColorSpace1 and then IDXGISwapChain4::SetHDRMetaData(DXGI_HDR_METADATA_TYPE_HDR10) with primaries/min-max luma/MaxCLL/MaxFALL from the hint; SDR falls back to G22_P709 with rgb10_a2 (or rgba8 if disable_10bit_sdr).",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/haasn/libplacebo/v7.349.0/src/d3d11/swapchain.c lines 33-80, 280-315",
+   "design_impact": "important"
+  },
+  {
+   "claim": "In 0.40 vo_gpu_next overrides the hint's max_luma with --target-peak or the display-reported MaxLuminance (target_peak = opts->target_peak ? … : target_csp.hdr.max_luma) and applies --target-prim/--target-trc overrides to the hint; hence libplacebo still tone-maps content brighter than the display peak, and --hdr-compute-peak remains relevant during passthrough. Set --target-peak=<nits> manually if Windows reports a bogus peak (AMD default reported 1499 nits in issue #10628).",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/mpv-player/mpv/v0.40.0/video/out/vo_gpu_next.c lines 990-1006; https://github.com/mpv-player/mpv/issues/10628",
+   "design_impact": "important"
+  },
+  {
+   "claim": "mpv 0.41.0 (2025-12-21) changed --target-colorspace-hint default to 'auto', added winvk target-colorspace probing, and added --target-colorspace-hint-mode=target|source|source-dynamic (default 'target'; 'source' = traditional passthrough where the compositor maps and the Windows 'SDR content brightness' slider applies). PR #16512 merged 2025-07-11.",
+   "confidence": "verified",
+   "source": "https://api.github.com/repos/mpv-player/mpv/pulls/16512 (title/commits/merged_at); https://mpv.io/manual/master/ (master options.rst target-colorspace-hint / -mode); https://github.com/mpv-player/mpv/discussions/16814",
+   "design_impact": "important"
+  },
+  {
+   "claim": "mpv does not switch Windows HDR mode on/off; Windows HDR must be enabled by the user (Win+Alt+B). The earlier 'mpv auto-enables HDR' behaviour was an NVIDIA Vulkan driver hack removed in R560+ (552.93 changelog: 'Improve Vulkan HDR behavior on Windows to not override user's Windows HDR Display settings'); issue closed as not planned 2025-07-11 by kasper93.",
+   "confidence": "verified",
+   "source": "https://api.github.com/repos/mpv-player/mpv/issues/15163/comments",
+   "design_impact": "critical"
+  },
+  {
+   "claim": "Windowed HDR: the image is rendered/composited in HDR by DWM when Windows HDR is on, but HDR10 static metadata (MaxCLL/MaxFALL/mastering luminance) reaches the display only when the swapchain window covers the entire screen; this is a Windows limitation, not fixable in mpv (issue #10628 open since 2022, Nevcairiel 2022-09-25). Exclusive fullscreen (--d3d11-exclusive-fs=yes) made things worse on AMD in that thread.",
+   "confidence": "verified",
+   "source": "https://api.github.com/repos/mpv-player/mpv/issues/10628 and /comments",
+   "design_impact": "important"
+  },
+  {
+   "claim": "A 2026-03 report (master v0.41.0-60, RTX 4070, Win11 26200, mpv.net host) describes the whole screen going black briefly on resize/fullscreen toggle with target-colorspace-hint=yes on d3d11; maintainer reply: windowed = DWM tone-maps/clips, fullscreen = direct scan-out, 'nothing we can really do'. Closed without code change. Avoid frequent window resizes in the receiver GUI.",
+   "confidence": "verified",
+   "source": "https://api.github.com/repos/mpv-player/mpv/issues/17570/comments",
+   "design_impact": "minor"
+  },
+  {
+   "claim": "With --wid=<HWND>, mpv creates its own WS_CHILD|WS_VISIBLE window sized to the parent's client rect (CreateWindowExW with WS_EX_NOPARENTNOTIFY) and installs a hook to follow parent resizes; when parented, update_window_state()/snap logic return early, so mpv's own fullscreen toggle does nothing — the host form must go borderless/maximised itself. Manual: pass HWND as a non-negative integer.",
+   "confidence": "verified",
+   "source": "mpv video/out/w32_common.c (local copy: CreateWindowExW at ~line 2045, update_window_state ~line 1171); https://raw.githubusercontent.com/mpv-player/mpv/v0.40.0/DOCS/man/options.rst (--wid)",
+   "design_impact": "important"
+  },
+  {
+   "claim": "HDR passthrough works when mpv is embedded in a WinForms child window: mpv.net (WinForms host using libmpv + wid) users report correct HDR brightness with gpu-api=d3d11 + hint=yes; the swapchain colorspace is set per-swapchain and DWM composites child windows the same way. No primary-source proof for the child-window case specifically.",
+   "confidence": "likely",
+   "source": "https://github.com/mpv-player/mpv/issues/17570 (reporter uses mpv.net); libplacebo d3d11/swapchain.c (per-swapchain SetColorSpace1)",
+   "design_impact": "important"
+  },
+  {
+   "claim": "--d3d11-output-format is documented as only a 'best-effort hint' for gpu-next ('libplacebo has the last say'); --d3d11-output-csp likewise gets overridden once the colorspace hint is active (implementer jeeb, 2022-05-03). Do not set either for gpu-next HDR.",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/mpv-player/mpv/v0.40.0/DOCS/man/options.rst (d3d11-output-format note); https://api.github.com/repos/mpv-player/mpv/issues/10158/comments",
+   "design_impact": "minor"
+  },
+  {
+   "claim": "--icc-profile-auto defaults to no; the ICC profile takes precedence over hint metadata (master manual note), so keep it off for HDR passthrough. --gamma-auto is deprecated and only implemented on macOS with --vo=gpu — irrelevant on Windows.",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/mpv-player/mpv/v0.40.0/DOCS/man/options.rst; https://mpv.io/manual/master/ (target-colorspace-hint-mode note)",
+   "design_impact": "minor"
+  },
+  {
+   "claim": "Forcing --target-colorspace-hint=yes on an SDR monitor with d3d11 selects an HDR (PQ/BT.2020, rgb10_a2) swapchain anyway because Windows always exposes it, leaving DWM to do low-quality tone-mapping; 'auto' was added (PR #15279, in 0.40) precisely to avoid this. On SDR use auto (or no) and let mpv tone-map.",
+   "confidence": "verified",
+   "source": "https://api.github.com/repos/mpv-player/mpv/issues/15268/comments",
+   "design_impact": "critical"
+  },
+  {
+   "claim": "SDR tone-mapping knobs in 0.40: --tone-mapping=auto maps to 'spline' on gpu-next (bt.2390, bt.2446a, st2094-40 also available); --target-peak auto = 203 nits for SDR curves; --target-trc/--target-prim auto convert HDR/wide-gamut to gamma2.2/BT.709; --hdr-compute-peak auto enables per-scene peak detection when compute shaders exist; high-quality profile adds hdr-peak-percentile=99.995 and hdr-contrast-recovery=0.30.",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/mpv-player/mpv/v0.40.0/DOCS/man/options.rst; https://raw.githubusercontent.com/mpv-player/mpv/v0.40.0/etc/builtin.conf",
+   "design_impact": "important"
+  },
+  {
+   "claim": "Vulkan (winvk) can present HDR10 swapchains (VK_COLOR_SPACE_HDR10_ST2084_EXT + vkSetHdrMetadataEXT in libplacebo), but Windows-specific bugs are reported (#13899 SDR↔HDR file switching colours, #13780 AMD Vulkan HDR broken), it adds ~1 s startup per user report, nvdec/cuda interop breaks AV1 hwdec for some, and the maintainer answer to HDR-on-Windows questions is d3d11.",
+   "confidence": "likely",
+   "source": "https://raw.githubusercontent.com/haasn/libplacebo/v7.349.0/src/vulkan/swapchain.c; web search results for issues #13899/#13780 (not read in full); https://github.com/mpv-player/mpv/issues/10628 (2026-03 comment)",
+   "design_impact": "important"
+  },
+  {
+   "claim": "Default GPU context autoprobe order on Windows is d3d11 first, then winvk (Vulkan), then angle/wgl; --gpu-api=d3d11 restricts to --gpu-context=d3d11.",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/mpv-player/mpv/v0.40.0/video/out/gpu/context.c (contexts[] array); options.rst --gpu-api",
+   "design_impact": "minor"
+  },
+  {
+   "claim": "shinchiro/mpv-winbuild-cmake builds FFmpeg with --enable-libsrt (plus --enable-libdav1d, --enable-libplacebo, --enable-nvdec) and lists libsrt in DEPENDS; libsrt is built statically from https://github.com/Haivision/srt with OpenSSL (ENABLE_SHARED=OFF). librist is NOT enabled.",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/shinchiro/mpv-winbuild-cmake/master/packages/ffmpeg.cmake; https://raw.githubusercontent.com/shinchiro/mpv-winbuild-cmake/master/packages/libsrt.cmake",
+   "design_impact": "critical"
+  },
+  {
+   "claim": "zhongfly/mpv-winbuild is a GitHub Actions workflow that clones shinchiro/mpv-winbuild-cmake and produces mpv-x86_64[-v3], mpv-dev (libmpv-2.dll), mpv-dev-lgpl and ffmpeg 7z archives; its README lists libsrt. SourceForge mpv-player-windows is shinchiro's mirror (64bit / 64bit-v3 / libmpv folders; latest 2026-08-30). Latest release assets checked 2026-09: shinchiro 20260903, zhongfly 2026-09-10.",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/zhongfly/mpv-winbuild/main/.github/workflows/mpv.yml; zhongfly README; https://sourceforge.net/projects/mpv-player-windows/files/; gh api releases/latest for both repos",
+   "design_impact": "important"
+  },
+  {
+   "claim": "'srt' is in mpv's safe protocol list (stream_lavf.c PROTO(\"srt\")), so `mpv srt://host:port?…` opens directly without an ffmpeg:// prefix. Verified by loopback: ffmpeg SRT listener → `mpv \"srt://127.0.0.1:9710?mode=caller&latency=1000000&streamid=test1\"` played HEVC 10-bit TS.",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/mpv-player/mpv/v0.40.0/stream/stream_lavf.c line 263; local run (mpv 0.40.0, ffmpeg 7.1.5) in scratchpad, log mpv_srt.log",
+   "design_impact": "critical"
+  },
+  {
+   "claim": "SRT protocol options come from FFmpeg's libsrt.c: the URL ?query is parsed with av_find_info_tag in libsrt_open (latency, rcvlatency, peerlatency, tlpktdrop, passphrase, pbkeylen, enforced_encryption, streamid, mode=caller|listener|rendezvous, pkt_size/payload_size, maxbw, transtype, connect_timeout, timeout, …); all latency/timeout values are in MICROseconds (latency=1500000 = 1.5 s). --stream-lavf-o=latency=…,rcvlatency=… sets the same AVOptions via AVDictionary before open (accepted silently in -v log, unlike unknown options which print 'Could not set AVOption'); URL query is applied afterwards so it wins. --demuxer-lavf-o targets the demuxer, not the protocol.",
+   "confidence": "verified",
+   "source": "local `ffmpeg -h protocol=srt` (7.1.5); FFmpeg libavformat/libsrt.c lines 397-671 (local copy); mpv stream_lavf.c mp_set_avdict; options.rst --stream-lavf-o/--demuxer-lavf-o; loopback log mpv_srt.log",
+   "design_impact": "critical"
+  },
+  {
+   "claim": "Live-buffer semantics in 0.40: --cache=yes|auto enables the network cache; --cache-pause-initial=yes + --cache-pause-wait=<s> makes mpv prebuffer that many seconds before starting (and after rebuffering); --cache-secs overrides --demuxer-readahead-secs when cache is on; --demuxer-max-bytes (default 150 MiB) / --demuxer-max-back-bytes (50 MiB) cap the packet queue; --demuxer-hysteresis-secs (default 0) only introduces chunked refills; --cache-pause=yes rebuffers on underrun (the builtin low-latency profile sets no).",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/mpv-player/mpv/v0.40.0/DOCS/man/options.rst; local `mpv --list-options` defaults",
+   "design_impact": "critical"
+  },
+  {
+   "claim": "Builtin [low-latency] profile in 0.40 = audio-buffer=0, vd-lavc-threads=1, cache-pause=no, demuxer-lavf-o-add=fflags=+nobuffer, demuxer-lavf-probe-info=nostreams, demuxer-lavf-analyzeduration=0.1, video-sync=audio, interpolation=no, video-latency-hacks=yes, stream-buffer-size=4k. For a 1-3 s livestream-style receiver take only the probe/nobuffer/video-sync=audio/interpolation=no parts; keep cache-pause=yes and normal threads.",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/mpv-player/mpv/v0.40.0/etc/builtin.conf",
+   "design_impact": "important"
+  },
+  {
+   "claim": "--video-sync=audio (default) is the right mode for live: display-resample modes change playback speed to lock to the monitor refresh (drifting relative to the live source) and --interpolation is silently disabled without a display-sync mode; --framedrop=vo (default) drops late frames at the VO.",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/mpv-player/mpv/v0.40.0/DOCS/man/options.rst (--video-sync, --interpolation, --framedrop)",
+   "design_impact": "important"
+  },
+  {
+   "claim": "mpv has no built-in 'stay N seconds behind live' control; the buffer only changes via clock drift/network stalls. Catch-up must be scripted (Lua timer setting `speed` from demuxer-cache-duration, e.g. keepsync.lua gist or mpv_reduce_stream_cache) or driven by the host over IPC.",
+   "confidence": "likely",
+   "source": "https://gist.github.com/TheDrHax/3b7bc7d819effa101e09f355d9390578; https://github.com/divout/mpv_reduce_stream_cache; absence of such option in `mpv --list-options`",
+   "design_impact": "important"
+  },
+  {
+   "claim": "JSON IPC on Windows: --input-ipc-server=\\\\.\\pipe\\<name> (prefix auto-added if omitted); manual explicitly says bidirectional use needs overlapped I/O 'or some wrapper like .NET's NamedPipeClientStream'. Commands get_property / observe_property / observe_property_string; property-change events carry id/name/data. Properties verified live on 0.40: demuxer-cache-duration, demuxer-cache-time, demuxer-cache-state (node: cache-end, reader-pts, fw-bytes, raw-input-rate, underrun, eof), cache-buffering-state, paused-for-cache, cache-speed, frame-drop-count, decoder-frame-drop-count, hwdec-current, video-params/{gamma,primaries,pixelformat,max-luma}, estimated-vf-fps, video-target-params (needs a real VO). Sub-path demuxer-cache-state/raw-input-rate is NOT addressable — read the node.",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/mpv-player/mpv/v0.40.0/DOCS/man/ipc.rst; DOCS/man/input.rst; local IPC test via python over unix socket (mpv 0.40.0)",
+   "design_impact": "important"
+  },
+  {
+   "claim": "Stats overlay: 'i' shows stats for --duration (4 s), 'I' (Shift+i) toggles persistent; pages 1-5 + 0 switch with number keys while shown; page 1 prints source and target Primaries/Transfer, HDR10 min/max luma, MaxCLL/MaxFALL and measured Max/Avg PQ (video-target-params + peak detection). --osd-level=3 with --osd-status-msg='${…}' gives a permanent custom line with property expansion.",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/mpv-player/mpv/v0.40.0/DOCS/man/stats.rst; player/lua/stats.lua v0.40.0 (append_hdr, video-target-params); options.rst --osd-level/--osd-status-msg",
+   "design_impact": "minor"
+  },
+  {
+   "claim": "hwdec autoprobe order (whitelisted): d3d11va, d3d11va-copy, dxva2-copy, nvdec, nvdec-copy, vaapi, vulkan, vulkan-copy …; 'auto' == 'auto-safe' == 'yes'. hwdec_d3d11va requires only that the ra context is d3d11 (ra_is_d3d11), so it works with --vo=gpu-next --gpu-api=d3d11 despite the manual's stale 'requires --vo=gpu' text; supported surface formats NV12 and P010 (10-bit). --d3d11va-zero-copy default no (one GPU copy; zero-copy may sample edges wrongly / hit driver bugs). Default --hwdec-codecs already includes hevc and av1.",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/mpv-player/mpv/v0.40.0/video/decode/vd_lavc.c (hwdec_autoprobe_info); https://raw.githubusercontent.com/mpv-player/mpv/v0.40.0/video/out/d3d11/hwdec_d3d11va.c; options.rst --d3d11va-zero-copy; `mpv --list-options` hwdec-codecs default",
+   "design_impact": "important"
+  },
+  {
+   "claim": "FFmpeg implements AV1 (incl. 10-bit, seq_profile 0/2 high_bitdepth) and HEVC via D3D11VA (dxva2_av1.c, AV_PIX_FMT_D3D11/D3D11VA_VLD), so d3d11va covers both HEVC Main10 and AV1 10-bit on GPUs whose drivers expose the DXVA AV1 profile (NVIDIA RTX 30+, AMD RX 6000+, Intel Xe/Arc).",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/FFmpeg/FFmpeg/n7.1/libavcodec/dxva2_av1.c (GPU generations: general knowledge, likely)",
+   "design_impact": "important"
+  },
+  {
+   "claim": "CUDA/nvdec interop exists only for OpenGL and Vulkan ('CUDA hwdec only works with OpenGL or Vulkan backends'); with --gpu-api=d3d11 --hwdec=nvdec falls back to nvdec-copy (system-RAM round-trip). Use d3d11va with d3d11.",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/mpv-player/mpv/v0.40.0/video/out/hwdec/hwdec_cuda.c line 110",
+   "design_impact": "important"
+  },
+  {
+   "claim": "Fallback pipeline `ffmpeg -fflags nobuffer -i srt://… -c copy -f mpegts - | mpv - --demuxer-lavf-format=mpegts …` works: mpv reads '-' as stdin (stream_file.c, setmode O_BINARY on Windows) and detected mpegts; -c copy keeps HEVC/AV1 VUI/SEI (HDR signalling) intact. Verified on Linux loopback.",
+   "confidence": "verified",
+   "source": "local run (mpv_pipe.log: 'Reading from stdin…', 'Detected file format: mpegts'); mpv stream/stream_file.c lines 315-371",
+   "design_impact": "minor"
+  },
+  {
+   "claim": "libmpv: both build families ship libmpv-2.dll in mpv-dev-<arch>-<date>.7z (mpv.cmake -Dlibmpv=true; zhongfly also has mpv-dev-lgpl). MPV_CLIENT_API_VERSION = 2.5 in v0.40.0 and v0.41.0. C API flow: mpv_create → mpv_set_option_string(\"wid\", hwnd) (+vo/gpu-api/etc) → mpv_initialize → mpv_command_string(\"loadfile …\") ; stats via mpv_observe_property(ctx, userdata, name, MPV_FORMAT_DOUBLE=5 / INT64=4 / FLAG=3 / STRING=1 / NODE=6) and an mpv_wait_event loop receiving MPV_EVENT_PROPERTY_CHANGE=22 with mpv_event_property{name, format, data}.",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/shinchiro/mpv-winbuild-cmake/master/packages/mpv.cmake; https://raw.githubusercontent.com/mpv-player/mpv/v0.40.0/include/mpv/client.h and v0.41.0",
+   "design_impact": "important"
+  },
+  {
+   "claim": "C# bindings: Mpv.NET 1.1.1 (Oct 2019) is marked 'deprecated … legacy and no longer maintained' on NuGet and https://github.com/hudec117/Mpv.NET-lib- now returns 404 (reported archived Mar 2026). HanumanInstitute.LibMpv 0.10.1 (2026-05-29, MIT, net10.0 + netstandard2.0, requires libmpv >= 0.40, layers MpvApi P/Invoke → MpvContextBase → strongly-typed MpvContext; repo mysteryx93/LibMpv-OpenGL, pushed 2026-07-10) is maintained but its only UI control is Avalonia (ANGLE render API); no WinForms control. Other candidates: vrjure/LibMPV.AutoGen (WPF/Avalonia controls, pushed 2025-05), miroslav22/MPVSharp (pushed 2026-07, 5 stars) — not evaluated.",
+   "confidence": "verified",
+   "source": "https://www.nuget.org/packages/Mpv.NET; https://www.nuget.org/packages/HanumanInstitute.LibMpv; gh api repos/mysteryx93/LibMpv-OpenGL/readme; gh api search/repositories",
+   "design_impact": "important"
+  },
+  {
+   "claim": "At 100 Mbps the demuxer queue fills at 12.5 MB/s, so the 0.40 default --demuxer-max-bytes=150MiB holds ~12 s; an 8 s --cache-secs cap needs ≥100 MiB. Total glass-to-glass ≈ encoder delay + SRT latency per hop (sender→relay, relay→receiver each add their own) + cache-pause-wait + ~2-3 frames render.",
+   "confidence": "likely",
+   "source": "arithmetic from `mpv --list-options` defaults and SRT latency semantics (ffmpeg -h protocol=srt)",
+   "design_impact": "important"
+  }
+ ],
+ "snippets": [
+  {
+   "title": "Receiver command line – HDR display (Windows 11, Windows HDR ON, mpv 0.40+ shinchiro/zhongfly build)",
+   "code": "mpv.exe ^\n  --vo=gpu-next --gpu-api=d3d11 ^\n  --target-colorspace-hint=auto ^\n  --target-peak=auto --target-contrast=auto ^\n  --hdr-compute-peak=auto --tone-mapping=auto ^\n  --icc-profile-auto=no ^\n  --hwdec=d3d11va --hwdec-codecs=hevc,av1 ^\n  --cache=yes --cache-pause=yes --cache-pause-initial=yes --cache-pause-wait=1.5 ^\n  --cache-secs=8 --demuxer-max-bytes=256MiB --demuxer-max-back-bytes=16MiB --demuxer-hysteresis-secs=0 ^\n  --demuxer-lavf-probe-info=nostreams --demuxer-lavf-analyzeduration=0.5 ^\n  --demuxer-lavf-o-add=fflags=+nobuffer ^\n  --video-sync=audio --interpolation=no --framedrop=vo ^\n  --force-window=yes --idle=yes --keep-open=no --osc=no --osd-level=1 ^\n  --input-ipc-server=\\\\.\\pipe\\hdrcast-mpv ^\n  --wid=%PANEL_HWND% ^\n  \"srt://relay.example.net:8890?mode=caller&latency=1500000&streamid=read:hdrcast&passphrase=CHANGEME_16plus&pbkeylen=16\"",
+   "notes": "Verified option names against `mpv --list-options` (0.40.0). --target-colorspace-hint=auto → passthrough only when the DXGI output reports PQ (Windows HDR on); if the friend uses a nightly (0.41+) 'auto' is already the default and you may add --target-colorspace-hint-mode=source to let DWM do the mapping (respects the Windows SDR-brightness slider). Drop --wid for a standalone window. If Windows reports a wrong display peak, set --target-peak=<nits>. latency is in microseconds; pick the same value on the relay/sender side (max of both applies). Omit passphrase/pbkeylen if the relay is unencrypted."
+  },
+  {
+   "title": "Receiver command line – SDR display (Windows HDR OFF or SDR monitor)",
+   "code": "mpv.exe ^\n  --vo=gpu-next --gpu-api=d3d11 ^\n  --target-colorspace-hint=auto ^\n  --tone-mapping=bt.2390 --hdr-compute-peak=yes --hdr-peak-percentile=99.995 --hdr-contrast-recovery=0.3 ^\n  --target-peak=auto --target-trc=auto --target-prim=auto --gamut-mapping-mode=auto ^\n  --icc-profile-auto=no ^\n  --hwdec=d3d11va --hwdec-codecs=hevc,av1 ^\n  --cache=yes --cache-pause=yes --cache-pause-initial=yes --cache-pause-wait=1.5 ^\n  --cache-secs=8 --demuxer-max-bytes=256MiB --demuxer-max-back-bytes=16MiB --demuxer-hysteresis-secs=0 ^\n  --demuxer-lavf-probe-info=nostreams --demuxer-lavf-analyzeduration=0.5 ^\n  --demuxer-lavf-o-add=fflags=+nobuffer ^\n  --video-sync=audio --interpolation=no --framedrop=vo ^\n  --force-window=yes --idle=yes --keep-open=no --osc=no --osd-level=1 ^\n  --input-ipc-server=\\\\.\\pipe\\hdrcast-mpv ^\n  \"srt://relay.example.net:8890?mode=caller&latency=1500000&streamid=read:hdrcast\"",
+   "notes": "With Windows HDR off the d3d11 probe reports G22_P709 → no hint → mpv tone-maps PQ/BT.2020 → gamma2.2/BT.709 at 203 nits in-shader (higher quality than DWM). --tone-mapping=auto (= spline) is also fine; bt.2390 is the ITU curve. Never force hint=yes here (issue #15268). The same command therefore works on both machines: only the tone-mapping extras differ."
+  },
+  {
+   "title": "mpv.conf for the receiver (put next to mpv.exe in portable_config\\ or pass --config-dir)",
+   "code": "# hdrcast receiver — mpv 0.40+ on Windows 11\nvo=gpu-next\ngpu-api=d3d11\nhwdec=d3d11va\nhwdec-codecs=hevc,av1\n\n# HDR: passthrough when Windows HDR is ON, in-shader tone-map otherwise\ntarget-colorspace-hint=auto\ntarget-peak=auto            # e.g. target-peak=800 if Windows reports nonsense\ntarget-contrast=auto\nhdr-compute-peak=auto\ntone-mapping=auto           # spline on gpu-next; bt.2390 = ITU curve\nicc-profile-auto=no\n\n# live buffering (~1.5 s startup, cap 8 s)\ncache=yes\ncache-pause=yes\ncache-pause-initial=yes\ncache-pause-wait=1.5\ncache-secs=8\ndemuxer-max-bytes=256MiB\ndemuxer-max-back-bytes=16MiB\ndemuxer-hysteresis-secs=0\ndemuxer-lavf-probe-info=nostreams\ndemuxer-lavf-analyzeduration=0.5\ndemuxer-lavf-o-add=fflags=+nobuffer\nvideo-sync=audio\ninterpolation=no\nframedrop=vo\n\n# host integration\ninput-ipc-server=\\\\.\\pipe\\hdrcast-mpv\nforce-window=yes\nidle=yes\nkeep-open=no\nosc=no\nosd-level=1\n\n[sdr-quality]              # --profile=sdr-quality on an SDR monitor\ntone-mapping=bt.2390\nhdr-compute-peak=yes\nhdr-peak-percentile=99.995\nhdr-contrast-recovery=0.3\n\n[hint-source]              # 0.41+/nightly only: let DWM map, honour Windows SDR slider\ntarget-colorspace-hint=yes\ntarget-colorspace-hint-mode=source",
+   "notes": "demuxer-lavf-o-add is the list-option 'append' suffix (same form the builtin low-latency profile uses). The [hint-source] profile uses an option that does not exist in 0.40.0 (mpv will error on unknown options in a profile only when the profile is applied)."
+  },
+  {
+   "title": "C#: read live stats from mpv.exe over the JSON IPC named pipe",
+   "code": "using System.IO.Pipes;\nusing System.Text;\nusing System.Text.Json;\n\n// mpv started with --input-ipc-server=\\\\.\\pipe\\hdrcast-mpv\nvar pipe = new NamedPipeClientStream(\".\", \"hdrcast-mpv\", PipeDirection.InOut, PipeOptions.Asynchronous);\nawait pipe.ConnectAsync(5000);\nvar utf8 = new UTF8Encoding(false);\nvar reader = new StreamReader(pipe, utf8);\nvar writer = new StreamWriter(pipe, utf8) { AutoFlush = true, NewLine = \"\\n\" };\n\nasync Task Cmd(params object[] cmd) =>\n    await writer.WriteLineAsync(JsonSerializer.Serialize(new { command = cmd }));\n\n// one observe per stat; the integer is the observer id echoed back in events\nawait Cmd(\"observe_property\", 1, \"demuxer-cache-duration\");   // seconds buffered ahead\nawait Cmd(\"observe_property\", 2, \"paused-for-cache\");         // true while rebuffering\nawait Cmd(\"observe_property\", 3, \"cache-buffering-state\");    // 0-100 % until unpause\nawait Cmd(\"observe_property\", 4, \"frame-drop-count\");         // VO drops\nawait Cmd(\"observe_property\", 5, \"decoder-frame-drop-count\");\nawait Cmd(\"observe_property\", 6, \"hwdec-current\");            // \"d3d11va\" or \"no\"\nawait Cmd(\"observe_property\", 7, \"estimated-vf-fps\");\nawait Cmd(\"observe_property\", 8, \"video-params\");             // node: gamma=pq, primaries=bt.2020, max-luma…\nawait Cmd(\"observe_property\", 9, \"video-target-params\");      // what the VO outputs (pq/bt.2020 = passthrough active)\nawait Cmd(\"observe_property\", 10, \"demuxer-cache-state\");     // node: raw-input-rate (B/s), fw-bytes, underrun\n\n_ = Task.Run(async () =>\n{\n    string? line;\n    while ((line = await reader.ReadLineAsync()) != null)\n    {\n        using var doc = JsonDocument.Parse(line);\n        var root = doc.RootElement;\n        if (root.TryGetProperty(\"event\", out var ev) && ev.GetString() == \"property-change\")\n        {\n            var name = root.GetProperty(\"name\").GetString();\n            root.TryGetProperty(\"data\", out var data);   // may be missing/null when unavailable\n            // marshal to UI thread and update labels\n        }\n    }\n});\n\n// simple catch-up from the host: if buffer > 3.5 s run at 1.05x until <= 2 s\nawait Cmd(\"set_property\", \"speed\", 1.05);\nawait Cmd(\"set_property\", \"speed\", 1.0);",
+   "notes": "Property names verified on mpv 0.40.0 via IPC (Linux socket; Windows pipe carries identical JSON lines). Writes and reads happen on the same NamedPipeClientStream concurrently — keep one writer task and one reader task. mpv adds the \\\\.\\pipe\\ prefix automatically if you pass a bare name."
+  },
+  {
+   "title": "C#: minimal libmpv-2.dll P/Invoke (embed via wid + observe properties)",
+   "code": "using System.Runtime.InteropServices;\n\nstatic class Mpv {\n    const string Dll = \"libmpv-2.dll\";   // from mpv-dev-x86_64-<date>.7z (shinchiro/zhongfly), API 2.5 in 0.40/0.41\n    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] public static extern IntPtr mpv_create();\n    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] public static extern int mpv_initialize(IntPtr ctx);\n    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] public static extern int mpv_set_option_string(IntPtr ctx, [MarshalAs(UnmanagedType.LPUTF8Str)] string name, [MarshalAs(UnmanagedType.LPUTF8Str)] string data);\n    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] public static extern int mpv_command_string(IntPtr ctx, [MarshalAs(UnmanagedType.LPUTF8Str)] string args);\n    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] public static extern int mpv_observe_property(IntPtr ctx, ulong userdata, [MarshalAs(UnmanagedType.LPUTF8Str)] string name, int format);\n    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] public static extern IntPtr mpv_wait_event(IntPtr ctx, double timeout);\n    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] public static extern void mpv_terminate_destroy(IntPtr ctx);\n\n    public const int FORMAT_STRING = 1, FORMAT_FLAG = 3, FORMAT_INT64 = 4, FORMAT_DOUBLE = 5, FORMAT_NODE = 6;\n    public const int EVENT_SHUTDOWN = 1, EVENT_END_FILE = 7, EVENT_PROPERTY_CHANGE = 22;\n\n    [StructLayout(LayoutKind.Sequential)] public struct Event { public int event_id; public int error; public ulong reply_userdata; public IntPtr data; }\n    [StructLayout(LayoutKind.Sequential)] public struct EventProperty { public IntPtr name; public int format; public IntPtr data; }\n}\n\n// usage (WinForms Panel `video`):\nvar ctx = Mpv.mpv_create();\nMpv.mpv_set_option_string(ctx, \"wid\", video.Handle.ToInt64().ToString());\nMpv.mpv_set_option_string(ctx, \"vo\", \"gpu-next\");\nMpv.mpv_set_option_string(ctx, \"gpu-api\", \"d3d11\");\nMpv.mpv_set_option_string(ctx, \"hwdec\", \"d3d11va\");\nMpv.mpv_set_option_string(ctx, \"target-colorspace-hint\", \"auto\");\nMpv.mpv_set_option_string(ctx, \"cache-pause-initial\", \"yes\");\nMpv.mpv_set_option_string(ctx, \"cache-pause-wait\", \"1.5\");\nMpv.mpv_initialize(ctx);\nMpv.mpv_observe_property(ctx, 1, \"demuxer-cache-duration\", Mpv.FORMAT_DOUBLE);\nMpv.mpv_observe_property(ctx, 2, \"frame-drop-count\", Mpv.FORMAT_INT64);\nMpv.mpv_command_string(ctx, \"loadfile \\\"srt://relay:8890?mode=caller&latency=1500000&streamid=read:hdrcast\\\"\");\n// event thread:\nwhile (true) {\n    var ev = Marshal.PtrToStructure<Mpv.Event>(Mpv.mpv_wait_event(ctx, 1.0));\n    if (ev.event_id == Mpv.EVENT_SHUTDOWN) break;\n    if (ev.event_id == Mpv.EVENT_PROPERTY_CHANGE) {\n        var p = Marshal.PtrToStructure<Mpv.EventProperty>(ev.data);\n        if (p.format == Mpv.FORMAT_DOUBLE && p.data != IntPtr.Zero) { double v = Marshal.PtrToStructure<double>(p.data); /* userdata==1 → cache secs */ }\n        if (p.format == Mpv.FORMAT_INT64  && p.data != IntPtr.Zero) { long  v = Marshal.PtrToStructure<long>(p.data); }\n    }\n}",
+   "notes": "Enum values/struct layouts taken from include/mpv/client.h (MPV_CLIENT_API_VERSION 2.5). Options that must be set before mpv_initialize are only config/config-dir/input-conf/scripts related; wid and the rest can be set before or after, but set wid before init so the first window is the child. Or skip interop entirely: HanumanInstitute.LibMpv 0.10.1 wraps this same API (MpvApi layer) for net10/netstandard2.0."
+  },
+  {
+   "title": "Fallback: ffmpeg receives SRT, mpv reads MPEG-TS from stdin",
+   "code": "ffmpeg.exe -hide_banner -loglevel warning -fflags nobuffer -flags low_delay ^\n  -i \"srt://relay.example.net:8890?mode=caller&latency=1500000&streamid=read:hdrcast\" ^\n  -c copy -f mpegts -muxdelay 0 -muxpreload 0 - ^\n| mpv.exe - --demuxer-lavf-format=mpegts ^\n  --vo=gpu-next --gpu-api=d3d11 --hwdec=d3d11va --target-colorspace-hint=auto --icc-profile-auto=no ^\n  --cache=yes --cache-pause-initial=yes --cache-pause-wait=1.5 --cache-secs=8 --demuxer-max-bytes=256MiB ^\n  --demuxer-lavf-probe-info=nostreams --demuxer-lavf-analyzeduration=0.5 --demuxer-lavf-o-add=fflags=+nobuffer ^\n  --video-sync=audio --interpolation=no --input-ipc-server=\\\\.\\pipe\\hdrcast-mpv",
+   "notes": "Verified on Linux (mpv 0.40 + ffmpeg 7.1.5 loopback): mpv logs 'Reading from stdin…' and detects mpegts; -c copy preserves the HEVC/AV1 VUI/SEI so HDR signalling survives. From C# use Process with RedirectStandardOutput on ffmpeg and RedirectStandardInput on mpv and pump the streams (or `cmd /c \"ffmpeg … | mpv …\"`). Use this only when the mpv build lacks libsrt or you want ffmpeg's SRT stats (-stats/-progress) on the receiver."
+  },
+  {
+   "title": "Lua: keep the live buffer near a target by nudging playback speed (scripts\\live-catchup.lua)",
+   "code": "-- live-catchup.lua: if the demuxer cache grows past `hi`, play at 1.05x until it is back to `target`.\nlocal target, hi = 2.0, 3.5      -- seconds\nlocal fast = 1.05\nmp.add_periodic_timer(1.0, function()\n    if mp.get_property_bool(\"paused-for-cache\") or mp.get_property_bool(\"pause\") then return end\n    local d = mp.get_property_number(\"demuxer-cache-duration\")\n    if not d then return end\n    local spd = mp.get_property_number(\"speed\", 1)\n    if d > hi and spd == 1 then\n        mp.set_property_number(\"speed\", fast)\n    elseif d <= target and spd ~= 1 then\n        mp.set_property_number(\"speed\", 1)\n    end\nend)",
+   "notes": "mpv has no native equivalent (0.40/0.41). With --video-sync=audio the audio is pitch-corrected by default (scaletempo2) so 1.05x is inaudible on speech. Load with --script=<path> or put in portable_config\\scripts\\. Pattern borrowed from keepsync.lua (TheDrHax gist) / mpv_reduce_stream_cache."
+  }
+ ],
+ "open_questions": [
+  "No primary source proves HDR colorspace hints behave identically for a --wid child-window swapchain on all vendors; evidence is only that mpv.net (WinForms + libmpv + wid) users get correct HDR with d3d11. Needs a 5-minute test on the friend's PC: stats page 1 should show target Transfer=pq, Primaries=bt.2020 when Windows HDR is on.",
+  "Whether the resize/fullscreen black-flash reported in #17570 (master Jan 2026, RTX 4070) also affects the 0.40.0 stable build and other GPUs; mitigation is to avoid live window resizing (fixed-size panel or borderless-fullscreen host).",
+  "Which mpv build the friend will run: 0.40.0 semantics (hint default no, auto only on d3d11) vs nightly 0.41+/master (hint default auto, --target-colorspace-hint-mode, winvk probing). The recommended command lines are valid on both, but the mpv.conf [hint-source] profile is 0.41+ only.",
+  "Windows 10 vs Windows 11 24H2: a 2026-03 comment in #10628 claims full windowed-HDR behaviour only on Win11 24H2 (with ACM); untested here.",
+  "If the receiver GPU reports a bogus display peak (issue #10628 saw 1499 nits default on AMD), passthrough may tone-map unnecessarily; expose a --target-peak override in the receiver GUI.",
+  "AV1 10-bit D3D11VA decode depends on the receiver GPU/driver exposing the DXVA AV1 profile (RTX 30+/RX 6000+/Arc); older GPUs fall back to dav1d software decode — fine at 1080p60, marginal at 4K60 100 Mbps.",
+  "MediaMTX SRT read-side latency adds a second SRT hop; the exact total latency budget (sender SRT latency + relay + cache-pause-wait) should be measured end to end; only cache-pause-wait is controlled on the mpv side."
+ ],
+ "recommendation": "Ship the receiver as mpv.exe (shinchiro or zhongfly mpv-x86_64[-v3] nightly, both have libsrt) launched by the WinForms GUI with --wid=<Panel.Handle> and --input-ipc-server=\\\\.\\pipe\\<name>, talking JSON over NamedPipeClientStream for stats and control — no native interop needed; keep libmpv-2.dll (same mpv-dev package, API 2.5, HanumanInstitute.LibMpv 0.10.1 or ~10 P/Invokes) as an optional later refinement. Fixed core options for both machines: --vo=gpu-next --gpu-api=d3d11 --hwdec=d3d11va --target-colorspace-hint=auto --icc-profile-auto=no --video-sync=audio --interpolation=no --cache=yes --cache-pause-initial=yes --cache-pause-wait=1.5 --cache-secs=8 --demuxer-max-bytes=256MiB --demuxer-lavf-probe-info=nostreams --demuxer-lavf-analyzeduration=0.5 --demuxer-lavf-o-add=fflags=+nobuffer, plus the SRT URL with mode=caller&latency=<µs>&streamid=…&passphrase=…. On the HDR PC the friend must have Windows HDR ON (Win+Alt+B); mpv will not toggle it. On an SDR display the same 'auto' setting makes mpv tone-map in-shader (add --tone-mapping=bt.2390 --hdr-compute-peak=yes if desired). Do not use Vulkan, --d3d11-output-csp/-format, --icc-profile-auto, or hint=yes on SDR. Give the GUI a fixed-size/borderless-fullscreen video panel (avoid frequent resizes), a --target-peak override, a 'buffer seconds' setting mapped to cache-pause-wait, and a catch-up rule (speed 1.05 when demuxer-cache-duration > target+1.5 s) driven either by the bundled Lua script or the IPC client. Keep the ffmpeg|mpv stdin fallback as a hidden option only."
+}

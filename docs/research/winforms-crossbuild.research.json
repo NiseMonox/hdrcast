@@ -1,0 +1,180 @@
+{
+ "topic": "winforms-crossbuild",
+ "summary": "All tests were run on this Debian 13 box with .NET SDK 10.0.302 (DOTNET_CLI_TELEMETRY_OPTOUT=1, DOTNET_NOLOGO=1). Work is in /tmp/claude-0/-projects/eb06eadf-2fb4-465a-826d-820fbabd8b59/scratchpad/winforms-probe (A-net48, A2-net48-dcjs, A3-net48-stj-ilrepack, B-net10, C-net8, D-net10-manifest, D2-net48-manifest, D3-net48-resx-bitmap, D4-net10-resx-bitmap; build logs beside each csproj; peinfo.py is a PE-header inspector). One Program.cs (shared/Program.cs) exercises records + init, switch-expression/type/relational patterns, string interpolation, async/await + Task.Run, System.Text.Json (or DataContractJsonSerializer in the *-dcjs variants), P/Invoke user32!MessageBoxW, and Process with OutputDataReceived/ErrorDataReceived; it compiled unchanged on every target (net48 needs only the IsExternalInit polyfill; `LangVersion=latest` is C# 14.0 on this SDK).\n\nTEST A (net48 + Microsoft.NETFramework.ReferenceAssemblies 1.0.3 + System.Text.Json 8.0.5): `dotnet build -c Release` succeeds in 2.6 s with 0 warnings, no Mono needed. Output is an AnyCPU IL-only PE32 GUI exe (16.9 KB) plus NINE runtime DLLs dragged in by STJ (System.Text.Json 645 KB, System.Memory, System.Buffers, System.Numerics.Vectors, System.Runtime.CompilerServices.Unsafe, System.Text.Encodings.Web, System.Threading.Tasks.Extensions, System.ValueTuple, Microsoft.Bcl.AsyncInterfaces) and a .exe.config with binding redirects; 1.12 MB / 12 files. STJ 10.0.12 would add System.IO.Pipelines (10 DLLs). A2 (DataContractJsonSerializer, `<Reference Include=\"System.Runtime.Serialization\"/>`) builds in 1.5 s to a single 17 KB EXE + 169-byte exe.config + pdb: zero-dependency single EXE is achievable. Bonus A3: ILRepack.Lib.MSBuild.Task 2.0.43 runs under Linux MSBuild and merges STJ + its 8 helpers into one 954 KB EXE (needs TargetPlatformDirectory pointed at the reference-assemblies pack; the package's default target then deletes the loose DLLs).\n\nTEST B (net10.0-windows + EnableWindowsTargeting): build 3.5 s, 0 warnings. Caveat: plain `dotnet build` emits a Linux ELF apphost `ProbeB` (no .exe); add `-r win-x64` (or RuntimeIdentifier) to get a PE32+ x64 GUI ProbeB.exe. Publishes: self-contained single-file compressed = 51.6 MB single exe (5 s); uncompressed = 116 MB; folder = 271 files/122.8 MB. `-p:PublishTrimmed=true` is a hard error NETSDK1175 (\"Windows Forms is not supported or recommended with trimming enabled\") raised in Microsoft.NET.RuntimeIdentifierInference.targets:305; forcing it with _SuppressWinFormsTrimError=true yields 16 MB but is unsupported (WinForms depends on built-in COM marshalling per MS docs). Framework-dependent single-file = 181 KB exe; runtimeconfig demands Microsoft.NETCore.App 10.0.0 + Microsoft.WindowsDesktop.App 10.0.0, i.e. the friend must install \".NET Desktop Runtime 10.0.x x64\" (windowsdesktop-runtime-10.0.12-win-x64.exe = 60,032,984 bytes). Cross-compiled ReadyToRun FD single-file also works (210 KB).\n\nTEST C (net8.0-windows): SDK 10.0.302 restores Microsoft.WindowsDesktop.App.Ref/Runtime.win-x64 8.0.29 automatically; build 1.5 s, 0 warnings; sc-single compressed 71.6 MB (bigger than net10 because the 8.0 WindowsDesktop runtime pack still ships ~40 MB of WPF assemblies; net10 drops them, 464 vs 271 files); trimming same NETSDK1175; FD single 169 KB needing .NET Desktop Runtime 8 (58.5 MB installer). .NET 8 support ends 2026-11-10; .NET 10 is LTS to 2028-11-14.\n\nMANIFEST/DPI/RESX: app.manifest with dpiAware=true/PM + dpiAwareness=PerMonitorV2 + longPathAware + asInvoker is embedded correctly in both the net48 EXE and the net10 apphost. On net10 having dpiAware in the manifest triggers analyzer warning WFO0003 (use `<ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>` instead; the source generator emits ApplicationConfiguration.Initialize() calling SetHighDpiMode(PerMonitorV2) — verified via EmitCompilerGeneratedFiles). On net48 the manifest is the right mechanism (0 warnings). `<ApplicationIcon>` .ico and string-only .resx work on Linux for both. A .resx containing a bitmap on net48 FAILS on Linux with MSB3823/MSB3822 unless GenerateResourceUsePreserializedResources=true + System.Resources.Extensions package, which re-adds 5 runtime DLLs (377 KB) — so keep designer resx string-only / use EmbeddedResource files. On net10 the same bitmap resx builds with no extra settings.\n\nRecommendation: net48 with DCJS (or STJ+ILRepack) gives the smallest true zero-install deployment (17 KB-1 MB single EXE, inbox .NET Framework 4.8 on Win10 ≥1903 and all Win11). If a ~50 MB download is acceptable, net10 self-contained single-file is the modern zero-install alternative; net10 FD single-file is tiny but not zero-install.",
+ "findings": [
+  {
+   "claim": "Test A (net48 SDK-style, UseWindowsForms, LangVersion latest, Nullable, Microsoft.NETFramework.ReferenceAssemblies 1.0.3, System.Text.Json 8.0.5) builds on Linux with `dotnet build -c Release` in 2.58 s, 0 warnings, 0 errors; no Mono/Windows needed.",
+   "confidence": "verified",
+   "source": "/tmp/claude-0/-projects/eb06eadf-2fb4-465a-826d-820fbabd8b59/scratchpad/winforms-probe/A-net48/build.log",
+   "design_impact": "critical"
+  },
+  {
+   "claim": "System.Text.Json 8.0.5 on net48 drags in 9 runtime DLLs (System.Text.Json 644,888 B; System.Memory 142,240; System.Numerics.Vectors 115,856; System.Text.Encodings.Web 79,024; Microsoft.Bcl.AsyncInterfaces 26,904; System.Threading.Tasks.Extensions 25,984; System.ValueTuple 25,232; System.Buffers 20,856; System.Runtime.CompilerServices.Unsafe 18,024) plus a .exe.config with binding redirects; output dir = 12 files / 1,120,942 bytes, ProbeA.exe itself 16,896 bytes. STJ 10.0.12's net462 group adds System.IO.Pipelines (10 DLLs).",
+   "confidence": "verified",
+   "source": "find bin/Release/net48 in A-net48; /root/.nuget/packages/system.text.json/8.0.5/system.text.json.nuspec; https://api.nuget.org/v3-flatcontainer/system.text.json/10.0.12/system.text.json.nuspec",
+   "design_impact": "important"
+  },
+  {
+   "claim": "Replacing STJ with DataContractJsonSerializer (`<Reference Include=\"System.Runtime.Serialization\" />`, [DataContract]/[DataMember] on the record) yields a single zero-dependency 17,408-byte ProbeA2.exe (+169-byte exe.config containing only supportedRuntime, + pdb). Build 1.54 s, 0 warnings.",
+   "confidence": "verified",
+   "source": "/tmp/claude-0/-projects/eb06eadf-2fb4-465a-826d-820fbabd8b59/scratchpad/winforms-probe/A2-net48-dcjs/build.log and bin/Release/net48",
+   "design_impact": "critical"
+  },
+  {
+   "claim": "net48 EXEs produced here are AnyCPU IL-only (PE32, CLR 2.5 header, flags ILONLY, no 32BITPREFERRED), subsystem GUI — they run as 64-bit processes on x64 Windows; the SDK does not default Prefer32Bit=true.",
+   "confidence": "verified",
+   "source": "python3 peinfo.py on ProbeA.exe / ProbeA2.exe / ProbeD2.exe; grep Prefer32Bit in /usr/share/dotnet/sdk/10.0.302 targets",
+   "design_impact": "minor"
+  },
+  {
+   "claim": "ILRepack.Lib.MSBuild.Task 2.0.43 runs under Linux .NET-Core MSBuild and merges ProbeA3.exe + the 9 STJ DLLs into one 954,368-byte single EXE (strings JsonSerializer/Utf8JsonWriter present; loose DLLs deleted by the package's CleanReferenceCopyLocalPaths target). It needs TargetPlatformDirectory pointed at ~/.nuget/packages/microsoft.netframework.referenceassemblies.net48/1.0.3/build/.NETFramework/v4.8; with the default TargetPlatformVersion=v4 it fails with 'Failed to find target platform v4 in /usr/share/dotnet/shared/Microsoft.NETCore.App'. Runtime correctness of the merged EXE was NOT executed (no Windows here).",
+   "confidence": "verified",
+   "source": "/tmp/claude-0/-projects/eb06eadf-2fb4-465a-826d-820fbabd8b59/scratchpad/winforms-probe/A3-net48-stj-ilrepack/build.log, build2.log",
+   "design_impact": "important"
+  },
+  {
+   "claim": "`LangVersion=latest` resolves to C# 14.0 on SDK 10.0.302; records, init accessors (with IsExternalInit polyfill), switch expressions, type/property/positional/relational patterns, nullable annotations, string interpolation, async/await, Process.OutputDataReceived/ErrorDataReceived and DllImport all compile unchanged for net48, net8.0-windows and net10.0-windows.",
+   "confidence": "verified",
+   "source": "dotnet /usr/share/dotnet/sdk/10.0.302/Roslyn/bincore/csc.dll -langversion:? ; shared/Program.cs compiled in all projects",
+   "design_impact": "critical"
+  },
+  {
+   "claim": ".NET Framework 4.8 is installed by default on Windows 10 1903, 1909, 2004, 20H2, 21H1, 21H2, 22H2 and Windows 11 21H2 (build 22000); 4.8.1 is inbox on Windows 11 22H2/23H2/24H2/25H2 (22621/22631/26100/26200). So a net48 EXE is genuinely zero-install on any supported Win10/Win11.",
+   "confidence": "verified",
+   "source": "https://learn.microsoft.com/en-us/dotnet/framework/migration-guide/versions-and-dependencies",
+   "design_impact": "critical"
+  },
+  {
+   "claim": "Test B (net10.0-windows + EnableWindowsTargeting=true) builds in 3.53 s with 0 warnings on Linux; the WindowsDesktop targeting/runtime packs (Microsoft.WindowsDesktop.App.Ref / .Runtime.win-x64 10.0.10, Microsoft.NETCore.App.Host.win-x64) are pulled from NuGet automatically.",
+   "confidence": "verified",
+   "source": "/tmp/claude-0/-projects/eb06eadf-2fb4-465a-826d-820fbabd8b59/scratchpad/winforms-probe/B-net10/build.log; ls ~/.nuget/packages",
+   "design_impact": "important"
+  },
+  {
+   "claim": "Plain `dotnet build` (no RID) for net10.0-windows / net8.0-windows on Linux emits a Linux ELF apphost named `ProbeB` with no .exe (file: 'ELF 64-bit LSB pie executable'); you must pass `-r win-x64` (or set <RuntimeIdentifier>win-x64</RuntimeIdentifier>) to get a PE32+ x64 GUI ProbeB.exe (162,304 B apphost + 16 KB ProbeB.dll + deps/runtimeconfig json).",
+   "confidence": "verified",
+   "source": "file B-net10/bin/Release/net10.0-windows/ProbeB; B-net10/bin-winx64/ProbeB.exe via peinfo.py",
+   "design_impact": "important"
+  },
+  {
+   "claim": "net10 self-contained single-file publish (-r win-x64 --self-contained -p:PublishSingleFile -p:IncludeNativeLibrariesForSelfExtract -p:EnableCompressionInSingleFile) = one ProbeB.exe of 51,627,172 bytes (49.2 MiB) + pdb, in 5 s. Without compression: 116,073,772 bytes. Self-contained folder publish: 271 files / 122,758,664 bytes.",
+   "confidence": "verified",
+   "source": "/tmp/claude-0/-projects/eb06eadf-2fb4-465a-826d-820fbabd8b59/scratchpad/winforms-probe/B-net10/pub-sc-single*, pub-sc-folder",
+   "design_impact": "critical"
+  },
+  {
+   "claim": "-p:PublishTrimmed=true with UseWindowsForms is a hard build ERROR, not a warning: 'error NETSDK1175: Windows Forms is not supported or recommended with trimming enabled' raised by Microsoft.NET.RuntimeIdentifierInference.targets line 305 whenever UseWindowsForms==true and PublishTrimmed==true and _SuppressWinFormsTrimError!=true. Identical on net8 and net10.",
+   "confidence": "verified",
+   "source": "B-net10/pub-sc-trimmed.log, C-net8/pub-sc-trimmed.log; /usr/share/dotnet/sdk/10.0.302/Sdks/Microsoft.NET.Sdk/targets/Microsoft.NET.RuntimeIdentifierInference.targets:305",
+   "design_impact": "important"
+  },
+  {
+   "claim": "Forcing trimming with -p:_SuppressWinFormsTrimError=true produces a 15,991,406-byte single EXE with 0 IL warnings in 8 s, but Microsoft documents that 'almost no Windows Forms apps are runnable without built-in COM marshalling, so trimming support for Windows Forms apps is disabled in the .NET SDK' — do not ship this.",
+   "confidence": "verified",
+   "source": "B-net10/pub-sc-trimmed-forced.log; https://learn.microsoft.com/en-us/dotnet/core/deploying/trimming/incompatibilities",
+   "design_impact": "minor"
+  },
+  {
+   "claim": "net10 framework-dependent single-file publish = ProbeB.exe 181,361 bytes (+pdb); its runtimeconfig requires Microsoft.NETCore.App 10.0.0 and Microsoft.WindowsDesktop.App 10.0.0, so the friend must install '.NET Desktop Runtime 10.0.x (Windows x64)'; the current installer windowsdesktop-runtime-10.0.12-win-x64.exe is 60,032,984 bytes. Adding -p:PublishReadyToRun=true cross-compiles fine on Linux (crossgen2 linux-x64 pack downloaded) giving 209,533 bytes.",
+   "confidence": "verified",
+   "source": "B-net10/pub-fd-single, pub-fd-single-r2r; B-net10/bin-winx64/ProbeB.runtimeconfig.json; curl -I https://builds.dotnet.microsoft.com/dotnet/WindowsDesktop/10.0.12/windowsdesktop-runtime-10.0.12-win-x64.exe",
+   "design_impact": "important"
+  },
+  {
+   "claim": "Test C (net8.0-windows) builds and publishes on SDK 10.0.302 with 0 warnings (targeting/runtime packs 8.0.29 auto-downloaded): build 1.45 s; sc-single compressed 71,569,065 bytes; uncompressed 161.6 MB; folder 464 files / 167.5 MB; FD single 168,981 bytes needing .NET Desktop Runtime 8 (installer 58,495,600 bytes); PublishTrimmed same NETSDK1175 error.",
+   "confidence": "verified",
+   "source": "/tmp/claude-0/-projects/eb06eadf-2fb4-465a-826d-820fbabd8b59/scratchpad/winforms-probe/C-net8/*.log, TestC/pub-sc-*",
+   "design_impact": "important"
+  },
+  {
+   "claim": "net8 self-contained output is ~20 MB (compressed) / ~45 MB (raw) larger than net10 because the 8.0 WindowsDesktop runtime pack ships WPF (PresentationCore/PresentationFramework/*.resources, D3DCompiler_47_cor3, PenImc_cor3, DirectWriteForwarder…): 206 files / ~40.3 MB present only in the net8 folder publish; SDK 10 excludes WPF assemblies for a WinForms-only net10 app.",
+   "confidence": "verified",
+   "source": "comm -23 of file lists TestC/pub-sc-folder vs TestB/pub-sc-folder",
+   "design_impact": "minor"
+  },
+  {
+   "claim": ".NET 8 (LTS) support ends 2026-11-10 (two months from now); .NET 9 ends 2026-11-10; .NET 10 is LTS supported until 2028-11-14. Targeting net8 for new work is not advisable.",
+   "confidence": "verified",
+   "source": "https://dotnet.microsoft.com/en-us/platform/support/policy/dotnet-core",
+   "design_impact": "important"
+  },
+  {
+   "claim": "app.manifest (requestedExecutionLevel asInvoker, supportedOS Win10/11 GUID, dpiAware true/PM, dpiAwareness PerMonitorV2, longPathAware, Common-Controls 6 dependency) referenced via <ApplicationManifest> is embedded on Linux into both the net48 EXE and the net10 win-x64 apphost EXE (strings PerMonitorV2/longPathAware/asInvoker found in the binaries); net48 build has 0 warnings.",
+   "confidence": "verified",
+   "source": "D2-net48-manifest/build-a.log; D-net10-manifest/build.log; byte scans of ProbeD2.exe / ProbeD.exe",
+   "design_impact": "important"
+  },
+  {
+   "claim": "On net10 a manifest containing <dpiAware> produces analyzer warning WFO0003 ('Remove high DPI settings from app.manifest and configure via Application.SetHighDpiMode API or ApplicationHighDpiMode project property'). With <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode> the WinForms source generator emits ApplicationConfiguration.Initialize() = EnableVisualStyles(); SetCompatibleTextRenderingDefault(false); SetHighDpiMode(HighDpiMode.PerMonitorV2) (dumped via -p:EmitCompilerGeneratedFiles=true). The default net10 apphost manifest contains no dpiAware entry. Fix: drop dpiAware from the manifest on net10 (keep asInvoker/supportedOS/longPathAware) or NoWarn WFO0003.",
+   "confidence": "verified",
+   "source": "D-net10-manifest/build.log; D4-net10-resx-bitmap/obj/Release/net10.0-windows/win-x64/generated/.../ApplicationConfiguration.g.cs; https://learn.microsoft.com/en-us/dotnet/desktop/winforms/compiler-messages/wfo0003",
+   "design_impact": "important"
+  },
+  {
+   "claim": "On net48, ApplicationHighDpiMode/ApplicationConfiguration.Initialize() do not exist; the manifest's dpiAwareness=PerMonitorV2 (plus Application.EnableVisualStyles()/SetCompatibleTextRenderingDefault in Main) is the mechanism, and it built with 0 warnings on Linux. (An app.config <System.Windows.Forms.ApplicationConfigurationSection DpiAwareness=PerMonitorV2> alternative exists but was not tested.)",
+   "confidence": "verified",
+   "source": "D2-net48-manifest/build-a.log; shared/Program.cs #if NET48 branch",
+   "design_impact": "important"
+  },
+  {
+   "claim": "A .resx containing a non-string resource (bitmap ResXFileRef, as WinForms designer Form.resx files often do) FAILS on net48 under `dotnet build` on Linux: 'error MSB3823: Non-string resources require the property GenerateResourceUsePreserializedResources to be set to true' and 'MSB3822: Non-string resources require the System.Resources.Extensions assembly'. Setting GenerateResourceUsePreserializedResources=true + PackageReference System.Resources.Extensions 8.0.0 builds (0 warnings) but re-adds 5 runtime DLLs (System.Resources.Extensions 80,544; System.Memory; System.Buffers; System.Numerics.Vectors; System.Runtime.CompilerServices.Unsafe; 399 KB total). String-only .resx and <ApplicationIcon>app.ico</ApplicationIcon> build fine with no extra DLLs on net48; the same bitmap .resx builds on net10 with no extra settings.",
+   "confidence": "verified",
+   "source": "D2-net48-manifest/build.log (first failing run), D3-net48-resx-bitmap/build.log, D4-net10-resx-bitmap/build.log",
+   "design_impact": "important"
+  },
+  {
+   "claim": "Build times are warm-cache numbers (NuGet packages and targeting packs were already in ~/.nuget/packages from an earlier session): net48 2.58 s, net48-dcjs 1.54 s, net10 3.53 s, net8 1.45 s; net10 sc-single publish 5 s, net8 6 s; FD single-file publish ≤2 s; forced-trim 8 s; R2R 2 s. First-ever restore additionally downloads Microsoft.WindowsDesktop.App.Ref + .Runtime.win-x64 + NETCore.App.Runtime.win-x64 + Host.win-x64 (tens of MB per TFM).",
+   "confidence": "verified",
+   "source": "'Time Elapsed' lines in each build.log; ls ~/.nuget/packages/microsoft.windowsdesktop.app.runtime.win-x64",
+   "design_impact": "minor"
+  },
+  {
+   "claim": "Nothing in `dotnet build` output differs or warns Linux-specifically versus Windows for these projects; the two cross-platform gotchas are (1) the RID-less apphost being a Linux ELF for net10/net8 and (2) the MSB3823/MSB3822 non-string resx error — the latter is a .NET-Core-MSBuild limitation that also applies to `dotnet build` on Windows (msbuild.exe from Visual Studio would not hit it).",
+   "confidence": "likely",
+   "source": "All build.log files show 0 warnings; MSB3822/MSB3823 message text in /usr/share/dotnet/sdk/10.0.302/Microsoft.Common.CurrentVersion.targets:3458",
+   "design_impact": "minor"
+  },
+  {
+   "claim": "Runtime behaviour (MessageBoxW P/Invoke, cmd.exe Process with OutputDataReceived, DataContractJsonSerializer round-trip of a positional record with init setters, STJ 8 record deserialization on net48, ILRepack-merged EXE) could not be executed on this box (no Windows, no Wine); all are standard, documented patterns but remain untested here.",
+   "confidence": "uncertain",
+   "source": "n/a — only compilation verified in this session",
+   "design_impact": "important"
+  }
+ ],
+ "snippets": [
+  {
+   "title": "csproj — net48 zero-dependency single EXE (recommended baseline; DataContractJsonSerializer for JSON)",
+   "code": "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    <TargetFramework>net48</TargetFramework>\n    <OutputType>WinExe</OutputType>\n    <UseWindowsForms>true</UseWindowsForms>\n    <LangVersion>latest</LangVersion>\n    <Nullable>enable</Nullable>\n    <ImplicitUsings>disable</ImplicitUsings>\n    <AssemblyName>HdrCastSender</AssemblyName>\n    <RootNamespace>HdrCast</RootNamespace>\n    <ApplicationManifest>app.manifest</ApplicationManifest>   <!-- PerMonitorV2 DPI lives here on net48 -->\n    <ApplicationIcon>app.ico</ApplicationIcon>\n    <!-- keep .resx string-only; a bitmap in .resx needs GenerateResourceUsePreserializedResources + System.Resources.Extensions (5 extra DLLs) -->\n  </PropertyGroup>\n  <ItemGroup>\n    <PackageReference Include=\"Microsoft.NETFramework.ReferenceAssemblies\" Version=\"1.0.3\" PrivateAssets=\"all\" />\n    <Reference Include=\"System.Runtime.Serialization\" />\n  </ItemGroup>\n</Project>",
+   "notes": "Verified: `dotnet build -c Release` on Linux → bin/Release/net48/ProbeA2.exe 17 KB + 169 B .exe.config (only <supportedRuntime>), 0 warnings, 1.5 s. Runs on inbox .NET Framework 4.8/4.8.1 (Win10 ≥1903, all Win11). Program.cs must include the IsExternalInit polyfill and use Application.EnableVisualStyles()/SetCompatibleTextRenderingDefault(false) in Main (no ApplicationConfiguration.Initialize on net48)."
+  },
+  {
+   "title": "csproj — net48 + System.Text.Json merged into ONE EXE with ILRepack (verified build on Linux)",
+   "code": "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    <TargetFramework>net48</TargetFramework>\n    <OutputType>WinExe</OutputType>\n    <UseWindowsForms>true</UseWindowsForms>\n    <LangVersion>latest</LangVersion>\n    <Nullable>enable</Nullable>\n    <ImplicitUsings>disable</ImplicitUsings>\n  </PropertyGroup>\n  <ItemGroup>\n    <PackageReference Include=\"Microsoft.NETFramework.ReferenceAssemblies\" Version=\"1.0.3\" PrivateAssets=\"all\" />\n    <PackageReference Include=\"System.Text.Json\" Version=\"8.0.5\" />\n    <PackageReference Include=\"ILRepack.Lib.MSBuild.Task\" Version=\"2.0.43\" PrivateAssets=\"all\" />\n  </ItemGroup>\n</Project>\n\n<!-- ILRepack.targets (next to the csproj) — replaces the package's default target so we can point at the net48 reference assemblies: -->\n<Project>\n  <Target Name=\"ILRepacker\" AfterTargets=\"Build\" Condition=\"'$(Configuration)' == 'Release'\">\n    <ItemGroup>\n      <InputAssemblies Include=\"$(OutputPath)$(AssemblyName).exe\" />\n      <InputAssemblies Include=\"$(OutputPath)*.dll\" />\n    </ItemGroup>\n    <ILRepack Parallel=\"true\" Internalize=\"true\" TargetKind=\"WinExe\"\n              InputAssemblies=\"@(InputAssemblies)\"\n              TargetPlatformDirectory=\"$(NuGetPackageRoot)microsoft.netframework.referenceassemblies.net48/1.0.3/build/.NETFramework/v4.8\"\n              LibraryPath=\"$(OutputPath);$(NuGetPackageRoot)microsoft.netframework.referenceassemblies.net48/1.0.3/build/.NETFramework/v4.8;$(NuGetPackageRoot)microsoft.netframework.referenceassemblies.net48/1.0.3/build/.NETFramework/v4.8/Facades\"\n              OutputFile=\"$(OutputPath)merged/$(AssemblyName).exe\" />\n  </Target>\n</Project>",
+   "notes": "In the probe (A3-net48-stj-ilrepack) the ILRepack task was placed inline in the csproj and the package's default in-place target ALSO ran; both produced a 954 KB single EXE with STJ + 8 helper DLLs merged. Without TargetPlatformDirectory the task fails: 'Failed to find target platform v4 in /usr/share/dotnet/shared/Microsoft.NETCore.App'. Runtime of the merged EXE not executed here (no Windows)."
+  },
+  {
+   "title": "csproj — net10.0-windows (build on Linux with -r win-x64; publish self-contained single-file)",
+   "code": "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    <TargetFramework>net10.0-windows</TargetFramework>\n    <OutputType>WinExe</OutputType>\n    <UseWindowsForms>true</UseWindowsForms>\n    <EnableWindowsTargeting>true</EnableWindowsTargeting>\n    <RuntimeIdentifier>win-x64</RuntimeIdentifier>   <!-- otherwise `dotnet build` on Linux emits a Linux ELF apphost, no .exe -->\n    <LangVersion>latest</LangVersion>\n    <Nullable>enable</Nullable>\n    <ImplicitUsings>disable</ImplicitUsings>\n    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>   <!-- NOT in app.manifest on net10 → WFO0003 -->\n    <ApplicationVisualStyles>true</ApplicationVisualStyles>\n    <ApplicationUseCompatibleTextRendering>false</ApplicationUseCompatibleTextRendering>\n    <ApplicationManifest>app.manifest</ApplicationManifest>   <!-- keep asInvoker/supportedOS/longPathAware only -->\n    <ApplicationIcon>app.ico</ApplicationIcon>\n    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>\n  </PropertyGroup>\n</Project>\n\n# zero-install (49 MiB single exe):\ndotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -o out/sc\n# needs .NET Desktop Runtime 10 on the target (181 KB exe):\ndotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o out/fd\n# NOT possible: -p:PublishTrimmed=true → error NETSDK1175",
+   "notes": "Main() must call ApplicationConfiguration.Initialize(); the WinForms source generator produces it from the Application* properties (verified generated code calls SetHighDpiMode(HighDpiMode.PerMonitorV2)). Measured: sc-single 51,627,172 B; fd-single 181,361 B; forced trim (unsupported) 15.99 MB."
+  },
+  {
+   "title": "app.manifest used in the probe (PerMonitorV2 DPI, Win10/11, asInvoker, long paths, ComCtl6)",
+   "code": "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<assembly manifestVersion=\"1.0\" xmlns=\"urn:schemas-microsoft-com:asm.v1\">\n  <assemblyIdentity version=\"1.0.0.0\" name=\"HdrCast.app\"/>\n  <trustInfo xmlns=\"urn:schemas-microsoft-com:asm.v2\">\n    <security><requestedPrivileges xmlns=\"urn:schemas-microsoft-com:asm.v3\">\n      <requestedExecutionLevel level=\"asInvoker\" uiAccess=\"false\" />\n    </requestedPrivileges></security>\n  </trustInfo>\n  <compatibility xmlns=\"urn:schemas-microsoft-com:compatibility.v1\">\n    <application><supportedOS Id=\"{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}\" /></application> <!-- Win10/11 -->\n  </compatibility>\n  <application xmlns=\"urn:schemas-microsoft-com:asm.v3\">\n    <windowsSettings>\n      <!-- net48: keep these two lines. net10: DELETE them (WFO0003) and use <ApplicationHighDpiMode> instead -->\n      <dpiAware xmlns=\"http://schemas.microsoft.com/SMI/2005/WindowsSettings\">true/PM</dpiAware>\n      <dpiAwareness xmlns=\"http://schemas.microsoft.com/SMI/2016/WindowsSettings\">PerMonitorV2</dpiAwareness>\n      <longPathAware xmlns=\"http://schemas.microsoft.com/SMI/2016/WindowsSettings\">true</longPathAware>\n    </windowsSettings>\n  </application>\n  <dependency><dependentAssembly>\n    <assemblyIdentity type=\"win32\" name=\"Microsoft.Windows.Common-Controls\" version=\"6.0.0.0\" processorArchitecture=\"*\" publicKeyToken=\"6595b64144ccf1df\" language=\"*\" />\n  </dependentAssembly></dependency>\n</assembly>",
+   "notes": "Verified embedded (byte-scan for PerMonitorV2/longPathAware/asInvoker) in ProbeD2.exe (net48, 0 warnings) and in the net10 apphost ProbeD.exe (1 warning WFO0003 because dpiAware was left in)."
+  },
+  {
+   "title": "net48 polyfill + DataContractJsonSerializer helper + async Process pattern (compiled on all targets)",
+   "code": "// IsExternalInit.cs — required for `init`/records on net48 (omit on net8/net10)\nnamespace System.Runtime.CompilerServices { internal static class IsExternalInit { } }\n\n[DataContract]\npublic record AppConfig([property: DataMember] string Host, [property: DataMember] int Port, [property: DataMember] int BitrateMbps)\n{\n    [DataMember] public string Codec { get; init; } = \"hevc\";\n}\n\ninternal static class Json\n{\n    public static string Serialize<T>(T value)\n    {\n        var ser = new DataContractJsonSerializer(typeof(T));\n        using var ms = new MemoryStream(); ser.WriteObject(ms, value);\n        return Encoding.UTF8.GetString(ms.ToArray());\n    }\n    public static T? Deserialize<T>(string json) where T : class\n    {\n        var ser = new DataContractJsonSerializer(typeof(T));\n        using var ms = new MemoryStream(Encoding.UTF8.GetBytes(json));\n        return ser.ReadObject(ms) as T;\n    }\n}\n\n// ffmpeg-style child process with async stdout/stderr\nvar psi = new ProcessStartInfo { FileName = \"ffmpeg.exe\", Arguments = args, UseShellExecute = false,\n    RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true, StandardOutputEncoding = Encoding.UTF8 };\nvar proc = new Process { StartInfo = psi, EnableRaisingEvents = true };\nproc.OutputDataReceived += (s, e) => { if (e.Data is { } d) Append($\"[out] {d}\"); };\nproc.ErrorDataReceived  += (s, e) => { if (e.Data is { } d) Append($\"[err] {d}\"); };\nvar tcs = new TaskCompletionSource<int>();\nproc.Exited += (s, e) => tcs.TrySetResult(proc.ExitCode);\nproc.Start(); proc.BeginOutputReadLine(); proc.BeginErrorReadLine();\nint code = await tcs.Task;\n\n[DllImport(\"user32.dll\", CharSet = CharSet.Unicode, SetLastError = true)]\nstatic extern int MessageBoxW(IntPtr hWnd, string text, string caption, uint type);\n\n// Main:\n#if NET48\n    Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false);\n#else\n    ApplicationConfiguration.Initialize();\n#endif\n    Application.Run(new MainForm());",
+   "notes": "Full file: /tmp/claude-0/-projects/eb06eadf-2fb4-465a-826d-820fbabd8b59/scratchpad/winforms-probe/A2-net48-dcjs/Program.cs (DCJS) and shared/Program.cs (STJ). Append() marshals to the UI thread via InvokeRequired/BeginInvoke because OutputDataReceived fires on a threadpool thread. DCJS output is compact (no indentation) and property order follows DataMember order; not executed here."
+  }
+ ],
+ "open_questions": [
+  "Runtime verification on real Windows is still needed for: DataContractJsonSerializer round-tripping a positional record with init-only setters (expected to work via reflection, untested), STJ 8.0.5 deserializing records on net48, MessageBoxW/Process/OutputDataReceived behaviour, and especially the ILRepack-merged single EXE (Internalize=true can occasionally break reflection-based serializers).",
+  "Which Windows 10 build does the friend run? .NET Framework 4.8 is inbox only from 1903 onward; anything older (1809-) is out of support anyway but would need the 4.8 offline installer.",
+  "For net48, which C# 14 features beyond the ones tested need extra polyfills (e.g. `required` members need RequiredMemberAttribute/SetsRequiredMembersAttribute/CompilerFeatureRequiredAttribute; nullable attributes like [NotNullWhen] must be declared internally; default interface members and static abstract members are unusable on the 4.8 runtime)? Not exercised in this probe.",
+  "If the WinForms designer (Visual Studio on Windows) is used later, its Form.resx files may pick up non-string resources (ImageList/Icon streams) and reintroduce the MSB3823/MSB3822 requirement (+5 DLLs on net48); a code-only UI or string-only resx avoids it.",
+  "Cold-cache first build time (targeting/runtime pack download for net10/net8 win-x64) was not measured — packages were already cached from a prior session.",
+  "Whether an app.config <System.Windows.Forms.ApplicationConfigurationSection DpiAwareness=\"PerMonitorV2\"/> is preferable to the manifest on net48 (both are Microsoft-documented for .NET Framework 4.7+; only the manifest route was tested)."
+ ],
+ "recommendation": "Use net48 for both the sender and receiver GUIs. It is the only target that gives a true zero-install deployment: a single AnyCPU EXE of ~20 KB (DataContractJsonSerializer for the config file, verified) or ~1 MB (System.Text.Json 8.0.5 merged with ILRepack.Lib.MSBuild.Task, verified build) that runs on the .NET Framework 4.8/4.8.1 that is inbox on every supported Windows 10 (≥1903) and Windows 11. Everything you need — C# 14 records/init (with the 3-line IsExternalInit polyfill), pattern matching, nullable, async/await, Process with OutputDataReceived/ErrorDataReceived, P/Invoke — compiles unchanged on this Linux box with `dotnet build -c Release` in ~2 s and zero warnings. Put PerMonitorV2 DPI awareness in app.manifest (verified embedded), use <ApplicationIcon>, and keep .resx files string-only (a bitmap in .resx costs 5 extra DLLs on net48 under .NET-Core MSBuild). If you want System.Text.Json without ILRepack, accept 9 loose DLLs (~1.1 MB) next to the EXE — still no runtime install. Choose net10.0-windows only if you are fine shipping a ~50 MB self-contained single-file EXE (trimming is a hard error NETSDK1175 for WinForms; no smaller zero-install variant exists) — and if you do, set RuntimeIdentifier=win-x64 (plain `dotnet build` on Linux emits a Linux apphost), use <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode> instead of manifest dpiAware (WFO0003), and prefer net10 (LTS to Nov 2028) over net8 (EOL 10 Nov 2026, and 20 MB larger because its runtime pack bundles WPF). The 181 KB framework-dependent net10 single-file is not zero-install (friend must run the 60 MB .NET Desktop Runtime 10 installer), so it does not meet the stated goal."
+}

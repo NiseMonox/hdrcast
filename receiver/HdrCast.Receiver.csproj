@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- net48: runs on the .NET Framework 4.8 that ships inside Windows 10 (1903+) / 11. Single EXE, zero install.
+       Built on Linux with `dotnet build -c Release` (reference assemblies come from NuGet). -->
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <OutputType>WinExe</OutputType>
+    <UseWindowsForms>true</UseWindowsForms>
+    <AssemblyName>HdrCastReceiver</AssemblyName>
+    <RootNamespace>HdrCast.Receiver</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <DebugType>none</DebugType>
+    <Prefer32Bit>false</Prefer32Bit>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+    <Reference Include="System.Runtime.Serialization" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- shared, platform-neutral logic (also compiled into the receiver and the Linux test project) -->
+    <Compile Include="../shared/**/*.cs" LinkBase="Shared" />
+  </ItemGroup>
+</Project>

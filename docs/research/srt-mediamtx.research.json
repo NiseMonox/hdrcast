@@ -1,0 +1,243 @@
+{
+ "topic": "srt-mediamtx",
+ "summary": "All claims below were checked against primary sources (ffmpeg release/7.1 libsrt.c + mpegtsenc.c, ffmpeg.org docs, MediaMTX v1.21.0 sources/docs/mediamtx.yml, Haivision srt docs) and against live experiments on the Debian 13 box (ffmpeg 7.1.5 / libsrt 1.5.4 / mpv 0.40 / Docker bluenviron/mediamtx:1.21.0, released 2026-09-05). Two of the user's own MediaMTX containers (mediamtx-relay on 8890, mediamtx-screen on 18890) were left untouched; tests used other host ports and were cleaned up.\n\nMediaMTX: SRT server is `srt: yes` / `srtAddress: :8890` (UDP). Stream ID grammar (internal/servers/srt/streamid.go): `publish:<path>[:<query>]`, `publish:<path>:<user>:<pass>[:<query>]`, same with `read:`; plus the Haivision standard form `#!::m=publish|request,r=<path>,u=<user>,s=<pass>`. Both forms worked. Per-path `srtPublishPassphrase` / `srtReadPassphrase` are the SRT AES keys for each leg and can differ (verified: wrong/missing passphrase -> \"invalid passphrase\"/\"passphrase not provided by client\"); `authInternalUsers` restricts publish vs read per path (verified: viewer creds cannot publish). MediaMTX never sets an SRT latency itself; gosrt defaults are 120 ms rcv/peer latency, so the client's `latency` is honoured as the negotiated max (verified through /v3/srtconns/list: 1500 ms publisher and 2500 ms reader each showed as msReceive/msSendTsbPdDelay). Codecs over SRT/MPEG-TS (docs table): video H265, H264, MPEG-4 Video, MPEG-1/2 Video; audio Opus, AAC, MP3, AC-3; other KLV. No AV1/VP9 in MPEG-TS. HLS output supports AV1, VP9, H265, H264, Opus, FLAC, AAC; HEVC Main10 HDR was served as LL-HLS/fMP4 with CODECS=\"hvc1.2.4.L120.90\" behind basic auth (401 without). HEVC Main10 + PQ/BT.2020 VUI + mastering-display/MaxCLL SEI passed through the relay bit-exact (ffprobe side data identical). Docker bridge `-p 8890:8890/udp` works for SRT; host networking is not needed (docs reserve it for RTSP-UDP); clients from the LAN show their real IP, but localhost clients show as 172.17.0.1 (matters for `ips:` rules and the default localhost-only API rule). `udpReadBufferSize` larger than host `net.core.rmem_max` is a fatal listener error. A reader that connects before the publisher is rejected (\"no stream is available on path\") so the receiver GUI must retry. The HLS muxer counts against `maxReaders`.\n\nAV1: neither MediaMTX nor ffmpeg 7.1/master's mpegts muxer supports AV1 in MPEG-TS (ffmpeg writes it as private stream_type 0x06 and cannot read it back). AV1 over SRT only works direct (no relay) in Matroska or NUT (tested OK on loopback).\n\nffmpeg srt://: URL `?k=v&...` and `-k v` CLI options are equivalent (`-srt_streamid` is the CLI alias, tested). latency/rcvlatency/peerlatency/snddropdelay/timeout/listen_timeout are MICROSECONDS (code divides by 1000 to ms); connect_timeout is ms; maxbw/inputbw bytes/s; oheadbw %; pkt_size bytes (default -1 -> libsrt 1316; ffmpeg then sets avio max_packet_size from SRTO_PAYLOADSIZE so every SRT packet carries exactly 7x188 TS bytes). maxbw: -1 unlimited (default), 0 relative = inputbw*(100+oheadbw)/100, >0 absolute B/s. Rendezvous mode is broken in ffmpeg 7.1 and master: it srt_bind()s to the REMOTE address, so a real peer fails with \"Cannot assign requested address\" (tested). Listener side needs the UDP port forward; the caller side needs nothing.\n\nThroughput: 50 and 100 Mbps HEVC10 through MediaMTX at 2 s latency worked with 0 loss on the publish leg, BUT the libsrt reader (ffmpeg/mpv) breaks with \"No room to store incoming packet ... 8192\" then \"SEQUENCE DISCREPANCY\" whenever latency x bitrate exceeds libsrt's default 8192-packet receive buffer, because gosrt keeps sending; fixed by `rcvbuf`+`ffs` (+`recv_buffer_size`) on the reader. Direct libsrt<->libsrt did not show this on loopback. Haivision's own guidance: SRT latency = RTT multiplier x RTT, multiplier ~4 on a 0.1-0.2% loss network, table up to 30; oheadbw default 25%.\n\nDeliverable files (validated with `mediamtx --validate-conf` and run end-to-end with the exact URLs): /tmp/claude-0/-projects/eb06eadf-2fb4-465a-826d-820fbabd8b59/scratchpad/srt/deliverable/docker-compose.yml and mediamtx.yml. Windows availability: gyan.dev essentials+full ffmpeg include libsrt (librist only in full); BtbN gpl builds include both; mpv Windows builds by shinchiro (mpv-winbuild-cmake, also ships ffmpeg .7z) and zhongfly bundle libsrt; mpv whitelists srt:// and rist://.",
+ "findings": [
+  {
+   "claim": "MediaMTX latest release is v1.21.0 (2026-09-05); Docker Hub tags: latest, 1, 1.21.0 plus -ffmpeg / -rpi / -ffmpeg-rpi variants. Image entrypoint /mediamtx, config read from /mediamtx.yml, no EXPOSE, env overrides MTX_<UPPERCASE_KEY>. New flag --validate-conf=<path>.",
+   "confidence": "verified",
+   "source": "https://api.github.com/repos/bluenviron/mediamtx/releases/latest ; docker image inspect bluenviron/mediamtx:1.21.0 ; docker run --rm bluenviron/mediamtx:1.21.0 --help",
+   "design_impact": "important"
+  },
+  {
+   "claim": "Default mediamtx.yml: `srt: true`, `srtAddress: :8890` (UDP/SRT listener); `udpMaxPayloadSize: 1452` -> SRT payload to readers = ((1452-16)/188)*188 = 1316 bytes (srtMaxPayloadSize in internal/servers/srt/server.go); `udpReadBufferSize: 0` (OS default), `writeQueueSize: 512`.",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/bluenviron/mediamtx/v1.21.0/mediamtx.yml ; https://raw.githubusercontent.com/bluenviron/mediamtx/v1.21.0/internal/servers/srt/server.go",
+   "design_impact": "important"
+  },
+  {
+   "claim": "Stream ID grammar (v1.21.0 streamid.go): custom form `publish:<path>`, `publish:<path>:<query>`, `publish:<path>:<user>:<pass>`, `publish:<path>:<user>:<pass>:<query>` (same with `read:`; 2-5 colon-separated parts, trailing `#feedbackplay` stripped); standard form `#!::m=publish|request,r=<path>,u=<user>,s=<pass>` (keys h,t ignored). Both forms tested against the server.",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/bluenviron/mediamtx/v1.21.0/internal/servers/srt/streamid.go ; docs/2-features/24-srt-specific-features.md ; local test (ffprobe with streamid=#!::m=request,r=screen,u=viewer,s=viewpass456 read OK)",
+   "design_impact": "critical"
+  },
+  {
+   "claim": "Per-path `srtPublishPassphrase` and `srtReadPassphrase` are the SRT encryption passphrases for the publish and read legs and may differ. Behaviour verified: publish without passphrase -> 'closed: passphrase not provided by client'; read with the publish passphrase -> 'closed: invalid passphrase'; correct passphrase + creds -> OK. Passphrase check happens after user/pass authentication. A caller requesting pbkeylen=32 (AES-256) is accepted by MediaMTX/gosrt.",
+   "confidence": "verified",
+   "source": "mediamtx.yml v1.21.0 lines 515-516 and 600-601; internal/servers/srt/conn.go srtCheckPassphrase(); local docker test (container mtxauth)",
+   "design_impact": "critical"
+  },
+  {
+   "claim": "authInternalUsers restricts publish vs read per path: user `sender` with `action: publish, path: screen` and user `viewer` with `action: read, path: screen`; publishing with viewer creds -> 'failed to authenticate: authentication failed'; reading without creds when only viewer may read -> rejected. Credentials for SRT go in the streamid (`publish:screen:sender:pass`); for HLS via HTTP Basic (URL http://viewer:pass@host:8888/screen/index.m3u8 works; no auth -> 401 after a 302 ?cookieCheck=1 redirect).",
+   "confidence": "verified",
+   "source": "docs/2-features/06-authentication.md ; local docker test",
+   "design_impact": "critical"
+  },
+  {
+   "claim": "MediaMTX does not set any SRT latency (server.go uses srt.DefaultConfig() unchanged; gosrt defaults ReceiverLatency=PeerLatency=120 ms, Latency=-1, MaxBW=-1, OverheadBW=25, PBKeylen=16, EnforcedEncryption=true, FC=25600, TransmissionType=live, TooLatePacketDrop=true). The client-set `latency` is therefore honoured as max(client, 120 ms): API /v3/srtconns/list showed msReceiveTsbPdDelay=1500 for a publisher using latency=1500000 and msSendTsbPdDelay=2500 for a reader using latency=2500000.",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/bluenviron/mediamtx/v1.21.0/internal/servers/srt/server.go ; https://raw.githubusercontent.com/datarhei/gosrt/a77b40bb4b76/config.go ; local API query",
+   "design_impact": "critical"
+  },
+  {
+   "claim": "Codecs accepted over SRT (publish and read) and MPEG-TS, quoted from the docs table: video 'H265, H264, MPEG-4 Video (H263, Xvid), MPEG-1/2 Video'; audio 'Opus, MPEG-4 Audio (AAC), MPEG-1/2 Audio (MP3), AC-3'; other 'KLV'. HLS read table: video 'AV1, VP9, H265, H264'; audio 'Opus, FLAC, MPEG-4 Audio (AAC)'; other 'KLV (MPEG-TS-based HLS only)'. mediacommon v2.9.4 mpegts reader has callbacks only for H264/H265/MPEG-1/2/4 video, Opus, MPEG-4 audio (ADTS and LATM), MPEG-1 audio, AC-3, E-AC-3 -> no AV1/VP9 in TS.",
+   "confidence": "verified",
+   "source": "docs/3-publish/03-srt-clients.md, docs/4-read/02-srt.md, docs/4-read/06-hls.md (v1.21.0); https://raw.githubusercontent.com/bluenviron/mediacommon/v2.9.4/pkg/formats/mpegts/reader.go",
+   "design_impact": "critical"
+  },
+  {
+   "claim": "HEVC Main10 (yuv420p10le) + Opus in MPEG-TS over SRT round-trips through MediaMTX 1.21.0: server logs '2 tracks (H265, Opus)', ffprobe on the read side shows hevc Main 10 yuv420p10le + opus 48 kHz. HDR10 signalling survives bit-exact: color bt2020/smpte2084/bt2020nc VUI and SEI 'Mastering display metadata' (white point 15635/16450, max 10000000/10000, min 1/10000) and 'Content light level' (max_content 1000) identical on input file and on the SRT read side.",
+   "confidence": "verified",
+   "source": "local test: ffmpeg libx265 -x265-params master-display=...:max-cll=1000,400 -> srt publish -> ffprobe -show_frames on srt://...streamid=read:screen",
+   "design_impact": "critical"
+  },
+  {
+   "claim": "AV1 in MPEG-TS is not viable anywhere in this stack: ffmpeg 7.1 (and current master) mpegtsenc.c has no AV1 case and muxes it as 'private data stream (stream_type 0x06) and may not be recognized upon reading'; ffprobe of the resulting .ts shows codec bin_data, so `-c copy` to SRT fails with 'Output file does not contain any stream'. MediaMTX's codec list also excludes AV1 for SRT/TS. AV1 10-bit over SRT does work DIRECT (no relay) with `-f matroska -live 1` or `-f nut` (ffprobe read side: av1 Main yuv420p10le), but those containers lack TS-style resync under packet drops.",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/FFmpeg/FFmpeg/release/7.1/libavformat/mpegtsenc.c (default case in mpegts_get_stream_type); local tests (libsvtav1 -> mpegts -> ffprobe = bin_data; matroska/nut over srt listener/caller OK)",
+   "design_impact": "critical"
+  },
+  {
+   "claim": "MediaMTX serves HLS of the same HEVC 10-bit stream simultaneously (default hlsVariant: lowLatency = fMP4 parts/segments, hlsSegmentDuration 1s, hlsPartDuration 200ms). Master playlist showed CODECS=\"hvc1.2.4.L120.90\", RESOLUTION=1920x1080; ffprobe over HLS reported hevc Main 10 yuv420p10le. HLS muxer is created on first request (hlsAlwaysRemux: false) and counts as a path reader (a `maxReaders` limit rejected an SRT reader with 'maximum reader count reached').",
+   "confidence": "verified",
+   "source": "mediamtx.yml v1.21.0 HLS section; local curl/ffprobe on http://viewer:pass@127.0.0.1:38888/screen/index.m3u8; docker logs",
+   "design_impact": "important"
+  },
+  {
+   "claim": "Docker: `-p 8890:8890/udp` bridge mapping is sufficient for SRT publish and read (both worked); the docs say `--network=host` is only needed for RTSP-over-UDP. Client IP preservation: a client connecting via the LAN IP 192.168.1.201 was logged as 192.168.1.201, but clients connecting via 127.0.0.1 appear as the bridge gateway 172.17.0.1 (docker-proxy), which breaks the default config's localhost-only API rule (`ips: [127.0.0.1, ::1]` -> 'authentication error') unless 172.16.0.0/12 is added.",
+   "confidence": "verified",
+   "source": "docs/1-kickoff/2-install.md ; local docker tests and MediaMTX logs",
+   "design_impact": "important"
+  },
+  {
+   "claim": "`udpReadBufferSize` must be <= host `net.core.rmem_max` (not namespaced, cannot be set via compose sysctls). With 8000000 on a host whose rmem_max is 4194304 MediaMTX logs 'ERR listen: listen udp :8890: unable to set UDP read buffer size to 8000000, got 4194304' and the SRT/HLS listeners are not usable. Docs recommend `udpReadBufferSize: 1000000` plus `sysctl net.core.rmem_max=100000000` to reduce packet loss, and `writeQueueSize: 1024` against 'reader is too slow'.",
+   "confidence": "verified",
+   "source": "docs/2-features/28-decrease-packet-loss.md ; local failure with the deliverable config before lowering the value",
+   "design_impact": "important"
+  },
+  {
+   "claim": "A reader that connects to a `source: publisher` path before the publisher is live is rejected immediately ('closed: no stream is available on path ...'); MediaMTX does not hold SRT readers waiting. The receiver GUI must retry (e.g. loop mpv/ffmpeg until connected).",
+   "confidence": "verified",
+   "source": "docker logs mtxtest during m5/m6/m7 runs",
+   "design_impact": "important"
+  },
+  {
+   "claim": "MediaMTX Control API (api: yes, :9997) exposes per-connection SRT stats at GET /v3/srtconns/list: msRTT, mbpsSendRate/mbpsReceiveRate, mbpsMaxBW, msSendTsbPdDelay/msReceiveTsbPdDelay (negotiated latency), packetsReceivedLoss, packetsRetrans, packetsReceivedDrop, msReceiveBuf, packetsFlowWindow, byteAvailReceiveBuf etc. Useful for a sender/receiver GUI health display.",
+   "confidence": "verified",
+   "source": "local curl http://127.0.0.1:29997/v3/srtconns/list",
+   "design_impact": "minor"
+  },
+  {
+   "claim": "ffmpeg 7.1 srt:// option parsing: keys in the URL query (maxbw, pbkeylen, passphrase, enforced_encryption, kmrefreshrate, kmpreannounce, snddropdelay, mss, ffs, ipttl, iptos, inputbw, oheadbw, latency, tsbpddelay, rcvlatency, peerlatency, tlpktdrop, nakreport, connect_timeout, payload_size|pkt_size, mode, sndbuf, rcvbuf, lossmaxttl, minversion, streamid, smoother, messageapi, transtype, linger, plus timeout and listen_timeout) are read with av_find_info_tag in libsrt_open/libsrt_setup; passphrase, streamid and smoother are percent-decoded (ff_urldecode) so '&', '%' or '+' inside them must be percent-encoded. Every key is also an AVOption usable as a CLI flag before the URL (`-srt_streamid` is the alias of streamid because `-streamid` is an ffmpeg CLI option); tested `-srt_streamid publish:clitest -latency 1500000 -pkt_size 1316 srt://host:port`.",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/FFmpeg/FFmpeg/release/7.1/libavformat/libsrt.c (libsrt_options[], libsrt_open, libsrt_setup); local CLI test",
+   "design_impact": "critical"
+  },
+  {
+   "claim": "Units in ffmpeg's srt protocol: latency, rcvlatency, peerlatency, tsbpddelay, snddropdelay, timeout, listen_timeout = MICROSECONDS (code does `s->latency / 1000` before SRTO_LATENCY which is ms); connect_timeout = milliseconds (caller default 3000, x10 in rendezvous); maxbw and inputbw = bytes/second; oheadbw = percent (5..100, default 25); pkt_size/payload_size = bytes, default -1 (auto -> 1316 in live mode, max 1456); sndbuf/rcvbuf/recv_buffer_size/send_buffer_size = bytes; ffs = packets (SRTO_FC, default 25600; ffmpeg doc wrongly says bytes); mode default caller; transtype default unset (= libsrt live); tlpktdrop/nakreport default -1 (libsrt defaults: on in live mode); pbkeylen 0/16/24/32; passphrase 10-79 chars; enforced_encryption default true (mismatched passphrases are rejected).",
+   "confidence": "verified",
+   "source": "libsrt.c libsrt_set_options_pre(); https://ffmpeg.org/ffmpeg-protocols.html#srt ; Haivision docs/API/API-socket-options.md (SRTO_LATENCY ms, SRTO_FC pkts, SRTO_RCVBUF bytes)",
+   "design_impact": "critical"
+  },
+  {
+   "claim": "`latency` sets both SRTO_RCVLATENCY and SRTO_PEERLATENCY; the effective latency of a connection is the maximum of the receiver's rcvlatency and the sender's peerlatency (negotiated in the handshake). So set the same value on both ends, or set it on the receiver only for a receiver-controlled delay.",
+   "confidence": "verified",
+   "source": "Haivision API-socket-options.md SRTO_LATENCY/SRTO_RCVLATENCY/SRTO_PEERLATENCY; ffmpeg protocols doc; MediaMTX API test",
+   "design_impact": "important"
+  },
+  {
+   "claim": "maxbw semantics: -1 = unlimited (live-mode cap 1 Gbps, libsrt default even in live mode), 0 = relative: MAXBW = INPUTBW*(100+OHEADBW)/100 with INPUTBW estimated from the input if inputbw=0, >0 = absolute bytes/s. Haivision recommends setting inputbw to the anticipated stream bitrate and keeping oheadbw at 25% for live; oheadbw 'too low ... your stream will choke and break quickly at any rise in packet loss'. tlpktdrop (default on in live) drops too-late packets on both sides; snddropdelay (µs in ffmpeg) adds sender drop delay, -1 disables sender drops.",
+   "confidence": "verified",
+   "source": "Haivision API-socket-options.md SRTO_MAXBW/SRTO_INPUTBW/SRTO_OHEADBW/SRTO_TLPKTDROP/SRTO_SNDDROPDELAY; ffmpeg protocols doc",
+   "design_impact": "important"
+  },
+  {
+   "claim": "After connecting, ffmpeg reads SRTO_PAYLOADSIZE and sets URLContext max_packet_size to it (1316 by default), so the AVIO layer flushes every 1316 bytes = exactly 7 TS packets per SRT packet without extra settings; MediaMTX's own read output is also 1316-byte aligned. pkt_size=1316 in the URL is nevertheless what the MediaMTX docs show for publishing.",
+   "confidence": "verified",
+   "source": "libsrt.c libsrt_setup() 'if (packet_size > 0) h->max_packet_size = packet_size;' ; MediaMTX docs/3-publish/17-ffmpeg.md",
+   "design_impact": "important"
+  },
+  {
+   "claim": "Haivision's official guidance: 'SRT Latency = RTT Multiplier * RTT'; 'On a fairly good network (0.1 to 0.2% loss), with no burst loss, a rule of thumb for this value would be approximately 4'; conservative table: loss <=1% -> multiplier 3 / overhead 1%, <=3% -> 4 / 4%, <=7% -> 6 / 9%, <=10% -> 8 / 15%, <=12% -> 8 / 20%, <=21% -> 10 / 38%, <=25% -> 13 / 46%, <=30% -> 14 / 61%, <=40% -> 30 / 97%. Multiplier below 3 is ineffective, above 20 indicates severe congestion (Haivision blog).",
+   "confidence": "verified",
+   "source": "https://doc.haivision.com/SRT/1.5.3/Haivision/rtt-multiplier ; https://www.haivision.com/blog/all/how-to-configure-srt-settings-video-encoder-optimal-performance/",
+   "design_impact": "important"
+  },
+  {
+   "claim": "High-bitrate pitfall (verified): reading from MediaMTX at ~48 Mbps with latency=2 s and libsrt's default receive buffer (8192 packets ~ 10.7 MB payload) breaks the connection: libsrt logs 'No room to store incoming packet seqno ..., insert offset 8192 ... Space avail 10/8192 pkts' thousands of times, then 'SEQUENCE DISCREPANCY. BREAKING CONNECTION'. gosrt (MediaMTX) keeps sending regardless of the receiver's free buffer. Setting on the reader `rcvbuf=64000000&ffs=64000&recv_buffer_size=4000000` (SRTO_RCVBUF must be <= SRTO_FC * (MSS-28), so raise ffs first) made 50 Mbps/2 s and 100 Mbps/1-2 s runs read cleanly (477/480 frames in 8 s at 1x, 357/360 at 100 Mbps) in both ffmpeg and mpv. Rule: needed packets = latency_s * bitrate_bps / 10528; if > 8192, enlarge. The publish leg into gosrt showed 0 loss at 100 Mbps/2 s without tuning. Direct libsrt->libsrt (ffmpeg listener -> ffmpeg caller) at 100 Mbps/2 s worked with default buffers on loopback.",
+   "confidence": "verified",
+   "source": "local runs m1/m2/m4/m5/m8/m9/m10 vs d1/d2/d3; Haivision SRTO_FC/SRTO_RCVBUF docs",
+   "design_impact": "critical"
+  },
+  {
+   "claim": "mpv passes the srt:// URL (including ?streamid=...&passphrase=...&latency=...&rcvbuf=...) straight to libavformat: `mpv \"srt://host:8890?streamid=read:screen:viewer:pw&passphrase=...&latency=2000000&rcvbuf=64000000&ffs=64000\"` opened the HEVC 10-bit stream ('Video --vid=1 (hevc 1920x1080 60 fps)') and exited cleanly after --frames=300 at 50 Mbps. mpv's stream_lavf.c safe-protocol whitelist includes \"srt\" and \"rist\". On join it logs 'Could not find ref with POC' until the first IDR (benign; keep GOP <= 1-2 s).",
+   "confidence": "verified",
+   "source": "mpv 0.40 local test; https://raw.githubusercontent.com/mpv-player/mpv/master/stream/stream_lavf.c lines 236-245",
+   "design_impact": "important"
+  },
+  {
+   "claim": "Direct mode: ffmpeg listener (`srt://0.0.0.0:PORT?mode=listener&passphrase=...&pbkeylen=32&latency=...&listen_timeout=<µs>`) + caller (`mode=caller`, default) works in both directions (sender=listener/receiver=caller and receiver=listener/sender=caller, HEVC10 verified). The listener accepts any caller whose passphrase matches; it does not check streamid (it only logs 'accept streamid [...]' at -loglevel verbose), so the passphrase is the only access control in direct mode. A wrong passphrase is rejected at handshake (enforced_encryption default true). When the caller disconnects first the sender logs 'Error writing trailer: Input/output error' and exits (the sender GUI must restart ffmpeg for the next viewer session or keep a persistent relay).",
+   "confidence": "verified",
+   "source": "local tests B/C/D and lst_verbose.log; Haivision SRTO_PASSPHRASE/SRTO_ENFORCEDENCRYPTION docs",
+   "design_impact": "critical"
+  },
+  {
+   "claim": "ffmpeg's rendezvous mode is unusable with a real remote peer: libsrt.c (7.1 and master) does `srt_bind(fd, cur_ai->ai_addr, ...)` i.e. binds the local socket to the REMOTE host:port from the URL (no localaddr option exists). Against a non-local IP the open fails with 'Cannot assign requested address'; on loopback both sides talked to themselves ('COOKIE CONTEST UNRESOLVED'). This matches FFmpeg trac ticket #7595 'Cannot use rendezvous mode in SRT protocol' (search snippet; trac page itself is behind an Anubis challenge). So two NATed peers cannot use ffmpeg rendezvous; use the relay or a VPN/tailnet (the LXC already has tailscale0 100.82.8.39) and then plain caller/listener.",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/FFmpeg/FFmpeg/release/7.1/libavformat/libsrt.c and master (SRT_MODE_RENDEZVOUS branch); local test srt://192.0.2.10:48901?mode=rendezvous; ip addr on the box",
+   "design_impact": "critical"
+  },
+  {
+   "claim": "NAT/port forward rules for direct mode: only the `mode=listener` side must have the UDP port forwarded on its router (and allowed inbound in Windows Firewall); the caller side needs nothing. With the MediaMTX relay on the home LAN, forward only 8890/udp (and optionally 8888/tcp for HLS) to the Linux box; the sender PC on the same LAN publishes to the LAN IP and the remote friend reads via the public IP/DDNS name.",
+   "confidence": "likely",
+   "source": "Derived from SRT caller/listener semantics (Haivision docs/features/handshake.md: caller-listener vs rendezvous) plus the local tests; not exercised across a real NAT here",
+   "design_impact": "important"
+  },
+  {
+   "claim": "Encryption model: the passphrase (10-79 chars) is a shared secret on both ends deriving the AES key via PBKDF2; pbkeylen 16/24/32 selects AES-128/192/256 and is decided by the caller/sender (receiver may leave 0); with MediaMTX each leg is a separate SRT connection so the sender uses srtPublishPassphrase and the viewer uses srtReadPassphrase. SRT encrypts payload only; the handshake (which carries streamid incl. user:pass) is not encrypted, so treat streamid credentials as low-value tokens and rely on the passphrase for confidentiality.",
+   "confidence": "likely",
+   "source": "Haivision API-socket-options.md SRTO_PASSPHRASE/SRTO_PBKEYLEN (verified parts); handshake-in-clear statement from SRT protocol knowledge (not re-verified in the draft text)",
+   "design_impact": "important"
+  },
+  {
+   "claim": "mpegts muxer (ffmpeg 7.1) defaults: muxrate=1 (VBR; CBR would pad with null packets and waste SRT bandwidth), pes_payload_size=2930 (min PES payload), pcr_period=-1 (20 ms for CBR, else highest multiple of frame duration < 100 ms), pat_period=0.1 s, sdt_period=0.5 s, omit_video_pes_length=1. mpegts_flags: resend_headers (re-emit PAT/PMT before the next packet), latm (LATM AAC only; irrelevant for Opus), pat_pmt_at_frames (PAT/PMT at every video frame), system_b, initial_discontinuity, nit, omit_rai. Generic: flush_packets (-1 auto/1/0), max_delay (µs), max_interleave_delta (µs, default 10 s). The ffmpeg CLI sets max_delay from -muxdelay (default 0.7 s) and preload from -muxpreload (default 0.44 s for mpegts); mpegtsenc adds 2*max_delay to PTS/DTS and max_delay to the first PCR (timestamp offset, not real buffering).",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/FFmpeg/FFmpeg/release/7.1/libavformat/mpegtsenc.c (AVOptions table, mpegts_write_packet delay math); https://ffmpeg.org/ffmpeg-formats.html mpegts + Format Options; fftools/ffmpeg_opt.c mux_max_delay=0.7",
+   "design_impact": "important"
+  },
+  {
+   "claim": "Windows builds: gyan.dev ffmpeg 'essentials' and 'full' both include libsrt; librist, libplacebo, libsvtav1 only in 'full'; nvenc/amf/libvpl(QSV)/d3d11va in all builds. BtbN FFmpeg-Builds gpl variants include srt and librist (scripts.d/50-srt.sh, 50-librist). mpv Windows builds by shinchiro (github.com/shinchiro/mpv-winbuild-cmake/releases, which also ships ffmpeg-x86_64-*.7z) and zhongfly (mpv-winbuild) list libsrt among bundled libraries (no librist listed).",
+   "confidence": "verified",
+   "source": "https://www.gyan.dev/ffmpeg/builds/ ; https://raw.githubusercontent.com/BtbN/FFmpeg-Builds/master/README.md + scripts.d listing ; https://raw.githubusercontent.com/shinchiro/mpv-winbuild-cmake/master/README.md ; https://raw.githubusercontent.com/zhongfly/mpv-winbuild/main/README.md ; https://mpv.io/installation/",
+   "design_impact": "important"
+  },
+  {
+   "claim": "RIST in ffmpeg 7.1 (librist 0.2.11 on the box): rist:// options rist_profile=simple|main(default)|advanced, buffer_size (ms, 0 = librist default 1 s, max 30 s), fifo_size (power of 2, default 8192), overrun_nonfatal, pkt_size (1316), secret + encryption=128|256 (main profile). mpv accepts rist://. MediaMTX has no RIST server, so RIST is direct-only; Windows mpv builds do not bundle librist.",
+   "confidence": "verified",
+   "source": "https://ffmpeg.org/ffmpeg-protocols.html#rist ; dpkg -l librist4 ; mpv --list-protocols ; MediaMTX docs (no RIST anywhere)",
+   "design_impact": "minor"
+  },
+  {
+   "claim": "Plain UDP (udp://host:port?pkt_size=1316&buffer_size=...): no retransmission, no encryption, no NAT help; MediaMTX can only ingest it (`source: udp+mpegts://`), never serve it to readers. Only sensible over a LAN or an already-encrypted VPN link.",
+   "confidence": "verified",
+   "source": "https://ffmpeg.org/ffmpeg-protocols.html#udp ; MediaMTX docs/3-publish/12-mpeg-ts.md and docs/4-read (no UDP read)",
+   "design_impact": "minor"
+  },
+  {
+   "claim": "Opus in MPEG-TS is accepted end-to-end (publisher 'H265, Opus' tracks, reader got opus 48 kHz). For desktop audio use `-c:a libopus -b:a 128k -ac 2`; if the browser HLS fallback must play audio in Chrome/Edge, AAC is the safer choice (MediaMTX HLS lists Opus, but browser MSE Opus-in-fMP4 support varies).",
+   "confidence": "likely",
+   "source": "local test (verified for SRT); browser Opus support is from general knowledge",
+   "design_impact": "minor"
+  },
+  {
+   "claim": "At the end of a reader session on MediaMTX, ffmpeg logs '[in#0/mpegts] Error during demuxing: Input/output error' even when all frames were received (477/480, exit 0); direct libsrt-libsrt sessions do not. Treat it as benign end-of-stream noise from the gosrt-side close, not as data loss.",
+   "confidence": "likely",
+   "source": "local runs m2/m3/m8/m9 (frame counts complete) vs d1-d3",
+   "design_impact": "minor"
+  }
+ ],
+ "snippets": [
+  {
+   "title": "docker-compose.yml (validated with `docker compose config`)",
+   "code": "services:\n  mediamtx:\n    image: bluenviron/mediamtx:1.21.0      # or bluenviron/mediamtx:1 for latest 1.x\n    container_name: mediamtx-relay\n    restart: unless-stopped\n    ports:\n      - \"8890:8890/udp\"                    # SRT (publish + read); forward this UDP port on the router\n      - \"8888:8888/tcp\"                    # HLS (browser SDR fallback); optional\n      - \"127.0.0.1:9997:9997/tcp\"          # Control API, localhost only; optional\n    volumes:\n      - ./mediamtx.yml:/mediamtx.yml:ro\n    # sysctls cannot raise net.core.rmem_max inside a container (it is not namespaced);\n    # set it on the host: sysctl -w net.core.rmem_max=16777216",
+   "notes": "File at /tmp/claude-0/-projects/eb06eadf-2fb4-465a-826d-820fbabd8b59/scratchpad/srt/deliverable/docker-compose.yml. Bridge networking is enough for SRT; no host network needed. NOTE: the user's existing container mediamtx-relay already binds 8890/8888/9997 on this box."
+  },
+  {
+   "title": "mediamtx.yml (validated with --validate-conf and run end-to-end)",
+   "code": "# MediaMTX 1.21.0 - single path \"screen\", SRT publish/read with separate passphrases.\nlogLevel: info\nreadTimeout: 10s\nwriteTimeout: 10s\nwriteQueueSize: 2048            # default 512; larger avoids \"reader is too slow\" drops at 50-100 Mbps\nudpMaxPayloadSize: 1452         # -> SRT payload 1316 = 7 x 188 TS packets\nudpReadBufferSize: 4000000      # MUST be <= host net.core.rmem_max, otherwise the SRT listener fails to start\n\nrtsp: no\nrtmp: no\nwebrtc: no\nmoq: no\nplayback: no\n\napi: yes\napiAddress: :9997\n\nhls: yes                        # browser SDR fallback; HLS supports AV1/VP9/H265/H264 + Opus/FLAC/AAC\nhlsAddress: :8888\nhlsVariant: lowLatency          # fMP4 (needed for HEVC in browsers)\nhlsSegmentDuration: 1s\nhlsPartDuration: 200ms\n\nsrt: yes\nsrtAddress: :8890\n\nauthMethod: internal\nauthInternalUsers:\n  - user: sender                # streamid=publish:screen:sender:<pass>\n    pass: CHANGE_ME_sender_pw\n    permissions:\n      - action: publish\n        path: screen\n  - user: viewer                # streamid=read:screen:viewer:<pass>; also HLS basic auth\n    pass: CHANGE_ME_viewer_pw\n    permissions:\n      - action: read\n        path: screen\n  - user: any                   # API only from localhost / docker bridge\n    pass:\n    ips: [\"127.0.0.1\", \"::1\", \"172.16.0.0/12\"]\n    permissions:\n      - action: api\n\npaths:\n  screen:\n    source: publisher\n    overridePublisher: yes\n    srtPublishPassphrase: CHANGE_ME_publish_passphrase_10to79chars   # AES key, sender leg\n    srtReadPassphrase: CHANGE_ME_read_passphrase_10to79chars         # AES key, receiver leg (may differ)",
+   "notes": "File at /tmp/claude-0/-projects/eb06eadf-2fb4-465a-826d-820fbabd8b59/scratchpad/srt/deliverable/mediamtx.yml. Do not set a small maxReaders: the HLS muxer counts as a reader. Passwords may be stored hashed (sha256:/argon2: prefixes). Passphrases must be 10-79 chars."
+  },
+  {
+   "title": "ffmpeg publish URL (sender -> MediaMTX), 50 Mbps HEVC10 example",
+   "code": "ffmpeg -f ddagrab ... -c:v hevc_nvenc -profile:v main10 -pix_fmt p010le ... -b:v 50M -g 60 \\\n  -c:a libopus -b:a 128k -ac 2 \\\n  -muxdelay 0 -muxpreload 0 -f mpegts -mpegts_flags +resend_headers \\\n  \"srt://RELAY_IP:8890?streamid=publish:screen:sender:CHANGE_ME_sender_pw&passphrase=CHANGE_ME_publish_passphrase_10to79chars&pbkeylen=32&pkt_size=1316&transtype=live&latency=1500000&maxbw=0&inputbw=6250000&oheadbw=25&sndbuf=64000000&ffs=64000&connect_timeout=5000\"\n\n# CLI-flag equivalent of the query (tested): ... -f mpegts -srt_streamid publish:screen:sender:pw -passphrase ... -pbkeylen 32 -pkt_size 1316 -latency 1500000 -maxbw 0 -inputbw 6250000 -oheadbw 25 srt://RELAY_IP:8890",
+   "notes": "Verified end-to-end with -c copy of a 52 Mbps HEVC10 file: server negotiated 2000 ms, 0 loss, 52.1 Mbps. latency is in microseconds. inputbw is bytes/s (50 Mbps = 6,250,000); with oheadbw=25 the send cap is 62.5 Mbps. Alternatively maxbw=8000000 (absolute 64 Mbps). sndbuf/ffs sized for latency x bitrate. For a 100 Mbps/3 s worst case use sndbuf=100000000&ffs=100000. Encoder flags are illustrative (NVENC topic is out of scope here)."
+  },
+  {
+   "title": "Receiver read URLs (mpv / ffmpeg / HLS)",
+   "code": "# mpv (HDR passthrough flags per mpv docs; SRT options live in the URL)\nmpv --vo=gpu-next --gpu-api=d3d11 --target-colorspace-hint=yes --hwdec=auto-safe --cache=yes --demuxer-max-bytes=256MiB \\\n  \"srt://RELAY_PUBLIC_IP:8890?streamid=read:screen:viewer:CHANGE_ME_viewer_pw&passphrase=CHANGE_ME_read_passphrase_10to79chars&latency=1500000&rcvbuf=64000000&ffs=64000&recv_buffer_size=8000000\"\n\n# ffmpeg / ffprobe\nffprobe \"srt://RELAY_PUBLIC_IP:8890?streamid=read:screen:viewer:CHANGE_ME_viewer_pw&passphrase=CHANGE_ME_read_passphrase_10to79chars&latency=1500000&rcvbuf=64000000&ffs=64000\"\n\n# standard stream-id form (also accepted)\n\"srt://RELAY_PUBLIC_IP:8890?streamid=#!::m=request,r=screen,u=viewer,s=CHANGE_ME_viewer_pw&passphrase=...\"\n\n# HLS browser fallback (Basic auth viewer:pw), LL-HLS fMP4, HEVC Main10 CODECS=hvc1.2.4.L120.90\nhttp://RELAY_PUBLIC_IP:8888/screen            # built-in player page\nhttp://viewer:CHANGE_ME_viewer_pw@RELAY_PUBLIC_IP:8888/screen/index.m3u8",
+   "notes": "The rcvbuf/ffs/recv_buffer_size are REQUIRED at >~40 Mbps with >=2 s latency when reading from MediaMTX (otherwise 'No room to store incoming packet' -> SEQUENCE DISCREPANCY). Receiver must retry while the publisher is not live ('no stream is available on path'). mpv's --target-colorspace-hint requires --vo=gpu-next (D3D11/winvk contexts). Wrong/absent passphrase or creds are rejected at handshake."
+  },
+  {
+   "title": "Direct mode without relay (sender = listener with port forward; friend = caller)",
+   "code": "# Sender PC (router forwards UDP 9000 -> this PC; Windows Firewall inbound UDP 9000):\nffmpeg ... -f mpegts \"srt://0.0.0.0:9000?mode=listener&passphrase=DirectSecret_at_least_10_chars&pbkeylen=32&latency=1500000&pkt_size=1316&listen_timeout=-1&maxbw=8000000&sndbuf=64000000&ffs=64000\"\n\n# Friend (no port forward needed):\nmpv \"srt://SENDER_PUBLIC_IP:9000?mode=caller&passphrase=DirectSecret_at_least_10_chars&latency=1500000&rcvbuf=64000000&ffs=64000&recv_buffer_size=8000000\"\n\n# Reverse roles (friend forwards a port, sender dials out) also work:\n#  friend:  mpv \"srt://0.0.0.0:9000?mode=listener&passphrase=...&latency=1500000&rcvbuf=...&ffs=...\"\n#  sender:  ffmpeg ... \"srt://FRIEND_PUBLIC_IP:9000?mode=caller&passphrase=...&latency=1500000&pkt_size=1316\"\n\n# DO NOT use mode=rendezvous with ffmpeg 7.1: it binds to the remote address -> 'Cannot assign requested address'.",
+   "notes": "Verified locally in both directions with HEVC10 and AES-256. The ffmpeg listener exits when the caller disconnects ('Error writing trailer'), so the sender GUI should restart it or use the relay. With both peers behind NAT use the relay or a VPN/tailnet."
+  },
+  {
+   "title": "Buffer sizing rule for libsrt reader/sender",
+   "code": "packets_needed = latency_seconds * bitrate_bps / (1316*8)\n# default SRTO_RCVBUF/SRTO_SNDBUF = 8192 packets; default SRTO_FC (ffs) = 25600 packets\n# rcvbuf must be <= ffs * (MSS-28) = ffs * 1472 bytes  -> raise ffs first\n# examples:  50 Mbps x 2 s = 9,500 pkts  -> rcvbuf=64000000&ffs=64000\n#           100 Mbps x 3 s = 28,500 pkts -> rcvbuf=90000000&ffs=65536\n# plus UDP socket buffer: recv_buffer_size=8000000 (Linux: needs net.core.rmem_max >= value)",
+   "notes": "Derived from Haivision SRTO_RCVBUF/SRTO_FC docs and the observed 'Space avail 10/8192 pkts' overflow when reading from MediaMTX."
+  },
+  {
+   "title": "RIST direct-mode equivalent (no MediaMTX support)",
+   "code": "# sender\nffmpeg ... -f mpegts \"rist://FRIEND_IP:9000?rist_profile=main&secret=SharedSecretHere&encryption=256&buffer_size=1500&pkt_size=1316\"\n# receiver (mpv/ffmpeg accept rist://)\nmpv \"rist://@:9000?rist_profile=main&secret=SharedSecretHere&encryption=256&buffer_size=1500\"",
+   "notes": "Syntax from ffmpeg-protocols.html#rist (buffer_size in ms). Not tested here; Windows mpv builds do not bundle librist, gyan 'full'/BtbN gpl ffmpeg do."
+  }
+ ],
+ "open_questions": [
+  "gosrt (MediaMTX) ignores the libsrt receiver's advertised free buffer at high bitrate x latency; whether this is a gosrt bug worth reporting, and whether a future MediaMTX release adds per-path SRT latency/buffer settings, was not checked.",
+  "Real-internet behaviour (30-100 ms RTT, loss, bursty NVENC output) was not measured; only loopback. The maxbw pacing effect on a home uplink and the actual loss/retransmission budget should be verified over the Japan<->China/Australia path.",
+  "Browser SDR fallback: MediaMTX serves the PQ HEVC stream unchanged over HLS; whether the friend's browser tone-maps HDR10 HEVC (Chrome/Edge with HW HEVC, Safari) or needs a separately encoded SDR path was not tested.",
+  "Windows: whether SRT socket buffers of 64-100 MB and recv_buffer_size are accepted without a system-wide cap (Linux needs rmem_max) was not tested on Windows.",
+  "AV1 over SRT is only possible without the relay (Matroska/NUT); robustness of those containers under tlpktdrop-induced gaps was not tested."
+ ],
+ "recommendation": "Use SRT + MPEG-TS + HEVC Main10 (not AV1) through a MediaMTX 1.21.0 relay on the home Linux box: publish `srt://relay:8890?streamid=publish:screen:sender:pw&passphrase=PUB_KEY&pbkeylen=32&pkt_size=1316&latency=...`, read `srt://relay:8890?streamid=read:screen:viewer:pw&passphrase=READ_KEY&latency=...&rcvbuf=64000000&ffs=64000&recv_buffer_size=8000000`, forward only 8890/udp (and 8888/tcp if HLS fallback wanted). Split the 1.5-3 s budget roughly as sender->relay 500-800 ms (LAN or short hop) and relay->friend 1000-1500 ms (>= 4x RTT with margin for burst loss), cap send rate with maxbw=0&inputbw=<bytes/s>&oheadbw=25 (or absolute maxbw ~1.3x bitrate), keep muxrate VBR, `-muxdelay 0 -muxpreload 0 -mpegts_flags +resend_headers`, GOP 1-2 s. In the receiver GUI always add rcvbuf/ffs sized to latency x bitrate (mandatory above ~40 Mbps with >=2 s latency) and retry until the path is live. For direct mode, the listener side needs the UDP port forward; never use ffmpeg's rendezvous mode; if both peers are NATed use the relay or a tailnet. Keep RIST/plain UDP as fallbacks only (no MediaMTX support, no Windows mpv librist)."
+}

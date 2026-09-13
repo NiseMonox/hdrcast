@@ -1,0 +1,136 @@
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using System.Windows.Forms;
+using HdrCast.Capture;
+using HdrCast.Sender.Capture;
+
+namespace HdrCast.Sender
+{
+    /// <summary>
+    /// One executable, three modes (design.md §2.1):
+    ///   HdrCastSender.exe                     → the GUI
+    ///   HdrCastSender.exe list-outputs [--json]
+    ///   HdrCastSender.exe capture &lt;options&gt;    → the capture engine driven by the GUI (or by hand)
+    /// </summary>
+    internal static class Program
+    {
+        [STAThread]
+        static int Main(string[] args)
+        {
+            if (args.Length == 0) return RunGui();
+
+            string verb = args[0].ToLowerInvariant();
+            var rest = new string[args.Length - 1];
+            Array.Copy(args, 1, rest, 0, rest.Length);
+
+            NativeMethods.EnsureConsole();
+            switch (verb)
+            {
+                case "list-outputs": return ListOutputs(rest);
+                case "audio-devices": return ListAudioDevices();
+                case "capture": return RunCapture(rest);
+                case "--help":
+                case "-h":
+                case "/?":
+                case "help":
+                    PrintUsage();
+                    return ExitCodes.Ok;
+                default:
+                    Console.Error.WriteLine("unknown command: " + args[0]);
+                    PrintUsage();
+                    return ExitCodes.BadArguments;
+            }
+        }
+
+        static int RunGui()
+        {
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            Application.Run(new Gui.MainForm());
+            return ExitCodes.Ok;
+        }
+
+        static void PrintUsage()
+        {
+            Console.Out.WriteLine("HdrCast sender " + typeof(Program).Assembly.GetName().Version);
+            Console.Out.WriteLine("  HdrCastSender.exe                       start the GUI");
+            Console.Out.WriteLine("  HdrCastSender.exe list-outputs [--json] list the DXGI outputs (index, HDR state)");
+            Console.Out.WriteLine("  HdrCastSender.exe audio-devices         list the WASAPI render endpoints");
+            Console.Out.WriteLine();
+            Console.Out.Write(CaptureArgs.Usage);
+        }
+
+        static int ListOutputs(string[] args)
+        {
+            bool json = false;
+            foreach (string a in args)
+            {
+                if (a == "--json") json = true;
+                else { Console.Error.WriteLine("unknown option: " + a); return ExitCodes.BadArguments; }
+            }
+            try
+            {
+                List<OutputInfo> outputs = OutputEnumerator.Enumerate();
+                Console.Out.Write(json ? OutputInfo.ToJson(outputs) : OutputInfo.ToTable(outputs));
+                if (json) Console.Out.WriteLine();
+                return ExitCodes.Ok;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("list-outputs failed: " + ex.Message);
+                return ExitCodes.DeviceError;
+            }
+        }
+
+        static int ListAudioDevices()
+        {
+            foreach (string line in AudioCapture.ListDevices()) Console.Out.WriteLine(line);
+            return ExitCodes.Ok;
+        }
+
+        static int RunCapture(string[] args)
+        {
+            CaptureArgs parsed;
+            try
+            {
+                parsed = CaptureArgs.Parse(args);
+            }
+            catch (CaptureArgsException ex)
+            {
+                Console.Error.WriteLine(ex.Message);
+                Console.Error.Write(CaptureArgs.Usage);
+                return ExitCodes.BadArguments;
+            }
+
+            if (parsed.SelfTest) return SelfTest.Run(parsed.SdrWhite);
+
+            using (var engine = new CaptureEngine(parsed))
+            {
+                // Ctrl+C / console close / the GUI killing the process tree: stop cleanly so the pipe is flushed.
+                NativeMethods.ConsoleCtrlHandler handler = type =>
+                {
+                    engine.RequestStop();
+                    Thread.Sleep(300);
+                    return true;
+                };
+                NativeMethods.SetConsoleCtrlHandler(handler, true);
+                Console.CancelKeyPress += (s, e) => { e.Cancel = true; engine.RequestStop(); };
+                try
+                {
+                    return engine.Run();
+                }
+                catch (Exception ex)
+                {
+                    Log.Error("capture: unhandled error: " + ex);
+                    return ExitCodes.DeviceError;
+                }
+                finally
+                {
+                    GC.KeepAlive(handler);
+                    NativeMethods.SetConsoleCtrlHandler(null, false);
+                }
+            }
+        }
+    }
+}

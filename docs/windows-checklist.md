@@ -1,0 +1,141 @@
+# Windows 验证清单
+
+Linux 这边能验证的（`dotnet build` / `dotnet test` / `relay/selftest.sh`）已经跑通；下面是**只能在 Windows 上做**的部分，按顺序执行，每一步都写了预期结果。全部通过后再叫朋友。
+
+环境：Windows 11 + RTX 4090 + AW3225QF（4K HDR），`dist/HdrCast-<版本>/` 解压到任意目录（下文记为 `HdrCast\`）。
+
+## 0. 准备
+
+- [ ] Windows HDR 已打开（`Win + Alt + B`，或 设置 → 显示 → 使用 HDR）。
+- [ ] ffmpeg：从 <https://www.gyan.dev/ffmpeg/builds/> 下载 **full** 版（release full），解压后把 `bin\ffmpeg.exe`（和 `ffprobe.exe`）放到 `HdrCast\` 或 `HdrCast\tools\`。essentials 也带 libsrt，但 full 才有 libplacebo/librist。
+- [ ] mpv（本机也装一个方便自测）：<https://github.com/shinchiro/mpv-winbuild-cmake/releases> 或 <https://github.com/zhongfly/mpv-winbuild/releases> 的 `mpv-x86_64-*.7z`，把 `mpv.exe` 放到 `HdrCast\` 或 `HdrCast\tools\`。
+- [ ] .NET Framework 4.8 是 Windows 10 1903+/11 自带的，不用装。
+- [ ] 中继：LXC 上已运行 `relay/setup.sh` 与 `relay/up.sh`（见 §5）。
+
+## 1. `scripts\check-tools.cmd`
+
+双击运行。预期：
+
+```
+ffmpeg    path/version 显示 7.x 或 8.x
+srt       : yes (libsrt)
+hevc_nvenc: listed, test encode 8-bit=ok 10-bit=ok
+av1_nvenc : listed, test encode 8-bit=ok 10-bit=ok        ← 4090 才有
+hevc_amf  : not in this ffmpeg build / listed but FAIL      ← 没有 AMD 卡，FAIL 正常
+hevc_qsv  : listed, FAIL                                   ← 没有 Intel 核显，FAIL 正常
+mpv       version 0.40+ 或 git 日期，srt : yes
+displays  list-outputs 的输出（见下一步）
+```
+
+`srt : NO` 说明下错了构建；`hevc_nvenc ... 10-bit=FAIL` 先更新 NVIDIA 驱动。
+
+## 2. `HdrCastSender.exe list-outputs`
+
+在 `HdrCast\` 打开终端运行。预期每个显示器一行，例如：
+
+```
+0  \\.\DISPLAY1  AW3225QF   3840x2160 @ 240 Hz  HDR: yes  MaxLuminance ~1000 nit
+1  \\.\DISPLAY2  ...        2560x1440 @ 165 Hz  HDR: no
+```
+
+- [ ] HDR 显示器的 `HDR: yes`（判定依据是 DXGI `ColorSpace == RGB_FULL_G2084_NONE_P2020`，即 Windows HDR 已开）。关掉 Windows HDR 再跑一次应变成 `no`。
+- [ ] `--json` 也能输出同样内容（GUI 用的就是它）。
+- [ ] 索引是跨显卡的全局编号，记住要分享的那个索引（下文用 0）。
+
+## 3. `HdrCastSender.exe capture --selftest`
+
+不需要显示器，只跑 compute shader。预期：编译成功，对合成灰阶打印转换结果并退出码 0。核对几个关键值（与 `docs/design.md` §2.3 的 zscale 实测一致，允许 ±2）：
+
+| scRGB 输入（sdr-white 80） | 亮度 | 期望 Y10 |
+|---|---|---|
+| 0.0 | 0 nit | 64 |
+| 1.0 | 80 nit | ≈ 491 |
+| 2.5 | 200 nit | ≈ 573 |
+| 12.5 | 1000 nit | ≈ 769 |
+| 125 | 10000 nit | 940 |
+
+- [ ] 中性灰的 Cb/Cr ≈ 512。
+- [ ] 报错 `d3dcompiler_47` 找不到 → 这台 Windows 缺 DirectX 运行时（Win10 1903+ 自带，理论上不会发生）。
+
+## 4. `scripts\dump-check.cmd`
+
+先用记事本把脚本开头的 `OUTPUT` 改成第 2 步的索引，`SIZE` 改成该显示器的原生分辨率（如 `3840x2160`）。运行后在 `scripts\dump\` 生成：
+
+- [ ] `frames.p010` 大小 = W×H×3 字节 × 帧数（4K：24 883 200 B/帧 × 30 fps × 3 s ≈ 2.2 GB；嫌大就先用 `SIZE=1920x1080` 测）。
+- [ ] 终端打印 `YMIN/YAVG/YMAX`：普通桌面（白色窗口）`YMAX ≈ 491`，屏幕上有 HDR 内容（HDR 视频/游戏）时才会 > 500；`YMIN` 接近 64。若 `YMAX` 总是 940 或全部相同 → 转换错了。
+- [ ] `frame1-pq-raw.png`：整体发灰、发平——**正常**，这是 PQ 编码直接当 sRGB 看的效果，证明数据不是黑屏或乱码。
+- [ ] `frame1-sdr-tonemapped.png`：看起来就是你的桌面，颜色不偏（红绿蓝方向正确，肤色正常），鼠标指针在正确位置。若色相错乱 → BT.709→BT.2020 矩阵或 UV 顺序有误；若整体过暗 → `sdr-white` 与实际不符（Windows 的 SDR 亮度滑块不影响这里，规范值就是 80）。
+- [ ] 把 `FORMAT` 改成 `nv12` 再跑一次（可先关闭 Windows HDR），`frame1-sdr.png` 应同样正确。
+- [ ] 结束后删掉 `scripts\dump\frames.*`。
+
+## 5. 中继（在 LXC 上）
+
+```
+cd /projects/hdrcast
+relay/setup.sh            # 第一次：生成密码；再次运行会问是否覆盖
+relay/selftest.sh         # 可选：本机合成 HDR10 → MediaMTX → ffprobe/mpv 全通过（结束后中继是停止状态）
+relay/up.sh               # 正式启动
+relay/logs.sh             # 看日志，Ctrl+C 退出
+```
+
+- [ ] `setup.sh` 打印的 sender/viewer 密码、两把 passphrase、URL 已保存（也在 `relay/.env`）。
+- [ ] `sysctl net.core.rmem_max` ≥ 4000000（建议 16777216，写进 `/etc/sysctl.d/99-hdrcast.conf`）。
+- [ ] 路由器：UDP 8890 → 192.168.1.201。
+- [ ] `docker ps` 里 `mediamtx-relay` 是 `Up`；日志里有 `[SRT] started with listener on :8890 (UDP/SRT)` 且没有 `ERR`。
+
+## 6. GUI 推流到中继
+
+运行 `HdrCastSender.exe`：
+
+1. 显示器：选第 2 步的那块，状态显示 HDR；模式"自动"。
+2. 画质：编码器 `hevc_nvenc`，码率 40 Mbps，60 fps，输出分辨率先选 2560×1440，质量档"均衡"，GOP 2 s。
+3. 音频：开，默认设备，AAC 192k。
+4. 目标：模式"中继"，主机 `192.168.1.201`，端口 8890，用户 `sender` + 密码，passphrase = **publish** passphrase，延迟 800 ms。
+5. 点开始。
+
+预期：
+
+- [ ] 两个子进程启动（任务管理器里 `HdrCastSender.exe` ×2 + `ffmpeg.exe`），5 s 内状态栏开始刷新。
+- [ ] 采集 fps ≈ 60；桌面静止时"重复帧"持续增长是**正常的**（DXGI 没有新帧就重发上一帧，保证恒定帧率）；拖动窗口时 `captured` 增长、`duplicated` 停止。
+- [ ] 编码 fps ≈ 60，码率 ≈ 40 Mbps，speed ≈ 1.0x，drop 为 0；`gpu_ms` 在 4K 下应 < 5 ms。
+- [ ] LXC：`relay/logs.sh` 出现 `[SRT] [conn 192.168.1.x:port] is publishing to path 'screen'`，`curl -s http://127.0.0.1:9997/v3/paths/list` 里 `ready: true`、`tracks: ["H265","MPEG-4 Audio"]`。
+- [ ] `curl -s http://127.0.0.1:9997/v3/srtconns/list` 里发布连接的 `msReceiveTsbPdDelay` = 800，`packetsReceivedLoss` = 0。
+- [ ] 点停止：两个子进程都消失；直接关闭 GUI 窗口也一样（进程树清理）。
+- [ ] 把 ffmpeg 进程在任务管理器里杀掉：GUI 应提示异常退出并停止采集进程；勾选"自动重连"后 3 s 内重新开始。
+- [ ] "复制 ffmpeg 命令"得到的命令与 `scripts\send-example.cmd` 结构一致，可粘贴到终端单独跑。
+
+## 7. 观众端（先自己测）
+
+同一台 PC（第二块显示器）或局域网里另一台 PC，运行 `HdrCastReceiver.exe`：
+
+- 模式"中继"，主机 `192.168.1.201`（外网朋友填公网 IP/DDNS），端口 8890，用户 `viewer` + 密码，passphrase = **read** passphrase，地区"日本 1500 ms"，码率上限 100 Mbps，显示"自动"。
+
+预期：
+
+- [ ] 推流未开始时显示"等待推流…"并每 3 s 重试；推流开始后 ≤ 5 s 出画面。
+- [ ] 状态栏：`hwdec-current = d3d11va`，`video-params` 为 `pq / bt.2020`，HDR 屏且 Windows HDR 已开时 `video-target-params` 也是 `pq`（直通）；缓存时长在 1.5 s 附近波动；`frame-drop-count` 不持续增长。
+- [ ] 画面亮度与发送端一致：白色窗口不刺眼（80 nit 规范值），HDR 视频高光正常。发灰 → 观众端 Windows HDR 没开或选了"SDR 色调映射"。
+- [ ] 全屏按钮可用，全屏时显示器 OSD 应显示 HDR 模式。
+- [ ] SDR 屏（或把 Windows HDR 关掉）：选"SDR 色调映射"，画面正常但高光被压缩，不应该发灰或过曝。
+- [ ] 声音同步：发送端播放一段有节奏的视频，观众端口型/节拍对得上（延迟约 4 s 是设计值）。
+- [ ] 关闭 mpv 窗口 / 点断开：mpv 进程消失。
+- [ ] 「用 ffmpeg 拉流」兜底模式也能出画面（把 mpv 的 srt 支持想成坏掉时的备胎）。
+
+## 8. 外网观众
+
+- [ ] 用手机热点连接一台笔记本，按 §7 填公网 IP，能出画面 → 端口转发正确。
+- [ ] 朋友按 `README.en.md` 操作；他那边 `docs/network.md` §2 的地区预设。跨境（中国）若卡顿，先把 latency 提到 4000~5000 ms 再降码率。
+- [ ] LXC `srtconns/list` 里每位观众的 `msSendTsbPdDelay` 等于他填的 latency，`packetsRetrans` 有少量是正常的，`packetsReceivedLoss` 应为 0（那是发送端那条腿）。
+
+## 9. 4K60 压力
+
+- [ ] 输出分辨率改"原生"（3840×2160）、80 Mbps、60 fps 推 10 分钟：采集 fps 稳定 60，`gpu_ms` < 8，编码 speed ≥ 1.0x，GPU 占用（任务管理器 Video Encode + 3D）不影响正在玩的游戏帧率太多。
+- [ ] 120 fps 档位：采集 fps 能到 120 说明 DXGI 帧率跟得上；否则退回 60。
+- [ ] 观众端 4K60 HEVC 10-bit 的 d3d11va 解码在 RTX 30/40、RX 6000+、Intel Arc 上没问题；老机器降到 1440p。
+
+## 10. 出问题时看哪里
+
+- 日志：`%APPDATA%\HdrCast\logs\`（sender / receiver / capture / ffmpeg / mpv 分文件，按天）。
+- 配置：`%APPDATA%\HdrCast\sender.json`、`receiver.json`（删掉即恢复默认）。
+- 中继：`relay/logs.sh`，API `http://127.0.0.1:9997/v3/paths/list`、`/v3/srtconns/list`。
+- 排查顺序见 `docs/faq.md`「画面卡顿 / 断线」。

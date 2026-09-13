@@ -1,0 +1,22 @@
+# .NET
+bin/
+obj/
+dist/
+*.user
+*.suo
+.vs/
+
+# tools dropped next to the exe (ffmpeg.exe / mpv.exe are downloaded separately)
+tools/
+*.exe
+!scripts/*.exe
+
+# logs / local config
+logs/
+*.log
+relay/recordings/
+relay/.env
+
+# OS
+Thumbs.db
+.DS_Store

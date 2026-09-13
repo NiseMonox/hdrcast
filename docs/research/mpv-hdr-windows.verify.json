@@ -1,0 +1,132 @@
+{
+ "topic": "mpv-hdr-windows",
+ "verdicts": [
+  {
+   "claim": "In mpv 0.40.0 the --target-colorspace-hint=auto probe (ra_swapchain_fns.target_csp) is implemented only by the d3d11 swapchain; vo_gpu_next assumes PQ when the probe is missing, so on winvk 'auto' behaves like 'yes'. --target-peak / display MaxLuminance replaces the hint's max_luma.",
+   "verdict": "confirmed",
+   "evidence": "video/out/vo_gpu_next.c v0.40.0 lines 979-984: \"// Assume HDR is supported, if query is not available\\n// TODO: Implement this for all backends\\ntarget_csp = sw->fns->target_csp ? sw->fns->target_csp(sw) : (struct pl_color_space){ .transfer = PL_COLOR_TRC_PQ };\" and lines 990-1004: \"float target_peak = opts->target_peak ? opts->target_peak : target_csp.hdr.max_luma; ... bool target_hint = p->next_opts->target_hint == 1 || (p->next_opts->target_hint == -1 && pl_color_transfer_is_hdr(target_csp.transfer)); ... if (target_peak) hint.hdr.max_luma = target_peak;\". grep -n target_csp over v0.40.0 d3d11/context.c, vulkan/context.c, vulkan/context_win.c, gpu/context.c returns only \"video/out/d3d11/context.c:495:    .target_csp   = d3d11_target_color_space,\". d3d11_target_color_space (context.c 192-235) maps DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709 -> PL_COLOR_TRC_SRGB (not HDR -> no hint) and RGB_FULL_G2084_NONE_P2020 -> PL_COLOR_TRC_PQ, and reads desc1.MaxLuminance/MinLuminance/primaries.",
+   "correction": ""
+  },
+  {
+   "claim": "mpv 0.41.0 (2025-12-21) changed --target-colorspace-hint default to 'auto', added winvk target-colorspace probing, and added --target-colorspace-hint-mode=target|source|source-dynamic (default 'target').",
+   "verdict": "confirmed",
+   "evidence": "GitHub API releases/tags/v0.41.0: published_at 2025-12-21T19:17:10Z. v0.41.0 RELEASE_NOTES line 70: \"- vo_gpu_next: change --target-colorspace-hint to 'auto' by default\". v0.41.0 DOCS/man/options.rst: \"``--target-colorspace-hint=<auto|yes|no>`` ... In ``auto`` mode, the target colorspace is only set if the current display parameters are known. Currently, this is supported on Wayland, D3D11 and winvk contexts. ... (Default: ``auto``)\" and \"``--target-colorspace-hint-mode=<target|source|source-dynamic>`` ... Default is ``target``. If target display parameters are not available, this will fall back to ``source``.\" v0.41.0 video/out/vo_gpu_next.c line 217: {\"target-colorspace-hint-mode\", OPT_CHOICE(target_hint_mode, {\"target\", 0}, {\"source\", 1}, {\"source-dynamic\", 2})}, line 229 \".target_hint = -1,\". v0.41.0 video/out/vulkan/context_win.c adds \"static struct pl_color_space preferred_csp(struct ra_ctx *ctx) { ... mp_dxgi_output_desc_from_hwnd(...) return mp_dxgi_desc_to_color_space(&desc);\" wired via \".preferred_csp = preferred_csp\". Nuance (see extra findings): in 0.41 'auto' fires whenever the display transfer is known (also SDR), not only when it is HDR: lines 1113-1116 \"(p->next_opts->target_hint == -1 && target_csp.transfer != PL_COLOR_TRC_UNKNOWN)\".",
+   "correction": ""
+  },
+  {
+   "claim": "shinchiro/mpv-winbuild-cmake builds FFmpeg with --enable-libsrt using a static libsrt (Haivision/srt + OpenSSL); librist is NOT enabled; zhongfly/mpv-winbuild lists libsrt; libmpv-2.dll ships in mpv-dev.",
+   "verdict": "confirmed",
+   "evidence": "packages/ffmpeg.cmake (master): DEPENDS list line 11 \"libsrt\", configure flags line 96 \"--enable-libsrt\", plus \"--enable-libdav1d\", \"--enable-libplacebo\", \"--enable-nvdec\"; grep -i rist over the file matches nothing (no librist). packages/libsrt.cmake: \"GIT_REPOSITORY https://github.com/Haivision/srt.git ... -DBUILD_SHARED_LIBS=OFF -DENABLE_SHARED=OFF -DUSE_ENCLIB=openssl -DENABLE_APPS=OFF\", DEPENDS openssl. zhongfly README.md line 66 lists libsrt; line 18: \"`mpv-dev-xxxx.7z` is libmpv, including the `libmpv-2.dll` file.\" packages/mpv.cmake line 43 \"-Dlibmpv=true\", line 83 copies libmpv-2.dll into mpv-dev/.",
+   "correction": ""
+  },
+  {
+   "claim": "With --wid=<HWND>, mpv creates its own WS_CHILD|WS_VISIBLE window (CreateWindowExW, WS_EX_NOPARENTNOTIFY) sized to the parent's client rect, installs a hook to follow parent resizes, and its own fullscreen/window-state handling returns early when parented, so the host must go borderless/fullscreen itself.",
+   "verdict": "confirmed",
+   "evidence": "video/out/w32_common.c v0.40.0 lines 2038-2047: \"if (w32->opts->WinID >= 0) w32->parent = (HWND)(intptr_t)(w32->opts->WinID); ... GetClientRect(w32->parent, &r); CreateWindowExW(WS_EX_NOPARENTNOTIFY, (LPWSTR)MAKEINTATOM(cls), MPV_WINDOW_CLASS_NAME, WS_CHILD | WS_VISIBLE, 0, 0, r.right, r.bottom, w32->parent, 0, HINST_THISCOMPONENT, w32);\". update_fullscreen_state (line ~1058): \"if (w32->parent) return;\"; same early return in update_window_state (1171), reinit_window_state (1261), update_maximized_state (1113). install_parent_hook (1872-1886): \"// If the parent lives inside the current process, install a Windows hook\" (WH_CALLWNDPROC) \"else { // Otherwise, use a WinEvent hook. These don't seem to be as smooth as Windows hooks, but they can be delivered across process boundaries. ... SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, ...)\"; resize_child_win resizes with SetWindowPos(..., SWP_ASYNCWINDOWPOS ...). Note: with mpv.exe launched by the WinForms host the cross-process WinEvent path is the one used.",
+   "correction": ""
+  },
+  {
+   "claim": "HDR passthrough works when mpv is embedded in a WinForms child window via --wid (d3d11 + colorspace hint); only mpv.net user reports support it.",
+   "verdict": "unresolved",
+   "evidence": "Supporting primary evidence, but no direct test of a child HWND found: (1) libplacebo v7.349.0 src/d3d11/swapchain.c line 486 creates the swapchain with IDXGIFactory2_CreateSwapChainForHwnd on whatever HWND mpv gives (the child window), and set_swapchain_metadata (lines 282-310) calls IDXGISwapChain3_SetColorSpace1 then IDXGISwapChain4_SetHDRMetaData per swapchain. (2) Microsoft 'Use DirectX with Advanced Color' doc: \"When in HDR mode, the Desktop Window Manager (DWM) uses a canonical composition color space ... The DWM converts each app from its native color space to CCCS before blending\" and Option 2 (\"DXGI_FORMAT_R10G10B10A2_UNORM ... explicitly call IDXGISwapChain3::SetColorSpace1 ... DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020\") is documented for swap chains created via CreateSwapChainFor[Hwnd|Composition|CoreWindow] with no fullscreen requirement; it also states DXGI reports Advanced-Color SDR displays as G22_P709 and \"DXGI doesn't let you check what Advanced Color kinds are supported-but-not-active\". (3) mpv issue #10628 (open, 2022-09-10): in windowed mode the picture displays but \"no metadata is passed through. The hdfury shows the default windows HDR values\"; reporter notes this hits \"any software that embeds mpv\". (4) mpv issue #17570 (mpv.net host, RTX 4070, v0.41.0-60): \"target-colorspace-hint=yes | Correct HDR brightness but screen flickers when resizing or toggling fullscreen\". (5) mpv.net issue #601 'HDR Passthrough Not Working' (open 2023-12) is an unanswered config question, no evidence either way. Conclusion: mechanism is per-HWND swapchain + DWM HDR composition, so a child window should behave like any windowed mpv (correct picture, no static metadata forwarded); still needs the 5-minute stats-page test on the friend's PC.",
+   "correction": ""
+  },
+  {
+   "claim": "(mpv.conf snippet note) 'The [hint-source] profile uses an option that does not exist in 0.40.0 (mpv will error on unknown options in a profile only when the profile is applied).'",
+   "verdict": "refuted",
+   "evidence": "Local experiment, mpv 0.40.0, the report's mpv.conf written to a --config-dir and run WITHOUT --profile: stderr prints \"Error parsing option target-colorspace-hint-mode (option not found)\" and \"/.../cfg/mpv.conf:39: setting option target-colorspace-hint-mode='source' failed.\" (line 39 is inside the [hint-source] section). Identical output with --profile=sdr-quality. The error is non-fatal (exit 0, playback continues) but is emitted at config-load time, not when the profile is applied.",
+   "correction": "mpv validates every option in every profile section when it parses mpv.conf. For a conf shared with a 0.40.0 build, remove the [hint-source] section (or ship two conf files); instead let the receiver GUI run `mpv --version`, and only for 0.41+/nightly builds append --target-colorspace-hint-mode=source (or a profile defined in a separate file passed with --include) on the command line. The stray error is harmless to playback but will appear in logs."
+  },
+  {
+   "claim": "JSON IPC properties verified on 0.40: demuxer-cache-duration, demuxer-cache-state (node incl. raw-input-rate, fw-bytes, underrun), cache-buffering-state, paused-for-cache, cache-speed, frame-drop-count, decoder-frame-drop-count, hwdec-current, video-params/{gamma,primaries,max-luma}, estimated-vf-fps; sub-path demuxer-cache-state/raw-input-rate is NOT addressable.",
+   "verdict": "confirmed",
+   "evidence": "Local IPC test (mpv 0.40.0, unix socket, lavfi testsrc2 source): demuxer-cache-duration -> 1159.7; demuxer-cache-state -> {\"cache-end\":..,\"reader-pts\":..,\"cache-duration\":..,\"eof\":false,\"underrun\":false,\"idle\":false,\"total-bytes\":..,\"fw-bytes\":..}; demuxer-cache-state/raw-input-rate -> {\"error\":\"error accessing property\"}; demuxer-cache-state/fw-bytes -> \"error accessing property\"; cache-buffering-state -> 100; paused-for-cache -> false; cache-speed -> 0; frame-drop-count -> 0; hwdec-current -> \"no\"; video-params/gamma -> \"bt.1886\"; video-params/max-luma -> \"property unavailable\" (SDR source); video-target-params -> \"property unavailable\" (vo=null); estimated-vf-fps -> 30.0; observe_property and set_property speed 1.05 -> success. Caveat: raw-input-rate was NOT in the node keys for the lavfi source — player/command.c v0.40.0 line 1557: \"if (s.bytes_per_second > 0) node_map_add_int64(r, \\\"raw-input-rate\\\", s.bytes_per_second);\" so it only exists for byte-oriented (network) inputs; DOCS/man/input.rst line 2452 under cache-speed: \"This is the same as ``demuxer-cache-state/raw-input-rate``.\" -> read the top-level `cache-speed` (INT64 B/s) instead.",
+   "correction": ""
+  },
+  {
+   "claim": "--cache-secs caps read-ahead when cache is on; cache-pause-initial/cache-pause-wait/demuxer-max-bytes semantics and defaults as stated (150 MiB / 50 MiB / 0 / 1 s).",
+   "verdict": "confirmed",
+   "evidence": "mpv 0.40.0 --list-options: \"--cache-secs Double (0 to any) (default: 3600000)\", \"--demuxer-max-bytes ByteSize (default: 150.000 MiB)\", \"--demuxer-max-back-bytes (default: 50.000 MiB)\", \"--demuxer-hysteresis-secs (default: 0)\", \"--cache-pause-wait Float (default: 1)\", \"--cache-pause-initial Flag (default: no)\", \"--cache-pause Flag (default: yes)\", \"--hwdec-codecs String (default: h264,vc1,hevc,vp8,vp9,av1,prores)\", \"--target-colorspace-hint Choices: auto no yes (default: no)\". Experiment: faster-than-realtime lavfi source with --cache=yes --cache-secs=8 --demuxer-max-bytes=256MiB -> demuxer-cache-duration: 8.0 after 4 s (without the cap it reached 1159 s in 2.5 s).",
+   "correction": ""
+  },
+  {
+   "claim": "hwdec autoprobe order in 0.40 is d3d11va, d3d11va-copy, dxva2-copy, nvdec, nvdec-copy, vaapi, vulkan...; hwdec_d3d11va only requires the ra context to be d3d11 (works with gpu-next); CUDA/nvdec interop only for OpenGL/Vulkan.",
+   "verdict": "confirmed",
+   "evidence": "video/decode/vd_lavc.c v0.40.0 hwdec_autoprobe_info[]: d3d11va, dxva2 (no WHITELIST), d3d11va-copy, dxva2-copy, nvdec, nvdec-copy, vaapi, vaapi-copy, vulkan, vulkan-copy, ... video/out/d3d11/hwdec_d3d11va.c v0.40.0 line 76: \"if (!ra_is_d3d11(hw->ra_ctx->ra))\", line 104: \"static const int subfmts[] = {IMGFMT_NV12, IMGFMT_P010, 0};\", line 37 \"{\\\"d3d11va-zero-copy\\\", OPT_BOOL(zero_copy)}\". video/out/hwdec/hwdec_cuda.c v0.40.0 line 109-110: MP_MSG(hw, level, \"CUDA hwdec only works with OpenGL or Vulkan backends.\\n\"). NOTE: 0.41.0 changed the order to d3d11va, vulkan, dxva2, nvdec, vaapi, ..., then all -copy variants (RELEASE_NOTES: \"Vulkan hardware decoding is preferred over other APIs\") — keep --hwdec=d3d11va explicit.",
+   "correction": ""
+  },
+  {
+   "claim": "libmpv: MPV_CLIENT_API_VERSION 2.5 in 0.40.0 and 0.41.0; MPV_EVENT_PROPERTY_CHANGE=22, SHUTDOWN=1, END_FILE=7; MPV_FORMAT_STRING=1, FLAG=3, INT64=4, DOUBLE=5, NODE=6; mpv_event {event_id,error,reply_userdata,data}; mpv_event_property {name,format,data}; only config/config-dir/input-conf/script-related options must precede mpv_initialize.",
+   "verdict": "confirmed",
+   "evidence": "include/mpv/client.h v0.40.0 and v0.41.0 both: line 251 \"#define MPV_CLIENT_API_VERSION MPV_MAKE_VERSION(2, 5)\", 672 MPV_FORMAT_STRING = 1, 699 MPV_FORMAT_FLAG = 3, 703 MPV_FORMAT_INT64 = 4, 707 MPV_FORMAT_DOUBLE = 5, 740 MPV_FORMAT_NODE = 6, 1253 MPV_EVENT_SHUTDOWN = 1, 1282 MPV_EVENT_END_FILE = 7, 1353 MPV_EVENT_PROPERTY_CHANGE = 22; \"typedef struct mpv_event { mpv_event_id event_id; int error; uint64_t reply_userdata; void *data; }\"; \"typedef struct mpv_event_property { const char *name; mpv_format format; void *data; }\"; \"Only the following options are required to be set _before_ mpv_initialize(): config, config-dir, input-conf, load-scripts, script, player-operation-mode, input-app-events (macOS), all encoding mode options\".",
+   "correction": ""
+  },
+  {
+   "claim": "mpv has no built-in 'stay N seconds behind live' / catch-up control (0.40 and 0.41); the Lua live-catchup.lua approach works.",
+   "verdict": "confirmed",
+   "evidence": "grep -iE 'catch|live|drift|behind' over `mpv --no-config --list-options` (0.40.0) returns nothing. Diff of option headers 0.40 -> 0.41 options.rst adds only: audio-set-media-role, background-blur-radius, background-tile-*, bluray-angle, clipboard-xwayland, d3d11-composition-size, d3d11-output-mode, hdr-reference-white, hwdec-threads, image-subs-hdr-peak, input-tablet-emulate-mouse, load-context-menu, osd-*, register(-rpath), sdr-adjust-gamma, sub-*, target-colorspace-hint-mode, target-colorspace-hint-strict, treat-srgb-as-power22, unregister — no live/latency control. The report's live-catchup.lua loaded and ran on mpv 0.40.0 (--script=..., lavfi source): \"[live_catchup] live-catchup loaded OK\", exit 0; set_property speed 1.05 over IPC -> 1.05.",
+   "correction": ""
+  },
+  {
+   "claim": "All option names in the receiver command lines / mpv.conf exist in 0.40.0 and --demuxer-lavf-o-add=fflags=+nobuffer is valid syntax.",
+   "verdict": "confirmed",
+   "evidence": "Full receiver command line (Linux: --vo=null --ao=null substituted, gpu-api omitted) parsed on mpv 0.40.0 with no 'Error'/'unknown'/'failed'/'invalid' output, exit 0; `get_property demuxer-lavf-o` after --demuxer-lavf-o-add=fflags=+nobuffer --demuxer-lavf-o-add=foo=bar -> {\"data\":{\"fflags\":\"+nobuffer\",\"foo\":\"bar\"}}. --list-options confirms target-contrast, hdr-peak-percentile, hdr-contrast-recovery, gamut-mapping-mode, cache-pause-wait, demuxer-hysteresis-secs, stream-lavf-o, osd-status-msg, wid (Integer64 default -1). Windows-only options (d3d11va-zero-copy, d3d11-output-csp/format) cannot be checked on Linux (`--gpu-api=d3d11` -> \"Option gpu-api: 'd3d11' isn't supported.\" here, expected). target-colorspace-hint-mode/-strict and hdr-reference-white are absent in 0.40.0 (0.41+ only).",
+   "correction": ""
+  }
+ ],
+ "experiments_run": [
+  {
+   "command": "curl raw.githubusercontent.com for mpv v0.40.0/v0.41.0 (vo_gpu_next.c, d3d11/context.c, vulkan/context_win.c, w32_common.c, client.h, hwdec_d3d11va.c, hwdec_cuda.c, vd_lavc.c, options.rst, input.rst, RELEASE_NOTES, command.c), libplacebo v7.349.0 d3d11/swapchain.c, shinchiro packages/{ffmpeg,libsrt,mpv}.cmake, zhongfly README; saved under /tmp/claude-0/-projects/eb06eadf-2fb4-465a-826d-820fbabd8b59/scratchpad/verify-mpv-hdr-windows/",
+   "result": "All files fetched; grep/sed excerpts quoted in verdicts (target_csp only in d3d11/context.c in 0.40; 0.41 adds preferred_csp in vulkan/context_win.c, target_hint default -1, hint-mode/strict options; --enable-libsrt present, no librist)."
+  },
+  {
+   "command": "curl https://api.github.com/repos/mpv-player/mpv/releases/tags/v0.40.0 and v0.41.0",
+   "result": "v0.40.0 published_at 2025-03-25T17:35:57Z; v0.41.0 published_at 2025-12-21T19:17:10Z"
+  },
+  {
+   "command": "mpv --version; mpv --no-config --list-options | grep for ~45 option names used in the snippets",
+   "result": "mpv v0.40.0 (libplacebo v7.349.0, FFmpeg runtime 7.1.5). All 0.40 options present with defaults: target-colorspace-hint default no; cache-secs default 3600000; demuxer-max-bytes 150 MiB; demuxer-max-back-bytes 50 MiB; cache-pause-wait 1; hwdec-codecs h264,vc1,hevc,vp8,vp9,av1,prores. Missing (expected): target-colorspace-hint-mode/-strict, hdr-reference-white (0.41+), d3d11* (Windows-only)."
+  },
+  {
+   "command": "timeout 20 mpv --no-config --vo=null --ao=null <full receiver option set incl. --demuxer-lavf-o-add=fflags=+nobuffer --wid=12345> --idle=no 2>&1 | grep -iE 'error|unknown|failed|invalid|warn'",
+   "result": "No output (no parse errors), exit 0. `--gpu-api=d3d11` alone on Linux -> \"Option gpu-api: 'd3d11' isn't supported.\" (expected). get_property demuxer-lavf-o -> {\"fflags\":\"+nobuffer\",\"foo\":\"bar\"}."
+  },
+  {
+   "command": "mpv --config-dir=$PWD/cfg (report's mpv.conf incl. [sdr-quality] and [hint-source] profiles) --vo=null --ao=null --idle=no, with and without --profile=sdr-quality / --profile=hint-source",
+   "result": "In all three runs: \"Error parsing option target-colorspace-hint-mode (option not found)\" + \"mpv.conf:39: setting option target-colorspace-hint-mode='source' failed.\"; exit 0 (non-fatal). Refutes the 'only when the profile is applied' note."
+  },
+  {
+   "command": "mpv --no-config --vo=null --ao=null --script=cfg/scripts/live-catchup.lua --length=4 av://lavfi:testsrc2=size=320x240:rate=30",
+   "result": "[live_catchup] live-catchup loaded OK; exit 0 (Lua script is syntactically valid and loads on 0.40)."
+  },
+  {
+   "command": "mpv --no-config --vo=null --ao=null --cache=yes --input-ipc-server=ipc.sock --length=30 av://lavfi:testsrc2 & python3 ipc_test.py (get_property for 18 properties, observe_property, set_property speed 1.05, quit)",
+   "result": "All listed properties answered as quoted in verdict 7; demuxer-cache-state/raw-input-rate and /fw-bytes -> 'error accessing property'; raw-input-rate absent from the node for a non-network source; video-target-params unavailable with vo=null; speed set to 1.05 OK."
+  },
+  {
+   "command": "mpv --no-config --vo=null --ao=null --cache=yes --cache-secs=8 --demuxer-max-bytes=256MiB --input-ipc-server=ipc2.sock av://lavfi:testsrc2 & python3 ipc_cache.py",
+   "result": "demuxer-cache-duration: 8.0 (cap honoured); node keys: bof-cached, cache-duration, cache-end, debug-*, eof, eof-cached, fw-bytes, idle, reader-pts, seekable-ranges, total-bytes, ts-per-stream, underrun."
+  },
+  {
+   "command": "curl api.github.com issues 10628 (+comments), 17570, mpvnet-player/mpv.net issue 601 (+comments), search mpv.net issues 'HDR'",
+   "result": "#10628 open since 2022-09-10: fullscreen passes HDR10 metadata, windowed mode does not (hdfury shows Windows defaults; AMD 1499/799); 2026-03 comments: ACM/Win11 24H2 remarks, Vulkan adds ~1 s startup and broke AV1 hwdec for one user. #17570 (mpv.net host, RTX 4070): hint=yes -> correct HDR brightness but black flash on resize/fullscreen; hint=no -> dim. mpv.net #601: unanswered config question, no technical content."
+  },
+  {
+   "command": "WebFetch https://learn.microsoft.com/en-us/windows/win32/direct3darticles/high-dynamic-range",
+   "result": "Confirms DWM composites all windows in FP16 scRGB when HDR mode is on; Option 2 (R10G10B10A2 + SetColorSpace1 G2084_P2020) documented for CreateSwapChainForHwnd swapchains without a fullscreen requirement; DXGI_OUTPUT_DESC1.ColorSpace = G2084_P2020 only when HDR is active; Advanced-Color SDR displays are reported as G22_P709; doc does not state any metadata/fullscreen limitation explicitly."
+  }
+ ],
+ "extra_findings": [
+  "[verified] 0.41.0 semantics change for --target-colorspace-hint=auto: the hint is applied whenever the display transfer is KNOWN (vo_gpu_next.c 0.41 lines 1113-1116: `target_csp.transfer != PL_COLOR_TRC_UNKNOWN`), i.e. on an SDR monitor with Windows HDR off, 0.41 sets an sRGB/G22 swapchain hint (mpv still tone-maps in-shader; the manual calls this 'crucial for all non-sRGB content, even SDR'). In 0.40 'auto' only hints when the display reports PQ. Both versions are fine for the receiver; just expect different stats-page 'target' lines.",
+  "[verified] 0.41.0 adds --target-colorspace-hint-strict (default yes: 'the configured swapchain colorspace (with the hint) will be respected ... --target-* options act only as a hint') and, in 0.41 vo_gpu_next.c, the reported display peak is discarded in SDR mode ('Don't use reported display peak in SDR mode ... target_csp.hdr.max_luma = 0'). So the report's --target-peak override advice applies to HDR mode only.",
+  "[verified] 0.41.0 changed the hwdec autoprobe order (vd_lavc.c): d3d11va, vulkan, dxva2, nvdec, vaapi, vdpau, drm, mediacodec, videotoolbox, then every -copy variant; RELEASE_NOTES: 'Vulkan hardware decoding is preferred over other APIs' and 'gpu-next is now the default'. Passing --hwdec=d3d11va explicitly (as the snippets do) sidesteps this.",
+  "[verified] 0.41.0 adds --d3d11-output-mode=<auto|window|composition> (composition = no window, for WinUI/SwapChainPanel hosts; swapchain address exposed via the `display-swapchain` property), --hdr-reference-white, --sdr-adjust-gamma, --treat-srgb-as-power22, --hwdec-threads. No 0.40 options were removed in 0.41 (header diff shows no deletions), so --d3d11-output-csp/-format still exist.",
+  "[verified] Cross-process embedding detail (w32_common.c): when mpv.exe is launched by a separate WinForms process with --wid, mpv follows parent resizes through SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, WINEVENT_OUTOFCONTEXT) — the code comments 'These don't seem to be as smooth as Windows hooks' — and resizes the child with SWP_ASYNCWINDOWPOS only when the parent's client rect changes. In-process libmpv hosting gets the WH_CALLWNDPROC hook instead. Combined with #17570's black flash on resize, keep the video panel size static (fixed panel or borderless-fullscreen form) or drive resizes from the host deliberately.",
+  "[verified] For the input-rate stat use the top-level property `cache-speed` (MPV_FORMAT_INT64 bytes/s; input.rst: 'This is the same as demuxer-cache-state/raw-input-rate'); `raw-input-rate` is only added to the demuxer-cache-state node when bytes_per_second > 0 (command.c 1557), and sub-paths of that node are not addressable. `video-params/max-luma` returns 'property unavailable' for SDR content and `video-target-params` is unavailable until a real VO exists — the C# reader must tolerate missing `data`.",
+  "[verified] mpv 0.40 does NOT tolerate unknown options inside unused profile sections: they log 'Error parsing option ... (option not found)' at config load (non-fatal). A single mpv.conf cannot carry 0.41-only options for a 0.40 build without log noise; version-gate them on the command line instead.",
+  "[verified] Microsoft's Advanced Color doc states Win32 apps should NOT use IDXGISwapChain::GetContainingOutput to refresh DXGI_OUTPUT_DESC1 after display changes because it returns a stale output; 0.41 moved the probe to an HWND-based helper (mp_dxgi_output_desc_from_hwnd) while 0.40's d3d11_target_color_space queries via the swapchain (mp_get_dxgi_output_desc(p->swapchain, ...)). [uncertain] whether 0.40 therefore fails to notice Windows HDR being toggled while mpv runs — practical mitigation: restart mpv.exe after toggling Win+Alt+B.",
+  "[verified] Microsoft doc: DXGI_OUTPUT_DESC1.ColorSpace is G2084_P2020 only while Windows HDR mode is active, and 'DXGI doesn't let you check what Advanced Color kinds are supported-but-not-active' — consistent with the report's rule that the user must enable Windows HDR before launching mpv; the receiver GUI cannot detect an HDR-capable-but-disabled display via mpv.",
+  "[verified] Sanity check on the read-ahead arithmetic: with a source faster than real time and no --cache-secs cap, 0.40's demuxer buffered 1159 s of lavfi video in 2.5 s (bounded only by demuxer-max-bytes), so the cap (--cache-secs=8 -> exactly 8.0 s) is what keeps the live buffer bounded when the relay bursts after a stall; --demuxer-max-bytes must be >= cache-secs x bitrate (8 s x 12.5 MB/s = 100 MB at 100 Mbps) or the byte cap wins first.",
+  "[likely] Vulkan on Windows: #10628 2026-03 comment reports winvk adds ~1 s startup and broke AV1 hwdec on an RTX 3080; a 2022 comment reports AMD Vulkan HDR not working at all and NVIDIA Vulkan sending no HDR metadata even in fullscreen. Reinforces the d3d11 recommendation."
+ ]
+}

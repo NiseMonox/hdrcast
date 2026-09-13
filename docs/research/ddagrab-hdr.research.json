@@ -1,0 +1,229 @@
+{
+ "topic": "ddagrab-hdr",
+ "summary": "ddagrab in FFmpeg 7.1 (libavfilter/vsrc_ddagrab.c) exposes output_idx, draw_mouse (default 1), framerate (default 30), video_size, offset_x/offset_y, output_fmt, allow_fallback (default 0), force_fmt (default 0), dup_frames (default 1). output_fmt constants: auto, 8bit/bgra (DXGI B8G8R8A8), 10bit/x2bgr10 (R10G10B10A2), 16bit/rgbaf16 (R16G16B16A16_FLOAT). The DEFAULT is 8bit, not auto, so HDR capture requires output_fmt=16bit (or auto). The filter calls IDXGIOutput5::DuplicateOutput1 with the format list [FP16, 10bit, BGRA] (auto) or [requested, BGRA]; with allow_fallback=0 it errors if DDA returns something else. Output frames are D3D11 with sw_format BGRA/X2BGR10/RGBAF16 and ARE colour-tagged: integer formats -> full range, BT.709, sRGB TRC, RGB; FP16 -> full range, BT.709, AVCOL_TRC_LINEAR, RGB. Microsoft's Advanced Color doc confirms the HDR-mode DWM composes in scRGB FP16 (BT.709 primaries, linear) with 1.0 = 80 nits scene-referred, 12.5 = 1000 nits, values outside [0,1] permitted; on Win11 ACM-SDR displays 1.0 is instead the display's reference white. OBS uses exactly this (requests FP16+BGRA, tags FP16 as scRGB with sdr_white 80). 16bit/rgbaf16/allow_fallback/force_fmt are undocumented in 7.1 docs.\n\nThe proposed CPU conversion is broken twice in 7.1. (a) `matrixin=rgb` is not a valid zscale token (execution error \"Unable to parse option value rgb\"); the token is `gbr`, and for RGB inputs zscale forces RGB matrix/full range anyway. (b) zscale accepts no packed-float formats (only GBRPF32/GBRAPF32), so ffmpeg auto-inserts swscale for rgbaf16, and swscale's rgbaf16 input path does `lrintf(av_clipf(65535*half,0,65535))` (16-bit integer intermediate) — verified by execution on ffmpeg 7.1.5: 2.5->1.0, 125->1.0, -0.2->0. Timo Rothenpieler's own patch message says \"ddagrab will return scRGB data with values outside of 0.0f to 1.0f for HDR values. Its primary purpose is to be able to work with the format at all.\" Identical code exists in release/8.0. zscale itself is correct: `npl` sets the linear value that maps to 1.0 = npl nits for ST2084 output (zimg gamma.cpp: to_gamma_scale = npl/10000; default NAN = 100 nits), verified numerically with npl=80: 1.0->81 nits, 2.5->204 nits, 125->PQ max, negative out-of-709 components preserved through the primaries matrix and only clamped to 0 by the PQ inverse EOTF. Frame tags from ddagrab survive hwdownload (av_frame_copy_props) so setparams is unnecessary. zscale has AVFILTER_FLAG_SLICE_THREADS. hwdownload of RGBAF16 D3D11 frames is supported (hwcontext_d3d11va supported_formats includes R16G16B16A16_FLOAT). Note zscale cannot emit P010; use format=yuv420p10le then format=p010le (cheap repack) or swscale does RGB->YUV itself.\n\nGPU alternatives in 7.1 are dead ends: hwcontext_vulkan only maps from VAAPI/DRM (no D3D11 import; Win32 handles are used only for CUDA interop), hwcontext_cuda derives only from Vulkan, hwcontext_d3d11va has no map/derive, Vulkan hwframes lack RGBAF16, scale_cuda has no transfer conversion and there is no tonemap_cuda. The libplacebo filter accepts sw rgbaf16 directly, but libplacebo maps AVCOL_TRC_LINEAR to PL_COLOR_TRC_LINEAR where 1.0 = 203 nits (PL_COLOR_SDR_WHITE); PL_COLOR_TRC_SCRGB (80 nits) has no AV mapping; LINEAR is classified non-HDR so peak detection is skipped and tone mapping clamps output_max to the 203-nit input max, clipping HDR highlights. NVENC also rejects RGBAF16 D3D11 frames directly (\"Invalid input pixel format\").\n\nEncoders: hevc_nvenc/av1_nvenc take P010/X2BGR10 (and D3D11/CUDA), force MAIN10 for 10-bit input, write VUI from -color_primaries/-color_trc/-colorspace/-color_range; nvenc.c 7.1 has zero mastering-display/CLL code (FFmpeg 8.0 adds it but only from decoded_side_data, unavailable for ddagrab). amfenc 7.1 does read MDCV/CLL frame side data; hevc_amf/av1_amf 10-bit output is hardwired to SMPTE2084/BT2020 tags. hevc_qsv main10 with P010 writes VUI, no MDCV. h265_metadata bsf (libavcodec/bsf/h265_metadata.c) has VUI colour options but no MDCV/CLL. libx265 supports master-display/max-cll params. mpv defaults --hdr-compute-peak=auto and infers 10000-nit peak for untagged PQ, so missing MDCV/CLL is acceptable; HDR passthrough is --vo=gpu-next --target-colorspace-hint=yes.\n\nBuilds: gyan.dev now ships 9.0.1 (full: libplacebo, vulkan, zimg, srt, rist, nvenc, amf, vpl, x265, svtav1, dav1d; essentials already include zimg+srt); BtbN builds 7.1 branch with scripts for libplacebo, vulkan, zimg, srt, librist, ffnvcodec, amf, onevpl, x265 (gpl), svtav1, dav1d.\n\nCost (measured here, Zen4 8845HS, zscale float->PQ + swscale->P010): ~4.5 ns/pixel single-thread => 1440p ≈17 ms/frame, 2160p ≈38 ms/frame; FP16 readback bandwidth 1.77 GB/s (1440p60) / 3.98 GB/s (2160p60) plus an equal CPU memcpy. Feasible, but pointless in 7.1 because the FP16->float step clips.",
+ "findings": [
+  {
+   "claim": "ddagrab 7.1 options: output_idx (int, default 0), draw_mouse (bool, default 1), framerate (video_rate, default 30), video_size, offset_x, offset_y, output_fmt, allow_fallback (bool, default 0), force_fmt (bool, default 0), dup_frames (bool, default 1). output_fmt constants: auto=0, 8bit/bgra=DXGI_FORMAT_B8G8R8A8_UNORM, 10bit/x2bgr10=DXGI_FORMAT_R10G10B10A2_UNORM, 16bit/rgbaf16=DXGI_FORMAT_R16G16B16A16_FLOAT.",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/FFmpeg/FFmpeg/release/7.1/libavfilter/vsrc_ddagrab.c lines 111-131 (local copy /tmp/claude-0/-projects/eb06eadf-2fb4-465a-826d-820fbabd8b59/scratchpad/libavfilter/vsrc_ddagrab.c)",
+   "design_impact": "critical"
+  },
+  {
+   "claim": "output_fmt DEFAULTS to 8bit (DXGI_FORMAT_B8G8R8A8_UNORM), not auto. For HDR you must pass output_fmt=16bit (or auto). With 'auto' the format list [FP16, R10G10B10A2, BGRA] is offered to DuplicateOutput1; with an explicit non-8bit value the list is [requested, BGRA] (or only [requested] when force_fmt=1); if allow_fallback=0 and DDA returns a different format, init fails with 'Requested output format unavailable'.",
+   "confidence": "verified",
+   "source": "vsrc_ddagrab.c lines 118, 232-246, 281-283, 897-900",
+   "design_impact": "critical"
+  },
+  {
+   "claim": "ddagrab DOES tag colour metadata on every output frame: BGRA/X2BGR10 -> color_range=JPEG(full), primaries=BT709, trc=IEC61966_2_1 (sRGB), colorspace=RGB; RGBAF16 -> range=JPEG, primaries=BT709, trc=LINEAR, colorspace=RGB (source comment: 'According to MSDN, all floating point formats contain sRGB image data with linear 1.0 gamma'). No HDR mastering/CLL side data is attached. hwframes sw_format mapping: BGRA, X2BGR10, RGBAF16.",
+   "confidence": "verified",
+   "source": "vsrc_ddagrab.c lines 818-836, 1198-1214",
+   "design_impact": "important"
+  },
+  {
+   "claim": "In HDR mode the Windows DWM composes in scRGB FP16 (BT.709/sRGB primaries, linear gamma); on HDR displays 1.0f = 80 nits (scene-referred): 'scRGB (1.0, 1.0, 1.0) encodes the standard D65 white at 80 nits; but scRGB (12.5, 12.5, 12.5) encodes the same D65 white at ... 1000 nits'; 'HDR10 (497, 497, 497)' also = 80 nits. Values outside [0,1] are allowed (no enforced clamp). On Windows 11 22H2 Advanced-Color SDR displays 1.0f is instead interpreted as the display's reference white (display-referred). Out-of-gamut colours are numerically clipped by DWM/display kernel. DuplicateOutput1 is explicitly named as the API to capture HDR/WCG content without losing pixel information.",
+   "confidence": "verified",
+   "source": "https://learn.microsoft.com/en-us/windows/win32/direct3darticles/high-dynamic-range",
+   "design_impact": "critical"
+  },
+  {
+   "claim": "DuplicateOutput1 docs: if the current fullscreen/desktop format is not in pSupportedFormats, DXGI converts to one of the supplied formats; the list should always contain B8G8R8A8_UNORM. The MS docs do not state what an HDR desktop yields for R10G10B10A2 requests; ddagrab's author treats all integer formats as sRGB (SDR) data, i.e. 10bit/x2bgr10 is NOT an HDR path in ddagrab.",
+   "confidence": "likely",
+   "source": "https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_5/nf-dxgi1_5-idxgioutput5-duplicateoutput1 ; vsrc_ddagrab.c line 1200 comment; commit 'avfilter/vsrc_ddagrab: set sRGB color information on output frames'",
+   "design_impact": "important"
+  },
+  {
+   "claim": "OBS Studio corroborates the scRGB semantics: its D3D11 duplicator requests {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_B8G8R8A8_UNORM}, defaults sdr_white_nits=80, and tags the FP16 texture as GS_CS_709_SCRGB when the monitor is HDR.",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/obsproject/obs-studio/master/libobs-d3d11/d3d11-duplicator.cpp lines 50-66, 246-248",
+   "design_impact": "important"
+  },
+  {
+   "claim": "The 7.1 documentation (doc/filters.texi and ffmpeg-filters.html / ayosec 7.1 mirror) documents only auto/8bit/bgra/10bit/x2bgr10 for output_fmt; 16bit, rgbaf16, allow_fallback and force_fmt exist only in the source.",
+   "confidence": "verified",
+   "source": "/tmp/claude-0/-projects/eb06eadf-2fb4-465a-826d-820fbabd8b59/scratchpad/doc/filters.texi ddagrab section; https://ayosec.github.io/ffmpeg-filters-docs/7.1/Sources/Video/ddagrab.html",
+   "design_impact": "minor"
+  },
+  {
+   "claim": "The proposed zscale string is syntactically wrong: 'matrixin=rgb' fails with 'Unable to parse option value \"rgb\"'; the accepted token is 'gbr' (ZIMG_MATRIX_RGB). Moreover, for any RGB pixel format zscale's format_init forces matrix=ZIMG_MATRIX_RGB and range=ZIMG_RANGE_FULL regardless of matrixin/rangein, so those two options are irrelevant for RGB input.",
+   "confidence": "verified",
+   "source": "Executed on ffmpeg 7.1.5 (verify.py in scratchpad); vf_zscale.c lines 583-596, 1074",
+   "design_impact": "critical"
+  },
+  {
+   "claim": "zscale in 7.1 does NOT accept AV_PIX_FMT_RGBAF16 (or any packed float): its input list has only planar GBRPF32/GBRAPF32 as float formats, and no P010 output. ffmpeg therefore auto-inserts swscale before zscale; in the test graph it negotiated rgbaf16le -> gbrap16le (16-bit integer), and with format=p010le after zscale, zscale outputs gbrpf32 and swscale does RGB->YUV (use ',format=yuv420p10le,format=p010le' to make zscale do the YUV conversion; the yuv420p10->p010 repack costs ~1.4 ms/frame at 1440p).",
+   "confidence": "verified",
+   "source": "vf_zscale.c lines 190-216; execution logs 'auto-inserting filter auto_scale_0 ... fmt:rgbaf16le -> fmt:gbrap16le' and 'gbrpf32le -> p010le'",
+   "design_impact": "critical"
+  },
+  {
+   "claim": "swscale's rgbaf16 input path clips scRGB to [0,1]: rgbaf16ToY/UV do lrintf(av_clipf(65535.0f * half, 0.0f, 65535.0f)) through a 16-bit integer intermediate. Executed: input 1.0 -> 1.0, 2.5 -> 1.0, 125.0 -> 1.0, -0.2 -> 0.0002 when converting rgbaf16le -> gbrpf32le. Therefore 'hwdownload,format=rgbaf16le,zscale=...' can never produce correct HDR10 in 7.1: everything above 80 nits is flattened to SDR white. The identical code is still present in release/8.0 libswscale/input.c.",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/FFmpeg/FFmpeg/release/7.1/libswscale/input.c lines 1204-1233; release/8.0 input.c lines 1630-1632; execution TEST1 in scratchpad/verify.py",
+   "design_impact": "critical"
+  },
+  {
+   "claim": "The author of ddagrab/rgbaf16 support acknowledged this: 'This is by no means perfect, since at least ddagrab will return scRGB data with values outside of 0.0f to 1.0f for HDR values. Its primary purpose is to be able to work with the format at all.'",
+   "confidence": "verified",
+   "source": "https://patchwork.ffmpeg.org/project/ffmpeg/patch/20220810204712.3123-11-timo@rothenpieler.org/",
+   "design_impact": "important"
+  },
+  {
+   "claim": "zscale 'npl' (nominal_peak_luminance, double, default NAN = 100 cd/m^2 per zimg.h) is the luminance assigned to linear 1.0 when converting to/from ST2084: zimg sets to_gamma_scale = peak_luminance/10000 for ST_2084, so linear 1.0 -> npl nits and 125.0 -> 10000 nits when npl=80. Verified numerically (gbrpf32 input, npl=80): 1.0 -> Y10=491 (~81 nits), 2.5 -> Y10=573 (~204 nits), 125.0 -> Y10=943 (PQ max, clipped), (-0.2,0.5,1.5) -> Y=403 U=576 V=451 (out-of-709 colour preserved via the BT.2020 matrix; only the PQ inverse EOTF clamps negatives to 0). Leaving npl unset would map 1.0 to 100 nits (25% too bright).",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/sekrit-twc/zimg/master/src/zimg/api/zimg.h lines 633-639; zimg src/zimg/colorspace/gamma.cpp lines 286-300, 386-391; execution TEST2 in verify.py",
+   "design_impact": "critical"
+  },
+  {
+   "claim": "zscale uses transferin/primariesin overrides when given, otherwise the frame's color_trc/color_primaries; ddagrab tags frames and hwdownload copies frame props (av_frame_copy_props), so setparams is not required (explicit *in options are harmless). zscale sets color_primaries/color_trc on output frames when transfer/primaries are specified and configures outlink colorspace/range when matrix/range are specified.",
+   "confidence": "verified",
+   "source": "vf_zscale.c lines 583-596, 226-235, 702-711; libavfilter/vf_hwdownload.c line 148",
+   "design_impact": "important"
+  },
+  {
+   "claim": "vf_zscale.c 7.1 has .flags = AVFILTER_FLAG_SLICE_THREADS; nb_threads = clip(min(ff_filter_get_nb_threads, min(in_h,out_h)/64), 1, 64), jobs dispatched via ff_filter_execute with zimg active_region slices (even-height alignment).",
+   "confidence": "verified",
+   "source": "vf_zscale.c lines 47-48, 241-253, 835-836, 889, 1141",
+   "design_impact": "minor"
+  },
+  {
+   "claim": "hwdownload of RGBAF16 D3D11 frames is supported: hwcontext_d3d11va.c supported_formats contains { DXGI_FORMAT_R16G16B16A16_FLOAT, AV_PIX_FMT_RGBAF16 } (and R10G10B10A2 -> X2BGR10, P010, NV12, ...); transfer_get_formats returns the frames' sw_format; download = CopySubresourceRegion to a D3D11_USAGE_STAGING texture, Map(D3D11_MAP_READ) and a CPU row copy.",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/FFmpeg/FFmpeg/release/7.1/libavutil/hwcontext_d3d11va.c lines 94-106, 354-380, 389, 416-470",
+   "design_impact": "important"
+  },
+  {
+   "claim": "No D3D11 -> Vulkan hwmap in 7.1: hwcontext_vulkan.c vulkan_map_to() handles only AV_PIX_FMT_VAAPI and AV_PIX_FMT_DRM_PRIME (under CONFIG_LIBDRM) and returns ENOSYS otherwise; Win32 external-memory handles are used only for Vulkan<->CUDA export. Vulkan device derivation supports VAAPI/DRM/CUDA sources only. hwcontext_d3d11va.c has no map/derive callbacks at all. Vulkan hwframes also lack RGBAF16 (only R32_SFLOAT GBRPF32/GBRAPF32/GRAYF32), so hwupload of rgbaf16 to Vulkan fails. Same in release/8.0.",
+   "confidence": "verified",
+   "source": "hwcontext_vulkan.c lines 3576-3600, 1880-1945, 3358-3391; hwcontext_d3d11va.c (grep derive/map: none); release/8.0 hwcontext_vulkan.c grep RGBAF16: none",
+   "design_impact": "critical"
+  },
+  {
+   "claim": "No D3D11 -> CUDA hwmap in 7.1: hwcontext_cuda.c derives devices only from AV_HWDEVICE_TYPE_VULKAN and has no D3D11 references. vf_scale_cuda has no transfer/primaries/colorspace handling (only scaling + pixel format); 7.1 has no tonemap_cuda (only tonemap, tonemap_opencl, tonemap_vaapi) and colorspace_cuda handles YUV matrix/range only. Vulkan -> CUDA frame transfer (vulkan_transfer_data_to_cuda, OPAQUE_WIN32 handles) does exist and works with hwupload=derive_device=cuda, but is moot without a D3D11 import.",
+   "confidence": "verified",
+   "source": "hwcontext_cuda.c lines 471-495; vf_scale_cuda.c (grep trc/primaries: none); libavfilter/allfilters.c; hwcontext_vulkan.c lines 4177-4192, 4294-4309",
+   "design_impact": "important"
+  },
+  {
+   "claim": "libplacebo filter can ingest rgbaf16 CPU frames directly (pl_test_pixfmt/pl_map_avframe uploads them itself) and output p010 with colorspace=bt2020nc:color_primaries=bt2020:color_trc=smpte2084:range=tv, BUT libplacebo maps AVCOL_TRC_LINEAR to PL_COLOR_TRC_LINEAR whose scale is 1.0 = PL_COLOR_SDR_WHITE = 203 nits, not 80 (PL_COLOR_TRC_SCRGB = 80 nits exists but has no AV mapping, marked 'missing'). LINEAR has nominal peak 1.0 so pl_color_space_is_hdr() is false: renderer.c skips peak detection ('if (!params->peak_detect_params || !pl_color_space_is_hdr(&pass->image.color))') and the tone mapper clamps output_max to the inferred 203-nit input max ('Never exceed the source unless requested'). Net effect: brightness scaled 2.54x and all scRGB values >1.0 clipped. 'contrast=0.394' (decode-matrix gain) could fix the scale but not the clip. So the 'hwdownload + libplacebo' GPU path is not a correct HDR path in 7.1 without upstream changes.",
+   "confidence": "likely",
+   "source": "vf_libplacebo.c lines 872, 920, 1111, 1290-1380; libplacebo src/include/libplacebo/utils/libav_internal.h lines 206, 251; colorspace.h lines 296-311; colorspace.c lines 323-345, 519-522; src/renderer.c line 1196; src/shaders/colorspace.c lines 657-658, 1755-1758, 1885-1889",
+   "design_impact": "critical"
+  },
+  {
+   "claim": "hevc_nvenc rejects ddagrab FP16 frames directly: nvenc_map_buffer_format() returns NV_ENC_BUFFER_FORMAT_UNDEFINED for RGBAF16 -> 'Invalid input pixel format'. Accepted 10-bit inputs: P010, P016, YUV444P16, X2RGB10, X2BGR10, GBRP16 (IS_10BIT); D3D11 and CUDA hwframes accepted. MAIN10 profile is forced when input is 10-bit or -highbitdepth 1; 10-bit encode capability checked (NV_ENC_CAPS_SUPPORT_10BIT_ENCODE). -profile:v main10 exists.",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/FFmpeg/FFmpeg/release/7.1/libavcodec/nvenc.c lines 56-100, 516-520, 1414-1441, 1797-1823, 1846-1847; nvenc_hevc.c line 65, 187",
+   "design_impact": "important"
+  },
+  {
+   "claim": "nvenc VUI: colourPrimaries/transferCharacteristics come from -color_primaries/-color_trc, colourMatrix from -colorspace and videoFullRangeFlag from -color_range (tv=0) for YUV input; for packed RGB input (BGRA/X2BGR10) colourMatrix is forced to BT470BG (BT.601) with full-range flag 0 (NVENC converts RGB->YUV internally). colourDescriptionPresentFlag is set whenever any value != 2. nvenc.c in 7.1 contains NO mastering-display / content-light-level SEI code (0 grep hits). FFmpeg 8.0.x nvenc.c sets hevc->outputMasteringDisplay / outputMaxCll only from avctx->decoded_side_data (decoder-provided), which a ddagrab/lavfi source never has.",
+   "confidence": "verified",
+   "source": "nvenc.c 7.1 lines 1340-1366 (grep MASTERING: 0); release/8.0 nvenc.c lines 1505-1510, 1726-1731",
+   "design_impact": "important"
+  },
+  {
+   "claim": "AMF in 7.1: amfenc.c reads AV_FRAME_DATA_MASTERING_DISPLAY_METADATA and AV_FRAME_DATA_CONTENT_LIGHT_LEVEL from each input frame and passes AMF_VIDEO_ENCODER_HEVC_INPUT_HDR_METADATA / AV1_INPUT_HDR_METADATA; hevc_amf/av1_amf accept NV12, YUV420P, P010, D3D11, DXVA2; -profile:v main10 exists; when the input is P010 the encoder sets COLOR_BIT_DEPTH_10 and hardwires OUTPUT_TRANSFER_CHARACTERISTIC=SMPTE2084 and OUTPUT_COLOR_PRIMARIES=BT2020 (8-bit -> BT709), colour profile derived from -colorspace/-color_range.",
+   "confidence": "verified",
+   "source": "amfenc.c lines 41-90, 100-130, 747-754, 881-895; amfenc_hevc.c lines 38-40, 245-263; amfenc_av1.c lines 242-261",
+   "design_impact": "important"
+  },
+  {
+   "claim": "QSV in 7.1: hevc_qsv -profile:v main10 (MFX_PROFILE_HEVC_MAIN10), P010 accepted, VUI VideoSignalInfo (ColourDescriptionPresent, TransferCharacteristics, MatrixCoefficients, full range) written from avctx colour fields; no mastering-display / CLL support (0 grep hits). av1_qsv has only profile 'main'.",
+   "confidence": "verified",
+   "source": "qsvenc.c lines 1215-1231 (grep MASTERING: 0); qsvenc_hevc.c lines 338-345, 400; qsvenc_av1.c 186-188",
+   "design_impact": "minor"
+  },
+  {
+   "claim": "Other MDCV/CLL injection routes: the h265_metadata bsf (libavcodec/bsf/h265_metadata.c in 7.1) offers colour_primaries, transfer_characteristics, matrix_coefficients, video_full_range_flag, chroma_sample_loc_type, tick_rate, crop, level - but NO mastering-display or content-light options. libx265 (CPU) reads MDCV/CLL side data and accepts -x265-params master-display=...:max-cll=...; libsvtav1 also maps side data to mastering_display/content_light_level. No 7.1 filter can attach MDCV/CLL side data to lavfi-generated frames.",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/FFmpeg/FFmpeg/release/7.1/libavcodec/bsf/h265_metadata.c lines 501-556; libx265.c lines 205-231; libsvtav1.c lines 188-203",
+   "design_impact": "important"
+  },
+  {
+   "claim": "mpv does not need MDCV/CLL: --hdr-compute-peak=auto (default) measures per-frame peak/average when compute shaders/SSBOs are available ('dynamic, per-scene tone mapping'); libplacebo infers a 10000-nit peak for untagged PQ (pl_color_transfer_nominal_peak(PQ) = 10000/203). HDR passthrough on Windows: --vo=gpu-next --target-colorspace-hint=yes (D3D11 and winvk contexts), with --target-colorspace-hint-mode=source for classic passthrough; --target-peak / --tone-mapping govern SDR-display fallback.",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/mpv-player/mpv/master/DOCS/man/options.rst lines 7343-7372, 7546-7552, 7822-7846; libplacebo colorspace.c lines 323-345",
+   "design_impact": "important"
+  },
+  {
+   "claim": "gyan.dev builds: current release 9.0.1 (2026-08-12) plus git master. 'essentials' already includes libzimg, libsrt, libx265, libvpx, libopus, mediafoundation; 'full' adds libplacebo, vulkan, librist, libsvtav1, libdav1d, libjxl, opencl, etc. The page reports nvenc/cuda, amf, libvpl(qsv), d3d11va as included in full; ddagrab is not named explicitly (it needs d3d11va + Windows SDK, which those builds have). 7.1-era zips are no longer the headline download.",
+   "confidence": "likely",
+   "source": "https://www.gyan.dev/ffmpeg/builds/ (WebFetch summary)",
+   "design_impact": "important"
+  },
+  {
+   "claim": "BtbN/FFmpeg-Builds: variants gpl, lgpl, nonfree (+ -shared), branches 4.4/5.0/5.1/6.0/6.1/7.0/7.1/master. scripts.d contains 50-libplacebo.sh (enabled for ffver>600, depends on 47-vulkan/), 47-vulkan/ (headers, loader, shaderc, spirv-cross), 50-zimg.sh, 50-srt.sh, 50-librist/, 50-ffnvcodec.sh (ffver>=404), 50-amf.sh, 50-onevpl.sh (non-arm64, ffver>=600), 50-x265.sh (not lgpl), 50-svtav1.sh (not win32, ffver>700), 50-dav1d.sh, 50-aom.sh. So the win64-gpl 7.1 zip carries ddagrab (d3d11va) + libplacebo + zimg + srt + rist + vulkan + nvenc + amf + vpl + x265 + svtav1 + dav1d.",
+   "confidence": "likely",
+   "source": "https://api.github.com/repos/BtbN/FFmpeg-Builds/contents/scripts.d ; https://raw.githubusercontent.com/BtbN/FFmpeg-Builds/master/scripts.d/50-libplacebo.sh ; https://raw.githubusercontent.com/BtbN/FFmpeg-Builds/master/README.md",
+   "design_impact": "important"
+  },
+  {
+   "claim": "Measured CPU cost on this box (AMD Ryzen 7 PRO 8845HS, Zen4/AVX-512, ffmpeg 7.1.5 + zimg) for gbrpf32 linear -> zscale(PQ/BT.2020) -> P010: ~4.5 ns/pixel single-thread => 2560x1440 ≈ 16.7 ms CPU/frame (54 frames in 0.903 s utime), 3840x2160 ≈ 37.8 ms CPU/frame; with 4 filter threads ≈ 25 ms CPU/frame at 1440p (threading overhead) i.e. ~1.5 cores for 1440p60 and ~2.5-3.5 cores for 2160p60. An FP16->F32 unpack would add ~1-2 ns/px. Memory traffic of the hwdownload: FP16 frame = 29.5 MB (1440p) / 66.4 MB (2160p) => 1.77 GB/s / 3.98 GB/s PCIe readback at 60 fps plus an equal CPU memcpy from the staging texture; Map(D3D11_MAP_READ) stalls the thread until the GPU copy completes.",
+   "confidence": "verified",
+   "source": "Bash benchmark in /tmp/claude-0/-projects/eb06eadf-2fb4-465a-826d-820fbabd8b59/scratchpad (ffmpeg -benchmark -filter_threads N ... -vf zscale=...,format=p010le -f null -); hwcontext_d3d11va.c lines 416-470",
+   "design_impact": "important"
+  },
+  {
+   "claim": "No public, tested HDR ddagrab command line (16bit/rgbaf16 -> HDR10) was found on ffmpeg trac, GitHub issues, Reddit or blogs; only SDR recipes exist (e.g. nico-lab: 'ffmpeg -init_hw_device d3d11va -filter_complex ddagrab=video_size=3840x2160:framerate=60,hwdownload,format=bgra -c:v hevc_nvenc ... -pix_fmt gbrp', noting bgra->gbrp conversion has no GPU assist and can drop frames). The HDR command lines below are derived from source and partially validated on Linux, not run on Windows.",
+   "confidence": "verified",
+   "source": "WebSearch results; https://nico-lab.net/ddagrab_with_ffmpeg/",
+   "design_impact": "important"
+  },
+  {
+   "claim": "FFmpeg 8.0 does not change the picture: it adds vf_scale_d3d11 (D3D11 VideoProcessor scaling, output NV12/P010 only, no colour-space options), zscale still lacks RGBAF16, Vulkan still lacks RGBAF16 and D3D11 import, hwcontext_d3d11va still has no derive/map, and swscale's rgbaf16 input still clips.",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/FFmpeg/FFmpeg/release/8.0/Changelog ; release/8.0 libavfilter/vf_scale_d3d11.c (grep ColorSpace: none) ; release/8.0 vf_zscale.c, hwcontext_vulkan.c, hwcontext_d3d11va.c, libswscale/input.c",
+   "design_impact": "important"
+  },
+  {
+   "claim": "ddagrab draws the hardware cursor with a pixel shader that blends the BGRA (sRGB-encoded) cursor texture straight into the FP16 linear render target without sRGB->linear conversion, so cursor colours/brightness are slightly off in HDR captures (cosmetic).",
+   "confidence": "verified",
+   "source": "vsrc_ddagrab.c lines 440-480 (cursor texture DXGI_FORMAT_B8G8R8A8_UNORM), 1040-1075 (OMSetRenderTargets/blend), 840 (BIND_RENDER_TARGET)",
+   "design_impact": "minor"
+  },
+  {
+   "claim": "ffmpeg 7.1 configure minimums: libplacebo >= 4.192.0, zimg >= 2.7.0, srt >= 1.3.0; the local Linux relay box's ffmpeg 7.1.5 has zscale (slice-threaded, 'TSC' flags show timeline+slice+command), libplacebo, tonemap, colorspace, hwmap, hwupload available for testing the receiver/relay side.",
+   "confidence": "verified",
+   "source": "https://raw.githubusercontent.com/FFmpeg/FFmpeg/release/7.1/configure lines 7005, 7023, 7081; ffmpeg -filters on this host",
+   "design_impact": "minor"
+  }
+ ],
+ "snippets": [
+  {
+   "title": "Corrected zscale HDR command (syntax-fixed; still CLIPS at 80 nits in ffmpeg 7.1/8.0 because of swscale's rgbaf16 path — use only to validate plumbing)",
+   "code": "ffmpeg -hide_banner -init_hw_device d3d11va=dx -filter_hw_device dx ^\n  -filter_complex \"ddagrab=output_idx=0:framerate=60:output_fmt=16bit:draw_mouse=1,hwdownload,format=rgbaf16le,zscale=transferin=linear:primariesin=bt709:transfer=smpte2084:primaries=bt2020:matrix=bt2020nc:range=limited:npl=80:dither=error_diffusion,format=yuv420p10le,format=p010le\" ^\n  -c:v hevc_nvenc -profile:v main10 -preset p4 -tune ll -rc cbr -b:v 40M -maxrate 40M -bufsize 80M -g 120 -bf 0 ^\n  -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc -color_range tv -chroma_sample_location left ^\n  -f mpegts \"srt://RELAY_HOST:9000?mode=caller&latency=2000&streamid=publish:desk&pkt_size=1316\"",
+   "notes": "Fixes vs the proposal: matrixin=gbr (not rgb; and irrelevant for RGB input), npl=80 maps scRGB 1.0 to 80 nits (verified numerically), format=yuv420p10le before p010le makes zimg (not swscale) do RGB->YCbCr/4:2:0. output_fmt must be set explicitly (default is 8bit). Fatal caveat: ffmpeg auto-inserts swscale for rgbaf16 -> gbrap16le/gbrpf32 which clips to [0,1], so HDR highlights above 80 nits are lost (executed on 7.1.5: 2.5->1.0, 125->1.0). AV1: swap to -c:v av1_nvenc (same colour flags, no -profile). AMD: -c:v hevc_amf -profile:v main10 -usage lowlatency -rc cbr -b:v 40M; Intel: -c:v hevc_qsv -profile:v main10 -b:v 40M -maxrate 40M."
+  },
+  {
+   "title": "SDR command (zero-copy: ddagrab BGRA D3D11 frames straight into NVENC)",
+   "code": "ffmpeg -hide_banner -init_hw_device d3d11va=dx -filter_hw_device dx ^\n  -filter_complex \"ddagrab=output_idx=0:framerate=60:output_fmt=8bit:allow_fallback=1\" ^\n  -c:v h264_nvenc -preset p4 -tune ll -rc cbr -b:v 20M -maxrate 20M -bufsize 40M -g 120 -bf 0 -profile:v high ^\n  -f mpegts \"srt://RELAY_HOST:9000?mode=caller&latency=2000&streamid=publish:desk&pkt_size=1316\"\n\nREM CPU-conversion variant (explicit BT.709 limited-range YUV, ~1 memcpy of 14.7 MB/frame at 1440p):\nffmpeg -hide_banner -init_hw_device d3d11va=dx -filter_hw_device dx ^\n  -filter_complex \"ddagrab=framerate=60:output_fmt=8bit,hwdownload,format=bgra,scale=out_color_matrix=bt709:out_range=tv,format=nv12\" ^\n  -c:v hevc_nvenc -preset p4 -tune ll -rc cbr -b:v 20M -maxrate 20M -bufsize 40M -g 120 -bf 0 ^\n  -color_primaries bt709 -color_trc bt709 -colorspace bt709 -color_range tv ^\n  -f mpegts \"srt://RELAY_HOST:9000?mode=caller&latency=2000&streamid=publish:desk\"",
+   "notes": "Zero-copy path: nvenc accepts D3D11 BGRA (NV_ENC_BUFFER_FORMAT_ARGB) and converts RGB->YUV inside NVENC; ffmpeg then writes VUI colourMatrix=bt470bg (BT.601), full_range=0 (nvenc.c 7.1 lines 1347-1351) — colour accuracy of that internal conversion is not verified. On an HDR desktop the 8-bit capture is Windows' sRGB rendition (HDR content clipped/washed). AMD/Intel: hevc_amf / hevc_qsv accept D3D11 NV12 but not BGRA -> use the hwdownload variant."
+  },
+  {
+   "title": "Receiver: mpv HDR passthrough / SDR tone-map",
+   "code": "mpv --vo=gpu-next --gpu-api=d3d11 --target-colorspace-hint=yes --hdr-compute-peak=auto --profile=low-latency --cache=yes --demuxer-max-bytes=64MiB --untimed=no \"srt://RELAY_HOST:9000?mode=caller&latency=2000&streamid=read:desk\"\nREM SDR display: drop --target-colorspace-hint (or =no); mpv/libplacebo tone-maps PQ->SDR using measured peak (--tone-mapping=bt.2390 default).",
+   "notes": "No MDCV/CLL SEI required: --hdr-compute-peak=auto measures peak per frame, and untagged PQ is inferred as 10000-nit peak. --target-colorspace-hint-mode=source gives classic passthrough."
+  },
+  {
+   "title": "Reference maths for a C#/D3D11 compute shader that replaces zscale (scRGB FP16 -> HDR10 P010), constants from OBS color.effect and MS docs",
+   "code": "// HLSL (per pixel). Input: scRGB linear FP16, 1.0 = 80 nits (BT.709 primaries).\nfloat3 rec709_to_rec2020(float3 v) {\n    return float3(dot(v, float3(0.62740389593469903, 0.32928303837788370, 0.043313065687417225)),\n                  dot(v, float3(0.069097289358232075, 0.91954039507545871, 0.011362315566309178)),\n                  dot(v, float3(0.016391438875150280, 0.088013307877225749, 0.89559525324762401)));\n}\nfloat linear_to_st2084_channel(float x) {            // x in units of 10000 nits\n    float c = pow(abs(x), 0.1593017578);\n    return pow((0.8359375 + 18.8515625 * c) / (1. + 18.6875 * c), 78.84375);\n}\n// ...\nfloat3 rgb2020 = max(rec709_to_rec2020(scrgb.rgb), 0.0);   // negative = out of BT.2020 gamut -> clip\nfloat3 pq      = saturate(float3(linear_to_st2084_channel(rgb2020.r * 80.0 / 10000.0),\n                                 linear_to_st2084_channel(rgb2020.g * 80.0 / 10000.0),\n                                 linear_to_st2084_channel(rgb2020.b * 80.0 / 10000.0)));\n// BT.2020 non-constant-luminance, limited range, 10-bit (store <<6 for P010)\nfloat Y  = 0.2627 * pq.r + 0.6780 * pq.g + 0.0593 * pq.b;\nfloat Cb = (pq.b - Y) / 1.8814;\nfloat Cr = (pq.r - Y) / 1.4746;\nuint y10  = (uint)round(64.0  + 876.0 * Y);\nuint cb10 = (uint)round(512.0 + 896.0 * Cb);\nuint cr10 = (uint)round(512.0 + 896.0 * Cr);   // subsample Cb/Cr 2x2 (average) for 4:2:0",
+   "notes": "Same mapping zscale npl=80 produced in the numeric test (1.0 -> Y10 ≈ 491). Feed the resulting P010 to ffmpeg via stdin: ffmpeg -f rawvideo -pix_fmt p010le -s WxH -r 60 -i pipe:0 -c:v hevc_nvenc -profile:v main10 ... (11.1 MB/frame at 1440p = 0.66 GB/s, 24.9 MB/frame at 2160p = 1.5 GB/s). Read DISPLAYCONFIG_SDR_WHITE_LEVEL if you want to renormalise SDR white like OBS does; for faithful reproduction keep 1.0 = 80 nits."
+  },
+  {
+   "title": "Numeric verification harness used (run on any ffmpeg with libzimg to re-check a build, e.g. FFmpeg 8.x/9.x)",
+   "code": "# writes 64x64 rgbaf16le with values 1.0 / 2.5 / 125.0 / (-0.2,0.5,1.5), converts, prints results\npython3 /tmp/claude-0/-projects/eb06eadf-2fb4-465a-826d-820fbabd8b59/scratchpad/verify.py\n# expected on 7.1.5: TEST1 swscale rgbaf16->gbrpf32: 2.5 -> 1.0, 125 -> 1.0 (CLIPPED)\n#                    TEST2 zscale npl=80: 1.0 -> ~81 nits, 2.5 -> ~204 nits, 125 -> PQ max",
+   "notes": "If a future ffmpeg prints TEST1 2.5 -> 2.5 and 125 -> 125, the pure-ffmpeg zscale path becomes viable."
+  }
+ ],
+ "open_questions": [
+  "Does FFmpeg 8.x/9.x's new swscale 'ops' backend ever take over the rgbaf16 -> gbrpf32 conversion without the 16-bit clip? The legacy clipping code is still present in release/8.0; behaviour selection was not tested (run verify.py against a gyan 9.0.1 build).",
+  "Can libplacebo/ffmpeg be patched so AVCOL_TRC_LINEAR float input is treated as PL_COLOR_TRC_SCRGB (80-nit, HDR-classified)? Today the mapping is marked 'missing'; without it the libplacebo filter scales by 203/80 and clips above 203 nits.",
+  "What exactly does DDA return on an HDR desktop when only R10G10B10A2 or B8G8R8A8 is offered — a hard numeric clip of scRGB to [0,1] or a tone-mapped SDR rendition? MS docs only say integer formats are sRGB; ddagrab's author treats them as SDR.",
+  "On Windows 11 Advanced-Color SDR displays (ACM enabled) FP16 1.0 = display reference white, not 80 nits — the sender should detect the mode (DXGI_OUTPUT_DESC1.ColorSpace / DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO) and only use the scRGB->PQ path when the desktop is genuinely HDR.",
+  "Colour accuracy of NVENC's internal RGB->YUV conversion for the zero-copy SDR path (ffmpeg tags VUI bt470bg/limited) — needs a visual/colour-bar check versus the CPU scale=out_color_matrix=bt709 path.",
+  "Real ddagrab FP16 hwdownload throughput and Map() stall on the user's GPU/PCIe at 2160p60 (4 GB/s readback) — untested here (Linux box only).",
+  "Whether a CLI mechanism exists in FFmpeg 8.x to inject MDCV/CLL side data into lavfi-sourced frames so nvenc's new SEI support could be used; none found in 7.1/8.0 (AMF is the only 7.1 HW encoder that reads frame side data, and ddagrab produces none)."
+ ],
+ "recommendation": "Do not build the HDR sender on 'ddagrab -> hwdownload -> zscale' (or '-> libplacebo') with ffmpeg 7.1: the capture side is fine (ddagrab output_fmt=16bit delivers correctly tagged scRGB FP16 D3D11 frames, hwdownload works), and zscale's maths is right (npl=80, verified), but ffmpeg has no lossless bridge from packed RGBAF16 to a float planar format — swscale clips scRGB to [0,1] (verified by execution; acknowledged by the filter's author), zscale rejects RGBAF16, Vulkan/CUDA cannot import D3D11 frames, and libplacebo interprets AVCOL_TRC_LINEAR as 203-nit SDR and clips highlights. Also fix the proposal's syntax (matrixin=gbr, explicit output_fmt, npl=80, format=yuv420p10le,format=p010le) if you keep it for plumbing tests.\n\nRecommended architecture: keep ffmpeg.exe strictly as encoder+muxer+SRT sender and move capture+colour conversion into the C# app (Vortice.Windows/SharpDX: IDXGIOutput5::DuplicateOutput1 with {R16G16B16A16_FLOAT, B8G8R8A8}, a ~40-line compute shader doing BT.709->BT.2020, x80/10000, PQ, BT.2020-NCL limited-range 4:2:0, into a P010 staging texture), then pipe raw P010 into 'ffmpeg -f rawvideo -pix_fmt p010le -s WxH -r 60 -i pipe:0 -c:v hevc_nvenc -profile:v main10 ... -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc -color_range tv -f mpegts srt://...'. This is exactly OBS's proven design (same shader constants), costs ~0.7-1.5 GB/s of pipe bandwidth, uses GPU for the heavy work, and works identically for hevc_nvenc/av1_nvenc/hevc_amf/hevc_qsv (all accept P010 and write PQ/BT.2020 VUI). Detect HDR vs SDR desktop via DXGI_OUTPUT_DESC1/advanced-colour info and fall back to the zero-copy 'ddagrab=output_fmt=8bit -> h264/hevc_nvenc' path for SDR. Skip MDCV/CLL SEI: no 7.1 HW encoder except AMF can emit it from lavfi sources, and mpv's default --hdr-compute-peak=auto plus --vo=gpu-next --target-colorspace-hint=yes handles untagged PQ streams fine. If you would rather not write D3D11 code, driving OBS Studio (HDR P010 NVENC + SRT/mpegts output) from the WinForms GUI via obs-websocket is the pragmatic alternative. For builds, both gyan 'full' (now 9.0.1) and BtbN win64-gpl (7.1 branch) contain ddagrab, libzimg, libplacebo, libsrt, librist, nvenc, amf, vpl; re-run the verify.py harness on whichever build you ship to see whether a newer swscale ever removes the clip, at which point the pure-ffmpeg zscale path (≈1.5 cores at 1440p60, ≈3 cores at 2160p60 measured) becomes usable."
+}

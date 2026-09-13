@@ -1,0 +1,13 @@
+services:
+  mediamtx:
+    image: bluenviron/mediamtx:1.21.0      # or bluenviron/mediamtx:1 for latest 1.x
+    container_name: mediamtx-relay
+    restart: unless-stopped
+    ports:
+      - "8890:8890/udp"                    # SRT (publish + read); forward this UDP port on the router
+      - "8888:8888/tcp"                    # HLS (browser SDR fallback); optional
+      - "127.0.0.1:9997:9997/tcp"          # Control API, localhost only; optional
+    volumes:
+      - ./mediamtx.yml:/mediamtx.yml:ro
+    # sysctls cannot raise net.core.rmem_max inside a container (it is not namespaced);
+    # set it on the host: sysctl -w net.core.rmem_max=16777216
