@@ -25,6 +25,7 @@ namespace HdrCast.Sender.Gui
         readonly SenderSettings _settings;
         readonly string _settingsPath;
         readonly SenderRunner _runner = new SenderRunner();
+        readonly ProcessJob _job = new ProcessJob();
         readonly List<string> _logLines = new List<string>();
         readonly Queue<string> _pendingLog = new Queue<string>();
         readonly System.Windows.Forms.Timer _uiTimer;
@@ -112,6 +113,7 @@ namespace HdrCast.Sender.Gui
             RefreshToolLabels();
             UpdateEnabledState();
 
+            _runner.Job = _job;
             _runner.LogLine += OnRunnerLog;
             _runner.StateChanged += OnRunnerState;
 
@@ -416,7 +418,7 @@ namespace HdrCast.Sender.Gui
             _start = new Button { Text = "Start", AutoSize = true, MinimumSize = new Size(Font.Height * 6, 0) };
             _start.Click += (s, e) => StartStream();
             _stop = new Button { Text = "Stop", AutoSize = true, MinimumSize = new Size(Font.Height * 6, 0), Enabled = false };
-            _stop.Click += (s, e) => { _runner.Stop(); AppendLog("[app] stopped by user"); };
+            _stop.Click += (s, e) => StopStream();
             _copy = new Button { Text = "Copy commands", AutoSize = true };
             _copy.Click += (s, e) => CopyCommands();
             _viewerUrl = new Button { Text = "Copy viewer URL", AutoSize = true };
@@ -734,6 +736,9 @@ namespace HdrCast.Sender.Gui
                 return null;
             }
 
+            var pipeNames = new List<string> { videoPipe };
+            if (_settings.Audio) pipeNames.Add(audioPipe);
+
             return new SendPlan
             {
                 CaptureExe = Application.ExecutablePath,
@@ -742,9 +747,23 @@ namespace HdrCast.Sender.Gui
                 FfmpegArgv = ffmpegArgv.ToArray(),
                 OutputUrl = url,
                 Fps = _settings.Fps,
+                PipeNames = pipeNames.ToArray(),
                 Summary = EncoderProfiles.Info(_settings.Encoder).DisplayName + " " + _settings.BitrateMbps + " Mbps " +
                           w + "x" + h + "@" + _settings.Fps + (hdr ? " HDR10" : " SDR"),
             };
+        }
+
+        /// <summary>Stops off the UI thread: killing two children takes up to ~6 s and would freeze the window.</summary>
+        void StopStream()
+        {
+            AppendLog("[app] stopping");
+            _start.Enabled = false;
+            _stop.Enabled = false;
+            _runner.StopAsync(() => SafeInvoke(() =>
+            {
+                AppendLog("[app] stopped by user");
+                UpdateEnabledState();
+            }));
         }
 
         void StartStream()
@@ -844,7 +863,7 @@ namespace HdrCast.Sender.Gui
                     r => AppendLogThreadSafe("[probe] " + EncoderProfiles.Info(r.Encoder).FfmpegName + ": " +
                                              (r.Works ? "ok" : r.Message)));
                 VideoEncoder? best = EncoderProbe.PickBest(results);
-                BeginInvoke((Action)(() =>
+                SafeInvoke(() =>
                 {
                     _probe.Enabled = true;
                     if (best.HasValue)
@@ -857,7 +876,7 @@ namespace HdrCast.Sender.Gui
                     {
                         AppendLog("[probe] no working encoder found — check the ffmpeg build and GPU drivers");
                     }
-                }));
+                });
             })
             { IsBackground = true, Name = "encoder-probe" };
             _probeThread.Start();
@@ -867,6 +886,7 @@ namespace HdrCast.Sender.Gui
 
         void OnRunnerLog(string line)
         {
+            line = SecretRedactor.Redact(line);
             lock (_pendingLog)
             {
                 _pendingLog.Enqueue(line);
@@ -952,6 +972,24 @@ namespace HdrCast.Sender.Gui
             _ffmpegPath.Enabled = !running;
         }
 
+        /// <summary>
+        /// Marshals to the UI thread and does nothing once the form is going away. The encoder probe can run
+        /// for a minute (7 trial encodes), so it routinely outlives the window it was started from; a plain
+        /// BeginInvoke would throw ObjectDisposedException on a background thread and take the process down.
+        /// </summary>
+        void SafeInvoke(Action action)
+        {
+            if (_closing || IsDisposed || !IsHandleCreated) return;
+            try
+            {
+                BeginInvoke(action);
+            }
+            catch (Exception)
+            {
+                // form is going away
+            }
+        }
+
         void AppendLogThreadSafe(string line)
         {
             lock (_pendingLog) _pendingLog.Enqueue(line);
@@ -967,12 +1005,27 @@ namespace HdrCast.Sender.Gui
             _log.ScrollToCaret();
         }
 
+        bool _stopRequestedOnClose;
+
         void OnFormClosing(object? sender, FormClosingEventArgs e)
         {
-            _closing = true;
             _uiTimer.Stop();
             SaveSettings();
+
+            if (_runner.IsRunning && !_stopRequestedOnClose)
+            {
+                // Killing the children takes seconds; close once they are gone instead of freezing the window.
+                _stopRequestedOnClose = true;
+                e.Cancel = true;
+                Enabled = false;
+                Text = "HdrCast Sender — stopping…";
+                _runner.StopAsync(() => SafeInvoke(Close));
+                return;
+            }
+
+            _closing = true;
             _runner.Stop();
+            _job.Dispose();
         }
     }
 }

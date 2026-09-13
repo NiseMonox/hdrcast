@@ -139,7 +139,10 @@ namespace HdrCast.Receiver
             if (double.IsNaN(BufferSeconds) || BufferSeconds < 0.1) BufferSeconds = 1.5;
             if (BufferSeconds > 30) BufferSeconds = 30;
             if (FullscreenScreen < 0) FullscreenScreen = 0;
-            if (TargetPeakNits < 0) TargetPeakNits = 0;
+            // mpv accepts "auto" or 10..10000; anything in between makes it exit with
+            // "Invalid value for option target-peak", so treat a too-small number as auto.
+            if (TargetPeakNits < 10) TargetPeakNits = 0;
+            if (TargetPeakNits > 10000) TargetPeakNits = 10000;
             if (!Enum.IsDefined(typeof(ConnectionMode), Mode)) Mode = ConnectionMode.Relay;
             if (!Enum.IsDefined(typeof(DisplayMode), DisplayMode)) DisplayMode = DisplayMode.Auto;
             if (!Enum.IsDefined(typeof(HwDecMode), HwDec)) HwDec = HwDecMode.D3d11va;

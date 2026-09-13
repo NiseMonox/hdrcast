@@ -47,8 +47,29 @@ namespace HdrCast.Sender
         {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+            Application.ThreadException += (s, e) => ReportCrash(e.Exception);
+            AppDomain.CurrentDomain.UnhandledException +=
+                (s, e) => SenderLog.Write("crash", (e.ExceptionObject ?? "?").ToString() ?? "?");
+
+            SenderLog.Write("app", "HdrCast Sender " + typeof(Program).Assembly.GetName().Version + " starting");
             Application.Run(new Gui.MainForm());
+            SenderLog.Write("app", "exit");
             return ExitCodes.Ok;
+        }
+
+        static void ReportCrash(Exception ex)
+        {
+            SenderLog.Write("crash", ex.ToString());
+            try
+            {
+                MessageBox.Show("Unexpected error:\n\n" + ex.Message + "\n\nDetails were written to the log folder.",
+                    "HdrCast Sender", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            catch (Exception)
+            {
+                // nothing else we can do
+            }
         }
 
         static void PrintUsage()

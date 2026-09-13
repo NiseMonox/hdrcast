@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
+using System.IO;
 using System.Threading;
 using HdrCast.Capture;
 using HdrCast.Common;
@@ -28,6 +29,8 @@ namespace HdrCast.Sender
         public string OutputUrl { get; set; } = "";
         public int Fps { get; set; } = 60;
         public string Summary { get; set; } = "";
+        /// <summary>Named pipes the capture engine creates and ffmpeg opens; ffmpeg waits until they exist.</summary>
+        public string[] PipeNames { get; set; } = new string[0];
     }
 
     /// <summary>
@@ -38,6 +41,13 @@ namespace HdrCast.Sender
     public sealed class SenderRunner
     {
         const int RestartDelayMs = 3000;
+        /// <summary>
+        /// How long to wait for the capture engine's named pipes before starting ffmpeg. The engine creates
+        /// them only after opening the D3D11 device and compiling the conversion shader, which on a cold start
+        /// takes noticeably longer than the fixed delay this used to use — and ffmpeg exits immediately when
+        /// the pipe is not there yet, so the first start of a session would fail and the second would work.
+        /// </summary>
+        const int PipeWaitMs = 15000;
 
         readonly object _gate = new object();
         LineProcess? _capture;
@@ -52,6 +62,9 @@ namespace HdrCast.Sender
 
         public event Action<string>? LogLine;
         public event Action<RunnerState, string>? StateChanged;
+
+        /// <summary>Job object the children are assigned to, so they die with the GUI (set by the form).</summary>
+        public ProcessJob? Job { get; set; }
 
         public RunnerState State { get; private set; } = RunnerState.Idle;
         public string StateDetail { get; private set; } = "";
@@ -74,6 +87,17 @@ namespace HdrCast.Sender
             Launch();
         }
 
+        /// <summary>Stops on a background thread so the UI thread is not blocked by the process waits.</summary>
+        public void StopAsync(Action? whenDone = null)
+        {
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                try { Stop(); }
+                catch (Exception ex) { SenderLog.Write("run", "stop failed: " + ex); }
+                finally { whenDone?.Invoke(); }
+            });
+        }
+
         public void Stop()
         {
             LineProcess? capture, ffmpeg;
@@ -94,7 +118,9 @@ namespace HdrCast.Sender
                 return;
             }
             SetState(RunnerState.Stopping, "Stopping…");
-            // ffmpeg first: it flushes the muxer and closes the SRT connection, then the engine sees the pipe close.
+            // ffmpeg first, so the engine's next pipe write fails and it shuts down on its own. Note this is a
+            // hard kill (taskkill /F), so the muxer is not flushed and MediaMTX sees the publisher drop; that is
+            // fine for a live stream and keeps Stop bounded in time.
             try { ffmpeg?.Stop(); } catch (Exception) { }
             try { capture?.Stop(); } catch (Exception) { }
             try { ffmpeg?.Dispose(); } catch (Exception) { }
@@ -119,20 +145,20 @@ namespace HdrCast.Sender
             LineProcess? ffmpeg = null;
             try
             {
-                capture = new LineProcess(plan.CaptureExe, ArgQuote.Join(plan.CaptureArgv));
+                capture = new LineProcess(plan.CaptureExe, ArgQuote.Join(plan.CaptureArgv)) { Job = Job };
                 capture.StdoutLine += line => OnCaptureStats(gen, line);
                 capture.StderrLine += line => Emit("[capture] " + line);
                 capture.Exited += code => OnCaptureExited(gen, code);
 
-                ffmpeg = new LineProcess(plan.FfmpegExe, ArgQuote.Join(plan.FfmpegArgv));
+                ffmpeg = new LineProcess(plan.FfmpegExe, ArgQuote.Join(plan.FfmpegArgv)) { Job = Job };
                 ffmpeg.StdoutLine += line => OnFfmpegProgress(gen, line);
                 ffmpeg.StderrLine += line => Emit("[ffmpeg] " + line);
                 ffmpeg.Exited += code => OnFfmpegExited(gen, code);
 
-                Emit("[run] " + capture.CommandLine);
-                Emit("[run] " + ffmpeg.CommandLine);
-                SenderLog.Write("run", capture.CommandLine);
-                SenderLog.Write("run", ffmpeg.CommandLine);
+                // SafeCommandLine masks passphrase= and the stream-id credentials: the log folder is meant
+                // to be shareable when something breaks.
+                Emit("[run] " + capture.SafeCommandLine);
+                Emit("[run] " + ffmpeg.SafeCommandLine);
 
                 lock (_gate)
                 {
@@ -148,8 +174,20 @@ namespace HdrCast.Sender
                 }
 
                 capture.Start();
-                // Give the engine a moment to create the named pipes before ffmpeg tries to open them.
-                Thread.Sleep(400);
+                SetState(RunnerState.Starting, "Waiting for the capture engine…");
+                if (!WaitForPipes(plan, capture, gen))
+                {
+                    string why = capture.HasExited
+                        ? "the capture engine exited (" + DescribeCaptureExit(capture.ExitCode) + ")"
+                        : "the capture engine did not open its pipes within " + (PipeWaitMs / 1000) + " s";
+                    Emit("[run] " + why);
+                    lock (_gate) { _capture = null; _ffmpeg = null; }
+                    try { capture.Stop(); } catch (Exception) { }
+                    try { capture.Dispose(); } catch (Exception) { }
+                    try { ffmpeg.Dispose(); } catch (Exception) { }
+                    Fail(why);
+                    return;
+                }
                 lock (_gate) { if (gen != _generation || _userStopped) return; }
                 ffmpeg.Start();
                 SetState(RunnerState.Streaming, "Streaming");
@@ -163,6 +201,28 @@ namespace HdrCast.Sender
                 try { capture?.Dispose(); } catch (Exception) { }
                 Fail("could not start: " + ex.Message);
             }
+        }
+
+        /// <summary>Polls for the engine's named pipes; returns false if it exits or takes too long.</summary>
+        bool WaitForPipes(SendPlan plan, LineProcess capture, int gen)
+        {
+            if (plan.PipeNames.Length == 0) return true;
+            var watch = Stopwatch.StartNew();
+            while (watch.ElapsedMilliseconds < PipeWaitMs)
+            {
+                lock (_gate) { if (gen != _generation || _userStopped) return false; }
+                if (capture.HasExited) return false;
+                bool all = true;
+                foreach (string name in plan.PipeNames)
+                {
+                    // Named pipes show up as entries of the \\.\pipe\ pseudo-directory; File.Exists is the
+                    // cheapest way to ask, and it is false on any platform without them.
+                    if (!File.Exists(@"\\.\pipe\" + name)) { all = false; break; }
+                }
+                if (all) return true;
+                Thread.Sleep(50);
+            }
+            return false;
         }
 
         void OnCaptureStats(int gen, string line)
@@ -239,6 +299,7 @@ namespace HdrCast.Sender
                 case 3: return "GPU / display error";
                 case 4: return "the pipe consumer went away (ffmpeg stopped)";
                 case 5: return "desktop duplication lost";
+                case 6: return "ffmpeg never connected to the capture pipe";
                 default: return "exit code " + code.ToString(CultureInfo.InvariantCulture);
             }
         }
@@ -258,6 +319,9 @@ namespace HdrCast.Sender
 
         void Emit(string line)
         {
+            // Single choke point for the log: ffmpeg echoes the srt:// URL on failure, passphrase included.
+            line = SecretRedactor.Redact(line);
+            SenderLog.Write(line);
             LogLine?.Invoke(line);
         }
     }

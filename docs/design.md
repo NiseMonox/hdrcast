@@ -80,7 +80,7 @@ capture --output <idx>           DXGI 输出索引（list-outputs 给出的 inde
 
 - 采集引擎是 **管道服务端**（`NamedPipeServerStream`，Out，缓冲 64 MB），创建后等待 ffmpeg 连接。
 - 帧格式：`p010le`（Y 平面 W×H×2 字节 + UV 交错平面 W×(H/2)×2 字节，10 bit 高位对齐即 `value << 6`）或 `nv12`（W×H + W×H/2）。W、H 强制偶数。
-- **恒定帧率**：用 `QueryPerformanceCounter` 做定时器；每个 tick 写一帧。`AcquireNextFrame(timeout=0 或很短)` 拿到新帧就转换，没有就重复上一帧（复制已转换好的缓冲，不重跑 shader）。这样 ffmpeg 侧用理想时间戳即可，不用 wallclock。
+- **恒定帧率**：用 `QueryPerformanceCounter` 做定时器；每个 tick 写一帧。节拍器与等待函数必须用**同一个时基**（`Stopwatch.GetTimestamp()` 的绝对值），混用「从 0 开始的 ElapsedTicks」会让等待永远立即返回，退化成按桌面刷新率忙转。`AcquireNextFrame(timeout=0 或很短)` 拿到新帧就转换，没有就重复上一帧（复制已转换好的缓冲，不重跑 shader）。这样 ffmpeg 侧用理想时间戳即可，不用 wallclock。
 - 统计：每秒向 stdout 写一行 JSON：`{"t":秒,"captured":n,"duplicated":n,"dropped":n,"fps":x,"gpu_ms":x,"audio_underrun":n}`。GUI 逐行解析显示。
 
 ### 2.3 色彩转换（compute shader，HLSL，运行时用 d3dcompiler_47 编译）
@@ -169,7 +169,10 @@ ffmpeg -hide_banner -loglevel warning -stats_period 1 -progress pipe:1 -nostdin
 6. ffmpeg 路径：自动查找（exe 同目录 `ffmpeg.exe`、`tools\ffmpeg.exe`、PATH），可浏览；缺失时提示下载 gyan.dev **full** 版。
 - 配置文件：`%APPDATA%\HdrCast\sender.json`（`DataContractJsonSerializer`）。
 - 崩溃保护：ffmpeg 或采集进程意外退出 → 停止另一方，显示原因，可选「自动重连」（间隔 3 s 重启）。
-- 进程树：GUI 退出时必须杀掉两个子进程（Job Object 或 Exited 事件）。
+- 进程树：两个 GUI 都创建 **Job Object（KILL_ON_JOB_CLOSE）** 并把每个子进程加入，任务管理器强杀 GUI 或 GUI 崩溃时子进程一起死。采集引擎另有 `--parent-pid`（用一个 `OpenProcess(SYNCHRONIZE)` 句柄轮询，不是每帧扫全系统进程表）。
+- **启动顺序**：采集引擎必须先把**两个**管道都建好，GUI 轮询到管道出现后才启动 ffmpeg（固定 sleep 不够：引擎要先建 D3D11 设备并编译 shader）。音频管道必须在等待视频管道客户端**之前**创建，否则两边互等。
+- 音频端点打不开时**不终止会话**：管道照建，写静音，日志说明原因（ffmpeg 已经被告知有音频输入，缺管道会直接退出）。
+- 日志与界面里的命令行一律经 `SecretRedactor` 脱敏（passphrase 与 streamid 里的密码），因为 README 会让用户把日志发出来排障。
 
 ## 3. 接收端
 

@@ -69,6 +69,11 @@ namespace HdrCast.Sender.Capture
                 catch (Exception ex) { _error = ex; _broken = true; return false; }
                 return true;
             }
+            // Timed out or cancelled: dispose the pipe so the pending overlapped wait is completed and its
+            // handle released, then drain EndWaitForConnection to observe the cancellation.
+            try { _pipe.Dispose(); } catch (Exception) { }
+            try { _pipe.EndWaitForConnection(ar); } catch (Exception) { }
+            _broken = true;
             return false;
         }
 

@@ -303,6 +303,16 @@ namespace HdrCast.Sender.Capture
                         int dst = y * width * 4;
                         if (src + width * 4 > data.Length) break;
                         Array.Copy(data, src, bgra, dst, width * 4);
+                        // The shader reads "alpha 0 with red set" as "invert the desktop pixel" (that is how
+                        // XOR cursors are carried). Cursors converted from .ico often store 0x00FFFFFF in the
+                        // transparent area, which would paint an inverted block around the pointer, so the
+                        // colour of every fully transparent pixel is cleared here.
+                        for (int x = 0; x < width; x++)
+                        {
+                            int i = dst + x * 4;
+                            if (bgra[i + 3] != 0) continue;
+                            bgra[i] = 0; bgra[i + 1] = 0; bgra[i + 2] = 0;
+                        }
                     }
                     break;
                 }

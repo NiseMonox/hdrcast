@@ -240,7 +240,9 @@ namespace HdrCast.Sender.Capture
             else
             {
                 // main_nv12 is a 1-D kernel folded into a 2-D dispatch of Nv12GroupsX groups per row.
-                long slots = ((long)_dstWidth * _dstHeight) / 4 + ((long)_dstWidth * _dstHeight) / 8;
+                // Same rounding as the shader: the UV plane can end on a half uint.
+                long pixels = (long)_dstWidth * _dstHeight;
+                long slots = pixels / 4 + (pixels + 7) / 8;
                 long groups = (slots + ConvertShaderSource.Nv12GroupSize - 1) / ConvertShaderSource.Nv12GroupSize;
                 int gx = ConvertShaderSource.Nv12GroupsX;
                 int gy = (int)((groups + gx - 1) / gx);

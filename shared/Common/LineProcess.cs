@@ -57,6 +57,15 @@ namespace HdrCast.Common
 
         public string CommandLine => ArgQuote.Quote(FileName) + (Arguments.Length > 0 ? " " + Arguments : "");
 
+        /// <summary>Command line with the SRT passphrase and stream-id credentials masked, for log files.</summary>
+        public string SafeCommandLine => SecretRedactor.Redact(CommandLine);
+
+        /// <summary>
+        /// Job object the child is put into right after it starts, so it cannot outlive this process
+        /// (see <see cref="ProcessJob"/>). Optional: leaving it null only loses that safety net.
+        /// </summary>
+        public ProcessJob? Job { get; set; }
+
         public void Start()
         {
             if (_process != null) throw new InvalidOperationException("already started");
@@ -82,6 +91,7 @@ namespace HdrCast.Common
             _process = p;
             p.Start();
             Id = p.Id;
+            Job?.Assign(p);
             p.BeginErrorReadLine();
             if (ReadStdoutLines) p.BeginOutputReadLine();
             else StdoutStream = p.StandardOutput.BaseStream;

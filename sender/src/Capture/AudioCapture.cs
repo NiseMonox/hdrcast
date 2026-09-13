@@ -58,36 +58,59 @@ namespace HdrCast.Sender.Capture
         public string FormatDescription { get; private set; } = "";
         /// <summary>True once ffmpeg opened the audio pipe.</summary>
         public bool ClientConnected => _clientConnected;
+        /// <summary>True when the audio endpoint could not be opened and the stream is silence only.</summary>
+        public bool Degraded { get; private set; }
 
+        /// <summary>
+        /// Creates the pipe first and opens the audio endpoint second, on purpose: ffmpeg was started with an
+        /// audio input, so the pipe MUST exist even when the endpoint cannot be opened (unplugged headphones,
+        /// a stale device id in sender.json, no render endpoint at all). If WASAPI fails the stream degrades to
+        /// silence and the session keeps running, instead of ffmpeg dying on a missing pipe and the GUI blaming
+        /// the encoder.
+        /// </summary>
         public void Start()
         {
-            _device = ResolveDevice(_deviceId);
-            _capture = new WasapiLoopbackCapture(_device);
-            WaveFormat f = _capture.WaveFormat;
-            FormatDescription = f.Encoding + " " + f.SampleRate + " Hz " + f.Channels + " ch " + f.BitsPerSample + " bit";
-            _capture.DataAvailable += OnData;
-            _capture.RecordingStopped += OnStopped;
-
-            // A completely idle render endpoint delivers no loopback data at all, so play silence into it.
-            try
-            {
-                var silenceOut = new WasapiOut(_device, AudioClientShareMode.Shared, false, 100);
-                silenceOut.Init(new SilenceProvider(new WaveFormat(f.SampleRate, 16, Math.Max(1, f.Channels))));
-                silenceOut.Play();
-                _silence = silenceOut;
-            }
-            catch (Exception ex)
-            {
-                Log.Warn("audio: could not start the silence keep-alive: " + ex.Message);
-            }
-
             _pipe = new NamedPipeServerStream(_pipeName, PipeDirection.Out, 1, PipeTransmissionMode.Byte,
                                               PipeOptions.Asynchronous, 0, 8 << 20);
             _running = true;
             _writerThread = new Thread(WriterLoop) { IsBackground = true, Name = "audio-pipe-writer" };
             _writerThread.Start();
-            _capture.StartRecording();
-            Log.Info("audio: capturing " + FormatDescription + " from " + (_device?.FriendlyName ?? "default"));
+
+            try
+            {
+                _device = ResolveDevice(_deviceId);
+                _capture = new WasapiLoopbackCapture(_device);
+                WaveFormat f = _capture.WaveFormat;
+                FormatDescription = f.Encoding + " " + f.SampleRate + " Hz " + f.Channels + " ch " + f.BitsPerSample + " bit";
+                _capture.DataAvailable += OnData;
+                _capture.RecordingStopped += OnStopped;
+
+                // A completely idle render endpoint delivers no loopback data at all, so play silence into it.
+                try
+                {
+                    var silenceOut = new WasapiOut(_device, AudioClientShareMode.Shared, false, 100);
+                    silenceOut.Init(new SilenceProvider(new WaveFormat(f.SampleRate, 16, Math.Max(1, f.Channels))));
+                    silenceOut.Play();
+                    _silence = silenceOut;
+                }
+                catch (Exception ex)
+                {
+                    Log.Warn("audio: could not start the silence keep-alive: " + ex.Message);
+                }
+
+                _capture.StartRecording();
+                Log.Info("audio: capturing " + FormatDescription + " from " + (_device?.FriendlyName ?? "default"));
+            }
+            catch (Exception ex)
+            {
+                Degraded = true;
+                FormatDescription = "silence (" + ex.Message + ")";
+                Log.Warn("audio: no desktop audio (" + ex.Message + "); sending silence so the stream keeps its audio track");
+                try { _capture?.Dispose(); } catch (Exception) { }
+                try { _device?.Dispose(); } catch (Exception) { }
+                _capture = null;
+                _device = null;
+            }
         }
 
         static MMDevice ResolveDevice(string id)
@@ -128,10 +151,10 @@ namespace HdrCast.Sender.Capture
                 int frames = ConvertToTarget(e.Buffer, e.BytesRecorded, _capture.WaveFormat, out float[] converted);
                 if (frames <= 0) return;
 
-                long expected = _aligner.ExpectedFrames(_clock.ElapsedTicks, Stopwatch.Frequency);
-                AudioAlignment align = _aligner.Align(expected, frames);
                 lock (_gate)
                 {
+                    long expected = _aligner.ExpectedFrames(_clock.ElapsedTicks, Stopwatch.Frequency);
+                    AudioAlignment align = _aligner.Align(expected, frames);
                     int offset = Math.Min(align.DropFrames, frames) * TargetChannels;
                     int count = (frames - Math.Min(align.DropFrames, frames)) * TargetChannels;
                     if (count > 0) RingWrite(converted, offset, count);
@@ -297,6 +320,15 @@ namespace HdrCast.Sender.Capture
                     lock (_gate)
                     {
                         if (_ringCount == 0) Monitor.Wait(_gate, 20);
+                        if (_ringCount == 0)
+                        {
+                            // Nothing captured: either the endpoint is silent/idle or it never opened. Top the
+                            // stream up from the same clock the video uses so ffmpeg's audio track keeps moving
+                            // and the muxer does not stall waiting for samples.
+                            long expected = _aligner.ExpectedFrames(_clock.ElapsedTicks, Stopwatch.Frequency);
+                            int pad = _aligner.PadIfBehind(expected);
+                            if (pad > 0) RingWriteSilence(Math.Min(pad, _ring.Length / 2) * TargetChannels);
+                        }
                         take = Math.Min(_ringCount, samples.Length);
                         for (int i = 0; i < take; i++)
                         {

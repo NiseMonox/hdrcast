@@ -26,10 +26,16 @@ namespace HdrCast.Receiver
         public static MpvExitReason ClassifyLine(string? line)
         {
             if (string.IsNullOrEmpty(line)) return MpvExitReason.Unknown;
-            string l = line!;
+            // mpv echoes the whole URL when a connection fails, and our URL always contains the word
+            // "passphrase". Classifying on the raw line would report every failure as an auth failure, so the
+            // query string is stripped before anything is matched.
+            string l = StripUrls(line!);
             if (Has(l, "no stream is available") || Has(l, "no one is publishing")) return MpvExitReason.NoPublisher;
             if (Has(l, "Protocol not found") || Has(l, "not on whitelist") || Has(l, "Unsupported protocol") || Has(l, "Unrecognized URL")) return MpvExitReason.ProtocolUnsupported;
-            if (Has(l, "bad password") || Has(l, "badsecret") || Has(l, "wrong password") || Has(l, "passphrase") || Has(l, "authentication failed") || Has(l, "unauthorized")) return MpvExitReason.AuthFailed;
+            if (Has(l, "bad password") || Has(l, "badsecret") || Has(l, "wrong password") ||
+                Has(l, "invalid passphrase") || Has(l, "passphrase not provided") || Has(l, "wrong passphrase") ||
+                Has(l, "authentication failed") || Has(l, "unauthorized") || Has(l, "KM_BADSECRET"))
+                return MpvExitReason.AuthFailed;
             if (Has(l, "Exiting... (Quit)")) return MpvExitReason.Quit;
             if (Has(l, "Exiting... (End of file)") || Has(l, "Exiting... (Errors when loading file)")) return MpvExitReason.EndOfStream;
             if (Has(l, "Connection refused") || Has(l, "Connection timed out") || Has(l, "timed out") ||
@@ -39,6 +45,35 @@ namespace HdrCast.Receiver
                 return MpvExitReason.ConnectionFailed;
             return MpvExitReason.Unknown;
         }
+
+        /// <summary>
+        /// Removes srt:// / rist:// / http:// URLs from a line. mpv prints the URL it failed to open, and that
+        /// URL carries our own option names ("passphrase", "streamid", "latency"), which would otherwise be
+        /// matched as if they were error text.
+        /// </summary>
+        internal static string StripUrls(string line)
+        {
+            int at = line.IndexOf("://", StringComparison.Ordinal);
+            if (at < 0) return line;
+            var sb = new System.Text.StringBuilder(line.Length);
+            int i = 0;
+            while (i < line.Length)
+            {
+                at = line.IndexOf("://", i, StringComparison.Ordinal);
+                if (at < 0) { sb.Append(line, i, line.Length - i); break; }
+                // back up over the scheme
+                int start = at;
+                while (start > i && IsSchemeChar(line[start - 1])) start--;
+                sb.Append(line, i, start - i);
+                sb.Append("<url>");
+                int end = at + 3;
+                while (end < line.Length && !char.IsWhiteSpace(line[end])) end++;
+                i = end;
+            }
+            return sb.ToString();
+        }
+
+        static bool IsSchemeChar(char c) => char.IsLetterOrDigit(c) || c == '+' || c == '-' || c == '.';
 
         /// <summary>Most specific reason found in the lines (later lines do not override a more specific earlier one).</summary>
         public static MpvExitReason Classify(IEnumerable<string> recentLines)

@@ -14,6 +14,8 @@ namespace HdrCast.Sender.Capture
         public const int DeviceError = 3;
         public const int PipeBroken = 4;
         public const int AccessLost = 5;
+        /// <summary>The pipe was created but ffmpeg never connected to it.</summary>
+        public const int NoPipeClient = 6;
     }
 
     /// <summary>
@@ -91,22 +93,14 @@ namespace HdrCast.Sender.Capture
                 ? FrameSink.CreateFile(_args.DumpPath, 4)
                 : FrameSink.CreatePipe(_args.VideoPipe, 32 << 20, 4);
 
-            if (_sink.IsPipe)
-            {
-                Log.Info("capture: waiting for the video pipe client on " + @"\\.\pipe\" + _args.VideoPipe +
-                         " (" + _args.PipeTimeoutSeconds + "s)");
-                if (!_sink.WaitForClient(TimeSpan.FromSeconds(_args.PipeTimeoutSeconds), _cancel.Token))
-                {
-                    Log.Error("capture: no pipe client connected" +
-                              (_sink.Error != null ? ": " + _sink.Error.Message : " (timeout)"));
-                    return ExitCodes.PipeBroken;
-                }
-                Log.Info("capture: video pipe connected");
-            }
-            _sink.Start();
-
+            // Audio first: the caller (and ffmpeg) can only see that we are ready once BOTH pipes exist, and
+            // the video pipe below blocks until ffmpeg connects — creating the audio pipe after that would
+            // deadlock the two sides against each other.
             if (_args.Audio && _args.DumpPath == null)
             {
+                // Start the clock before the audio so the alignment starts from zero (the frame pacer starts
+                // from whatever the clock reads a moment later, which it handles).
+                _clock.Start();
                 try
                 {
                     _audio = new AudioCapture(_args.AudioPipe, _args.AudioDevice, _clock);
@@ -114,11 +108,31 @@ namespace HdrCast.Sender.Capture
                 }
                 catch (Exception ex)
                 {
-                    Log.Warn("capture: audio disabled (" + ex.Message + ")");
+                    // AudioCapture.Start already degrades to silence internally; reaching here means even the
+                    // pipe could not be created, and ffmpeg is waiting for that pipe — so this is fatal.
+                    Log.Error("capture: cannot create the audio pipe: " + ex.Message);
                     _audio?.Dispose();
                     _audio = null;
+                    return ExitCodes.PipeBroken;
                 }
+                if (_audio.Degraded)
+                    Log.Warn("capture: desktop audio is unavailable; the stream carries silence");
             }
+
+            if (_sink.IsPipe)
+            {
+                Log.Info("capture: waiting for the video pipe client on " + @"\\.\pipe\" + _args.VideoPipe +
+                         " (" + _args.PipeTimeoutSeconds + "s)");
+                if (!_sink.WaitForClient(TimeSpan.FromSeconds(_args.PipeTimeoutSeconds), _cancel.Token))
+                {
+                    Log.Error("capture: ffmpeg did not connect to " + @"\\.\pipe\" + _args.VideoPipe +
+                              " within " + _args.PipeTimeoutSeconds + "s" +
+                              (_sink.Error != null ? ": " + _sink.Error.Message : ""));
+                    return ExitCodes.NoPipeClient;
+                }
+                Log.Info("capture: video pipe connected");
+            }
+            _sink.Start();
 
             return Loop(format, dstW, dstH);
         }
@@ -128,10 +142,15 @@ namespace HdrCast.Sender.Capture
             if (_duplicator == null || _converter == null || _sink == null || _pool == null) return ExitCodes.DeviceError;
 
             var pacer = new FramePacer(_args.Fps, Stopwatch.Frequency);
+            using (var parent = new ParentWatch(_args.ParentPid))
             using (var timer = new HighResTimer())
             {
                 _clock.Start();
-                pacer.Start(_clock.ElapsedTicks);
+                // The pacer works in absolute Stopwatch timestamps because that is what HighResTimer.WaitUntil
+                // compares against. Mixing in _clock.ElapsedTicks (which counts from zero) made every deadline
+                // look long past, so the loop never waited and spun at the desktop's refresh rate instead of
+                // the requested frame rate.
+                pacer.Start(Stopwatch.GetTimestamp());
 
                 // Start from a black frame so the encoder has valid input even before the first desktop update.
                 FrameBuffer? first = _pool.TryRent();
@@ -139,7 +158,7 @@ namespace HdrCast.Sender.Capture
                 ColorMath.FillBlack(first.Data, format, dstW, dstH);
                 _latest = first;
 
-                long lastStatsTick = _clock.ElapsedTicks;
+                long lastStatsTick = Stopwatch.GetTimestamp();
                 long accessLostSince = 0;
                 var gpuWatch = new Stopwatch();
                 int exitCode = ExitCodes.Ok;
@@ -147,7 +166,7 @@ namespace HdrCast.Sender.Capture
 
                 while (!_cancel.IsCancellationRequested)
                 {
-                    if (_args.ParentPid > 0 && !IsProcessAlive(_args.ParentPid))
+                    if (parent.ParentIsGone())
                     {
                         Log.Info("capture: parent process " + _args.ParentPid + " is gone, stopping");
                         break;
@@ -162,7 +181,7 @@ namespace HdrCast.Sender.Capture
                     if (_args.DumpSeconds > 0 && _clock.Elapsed.TotalSeconds >= _args.DumpSeconds) break;
 
                     // Pull whatever the desktop has, without blocking past the next frame deadline.
-                    long ticksLeft = pacer.TicksUntilNext(_clock.ElapsedTicks);
+                    long ticksLeft = pacer.TicksUntilNext(Stopwatch.GetTimestamp());
                     int waitMs = (int)Math.Max(0, Math.Min(8, ticksLeft * 1000 / Stopwatch.Frequency));
                     AcquireResult acquired;
                     try
@@ -179,10 +198,10 @@ namespace HdrCast.Sender.Capture
                     {
                         if (accessLostSince == 0)
                         {
-                            accessLostSince = _clock.ElapsedTicks;
+                            accessLostSince = Stopwatch.GetTimestamp();
                             Log.Warn("capture: desktop duplication lost (mode change or full-screen app); retrying");
                         }
-                        else if ((_clock.ElapsedTicks - accessLostSince) * 1000 / Stopwatch.Frequency > AccessLostGiveUpMs)
+                        else if ((Stopwatch.GetTimestamp() - accessLostSince) * 1000 / Stopwatch.Frequency > AccessLostGiveUpMs)
                         {
                             Log.Error("capture: could not recreate the duplication within " +
                                       (AccessLostGiveUpMs / 1000) + "s");
@@ -191,7 +210,8 @@ namespace HdrCast.Sender.Capture
                         }
                         try
                         {
-                            Thread.Sleep(AccessLostRetryMs);
+                            // Try immediately first: a full-screen toggle usually clears within a frame or two,
+                            // and sleeping half a second every time would stall the stream for no reason.
                             _duplicator.Recreate();
                             accessLostSince = 0;
                             Log.Info("capture: duplication restored");
@@ -199,6 +219,7 @@ namespace HdrCast.Sender.Capture
                         catch (Exception ex)
                         {
                             Log.Warn("capture: retry failed: " + ex.Message);
+                            Thread.Sleep(AccessLostRetryMs);
                         }
                     }
                     else
@@ -247,20 +268,23 @@ namespace HdrCast.Sender.Capture
                     }
 
                     // Emit every frame whose deadline has passed (repeating the last image when idle).
-                    long due = pacer.FramesDue(_clock.ElapsedTicks);
+                    long now = Stopwatch.GetTimestamp();
+                    long due = pacer.FramesDue(now);
                     if (due > 0 && _latest != null)
                     {
                         if (due > _args.Fps)
                         {
                             // More than a second behind (suspend/resume, long stall): jump to now instead of catching up.
-                            long skipped = pacer.SkipMissed(_clock.ElapsedTicks);
+                            long skipped = pacer.SkipMissed(now);
                             _dropped += Math.Max(0, skipped);
-                            due = pacer.FramesDue(_clock.ElapsedTicks);
+                            due = pacer.FramesDue(now);
                         }
                         long emitted = 0;
                         for (long i = 0; i < due; i++)
                         {
-                            if (!_sink.TryEnqueue(_latest)) { _dropped++; break; }
+                            // A refused frame is not consumed, so it is re-offered on the next pass; counting it
+                            // as dropped every time would inflate the number. Count the backlog once instead.
+                            if (!_sink.TryEnqueue(_latest)) { if (i == 0) _dropped++; break; }
                             emitted++;
                             // The first frame after a fresh capture carries new pixels; the rest repeat it.
                             if (freshFrame && i == 0) freshFrame = false;
@@ -270,14 +294,14 @@ namespace HdrCast.Sender.Capture
                         freshFrame = false;
                     }
 
-                    if ((_clock.ElapsedTicks - lastStatsTick) >= Stopwatch.Frequency)
+                    long sinceStats = Stopwatch.GetTimestamp() - lastStatsTick;
+                    if (sinceStats >= Stopwatch.Frequency)
                     {
-                        lastStatsTick = _clock.ElapsedTicks;
-                        EmitStats();
+                        lastStatsTick = Stopwatch.GetTimestamp();
+                        EmitStats(sinceStats);
                     }
 
-                    long wait = pacer.TicksUntilNext(_clock.ElapsedTicks);
-                    if (wait > 0) timer.WaitUntil(pacer.NextDeadlineTicks);
+                    if (pacer.TicksUntilNext(Stopwatch.GetTimestamp()) > 0) timer.WaitUntil(pacer.NextDeadlineTicks);
                 }
 
                 EmitStats();
@@ -320,15 +344,23 @@ namespace HdrCast.Sender.Capture
             return d.Info.Hdr && d.SourceIsFloat ? CaptureFormat.P010 : CaptureFormat.Nv12;
         }
 
-        void EmitStats()
+        long _lastWritten;
+
+        void EmitStats(long intervalTicks = 0)
         {
+            long written = _sink?.FramesWritten ?? 0;
+            double seconds = intervalTicks > 0 ? (double)intervalTicks / Stopwatch.Frequency : _clock.Elapsed.TotalSeconds;
+            long frames = intervalTicks > 0 ? written - _lastWritten : written;
+            _lastWritten = written;
             var stats = new CaptureStats
             {
                 T = _clock.Elapsed.TotalSeconds,
                 Captured = _captured,
                 Duplicated = _duplicated,
                 Dropped = _dropped,
-                Fps = _clock.Elapsed.TotalSeconds > 0 ? (_sink?.FramesWritten ?? 0) / _clock.Elapsed.TotalSeconds : 0,
+                // Frames per second over the last interval, not the average since start: a stall has to be
+                // visible in the GUI while it is happening.
+                Fps = seconds > 0 ? frames / seconds : 0,
                 GpuMs = _gpuMsCount > 0 ? _gpuMsAccum / _gpuMsCount : 0,
                 AudioUnderrun = _audio?.Underruns ?? 0,
                 PipeQueueMs = (_sink?.QueuedFrames ?? 0) * (1000.0 / Math.Max(1, _args.Fps)),
@@ -339,13 +371,44 @@ namespace HdrCast.Sender.Capture
             _gpuMsCount = 0;
         }
 
-        static bool IsProcessAlive(int pid)
+        /// <summary>
+        /// Watches the parent through a single handle. Process.GetProcessById would take a snapshot of every
+        /// process on the machine on each call, which at 60-120 fps inside the pacing loop costs real CPU and
+        /// garbage; a handle is also immune to PID reuse (the PID cannot be recycled while we hold it open).
+        /// </summary>
+        sealed class ParentWatch : IDisposable
         {
-            try
+            const uint SYNCHRONIZE = 0x00100000;
+            const uint WAIT_TIMEOUT = 258;
+
+            [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+            static extern IntPtr OpenProcess(uint dwDesiredAccess, [System.Runtime.InteropServices.MarshalAs(
+                System.Runtime.InteropServices.UnmanagedType.Bool)] bool bInheritHandle, int dwProcessId);
+
+            IntPtr _handle;
+            public bool Valid => _handle != IntPtr.Zero;
+
+            public ParentWatch(int pid)
             {
-                using (Process p = Process.GetProcessById(pid)) return !p.HasExited;
+                if (pid <= 0) return;
+                try { _handle = OpenProcess(SYNCHRONIZE, false, pid); }
+                catch (Exception) { _handle = IntPtr.Zero; }
+                if (_handle == IntPtr.Zero) Log.Warn("capture: cannot watch parent process " + pid);
             }
-            catch (Exception) { return false; }
+
+            public bool ParentIsGone()
+            {
+                if (_handle == IntPtr.Zero) return false;
+                try { return NativeMethods.WaitForSingleObject(_handle, 0) != WAIT_TIMEOUT; }
+                catch (Exception) { return false; }
+            }
+
+            public void Dispose()
+            {
+                if (_handle == IntPtr.Zero) return;
+                try { NativeMethods.CloseHandle(_handle); } catch (Exception) { }
+                _handle = IntPtr.Zero;
+            }
         }
 
         static int Even(int v) => v < 2 ? 2 : (v & 1) == 0 ? v : v - 1;

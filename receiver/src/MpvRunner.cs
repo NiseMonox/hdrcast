@@ -49,6 +49,9 @@ namespace HdrCast.Receiver
         /// <summary>Raw child-process / IPC log lines (already prefixed with [mpv] / [ffmpeg] / [ipc]).</summary>
         public event Action<string>? LogLine;
         public event Action<RunnerState, string>? StateChanged;
+
+        /// <summary>Job object the children are assigned to, so mpv cannot outlive the GUI.</summary>
+        public ProcessJob? Job { get; set; }
         /// <summary>Raised after every property-change applied to <see cref="Status"/>.</summary>
         public event Action? StatusChanged;
 
@@ -103,6 +106,10 @@ namespace HdrCast.Receiver
             ipc?.Dispose();
             ffmpeg?.Dispose();
             mpv?.Dispose();
+
+            // Killing mpv takes seconds. If the user pressed Play again in the meantime a newer generation owns
+            // the state now, and resetting it here would blank the status of a session that is actually running.
+            lock (_gate) { if (gen != _generation) return; }
             Status.Reset();
             StatusChanged?.Invoke();
             SetState(RunnerState.Idle, "Idle");
@@ -147,20 +154,29 @@ namespace HdrCast.Receiver
             LineProcess? mpv = null;
             try
             {
-                mpv = new LineProcess(plan.MpvExe, ArgQuote.Join(plan.MpvArgs)) { RedirectStdin = plan.UsesFfmpegPipe };
+                mpv = new LineProcess(plan.MpvExe, ArgQuote.Join(plan.MpvArgs))
+                {
+                    RedirectStdin = plan.UsesFfmpegPipe,
+                    Job = Job,
+                };
                 mpv.StdoutLine += l => OnMpvLine(gen, l);
                 mpv.StderrLine += l => OnMpvLine(gen, l);
                 mpv.Exited += code => OnMpvExited(gen, code);
 
                 if (plan.UsesFfmpegPipe)
                 {
-                    ffmpeg = new LineProcess(plan.FfmpegExe!, ArgQuote.Join(plan.FfmpegArgs!)) { ReadStdoutLines = false };
+                    ffmpeg = new LineProcess(plan.FfmpegExe!, ArgQuote.Join(plan.FfmpegArgs!))
+                    {
+                        ReadStdoutLines = false,
+                        Job = Job,
+                    };
                     ffmpeg.StderrLine += l => Emit("[ffmpeg] " + l);
                     ffmpeg.Exited += code => OnFfmpegExited(gen, code);
                 }
 
-                Emit("[run] " + mpv.CommandLine);
-                if (ffmpeg != null) Emit("[run] " + ffmpeg.CommandLine);
+                // The log folder is meant to be shareable, so the passphrase and the stream-id password are masked.
+                Emit("[run] " + mpv.SafeCommandLine);
+                if (ffmpeg != null) Emit("[run] " + ffmpeg.SafeCommandLine);
 
                 lock (_gate)
                 {
@@ -385,6 +401,9 @@ namespace HdrCast.Receiver
 
         private void Emit(string line)
         {
+            // Every path into the log goes through here, so redact once: mpv prints the srt:// URL (passphrase
+            // and stream-id password included) whenever a connection fails.
+            line = SecretRedactor.Redact(line);
             ReceiverLog.Write(line);
             LogLine?.Invoke(line);
         }

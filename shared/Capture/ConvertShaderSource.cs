@@ -181,7 +181,9 @@ void main_nv12(uint3 id : SV_DispatchThreadID)
 {
     uint t = id.y * (64u * 1024u) + id.x;              // linear thread id (2-D dispatch of 1024 groups per row)
     uint ySlots  = (dstWidth * dstHeight) >> 2;        // uints in the Y plane
-    uint uvSlots = (dstWidth * dstHeight) >> 3;        // uints in the UV plane (2 chroma pairs each)
+    // Round up: with W and H both even but not multiples of 4 (1366x766, say) the UV plane ends on a half
+    // uint, and truncating would leave the last chroma pair of the frame unwritten.
+    uint uvSlots = ((dstWidth * dstHeight) + 7u) >> 3;
     if (t < ySlots)
     {
         uint i0 = t * 4;
@@ -197,10 +199,12 @@ void main_nv12(uint3 id : SV_DispatchThreadID)
     {
         uint m0 = (t - ySlots) * 2;
         uint cw = dstWidth >> 1;
+        uint chromaPairs = (dstWidth * dstHeight) >> 2;    // (W/2) * (H/2)
         uint v = 0;
         [unroll] for (uint k = 0; k < 2; k++)
         {
             uint m = m0 + k;
+            if (m >= chromaPairs) break;                   // last, partially used uint of the plane
             uint cx = (m % cw) * 2, cy = (m / cw) * 2;
             float3 c = (pixel_srgb(cx, cy) + pixel_srgb(cx + 1, cy) + pixel_srgb(cx, cy + 1) + pixel_srgb(cx + 1, cy + 1)) * 0.25;
             float Y = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;

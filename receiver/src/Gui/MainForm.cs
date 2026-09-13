@@ -22,6 +22,7 @@ namespace HdrCast.Receiver.Gui
         private readonly ReceiverSettings _settings;
         private readonly string _settingsPath;
         private readonly MpvRunner _runner = new MpvRunner();
+        private readonly ProcessJob _job = new ProcessJob();
         private readonly List<string> _logLines = new List<string>();
         private readonly Queue<string> _pendingLog = new Queue<string>();
         private readonly System.Windows.Forms.Timer _uiTimer;
@@ -95,6 +96,7 @@ namespace HdrCast.Receiver.Gui
             RefreshToolLabels();
             UpdateEnabledState();
 
+            _runner.Job = _job;
             _runner.LogLine += OnRunnerLog;
             _runner.StateChanged += OnRunnerState;
             _runner.StatusChanged += () => { /* polled by the UI timer */ };
@@ -633,6 +635,9 @@ namespace HdrCast.Receiver.Gui
         private void StopAsync()
         {
             if (!_runner.IsRunning) return;
+            // Play has to go too: MpvRunner.Stop() flips IsRunning to false within microseconds but then spends
+            // seconds killing mpv, and a Play in that window would start a second mpv on the same IPC pipe.
+            _play.Enabled = false;
             _stop.Enabled = false;
             _fsToggle.Enabled = false;
             ThreadPool.QueueUserWorkItem(_ =>
@@ -695,12 +700,16 @@ namespace HdrCast.Receiver.Gui
             {
                 ReceiverLog.Write("app", "stop on close failed: " + ex);
             }
+            // Closing the job kills anything still running, including after a crash on another thread.
+            _job.Dispose();
         }
 
         // ---- runner callbacks (worker threads) --------------------------------------------
 
         private void OnRunnerLog(string line)
         {
+            // mpv echoes the whole URL when a connection fails, passphrase included.
+            line = SecretRedactor.Redact(line);
             lock (_pendingLog)
             {
                 _pendingLog.Enqueue(line);

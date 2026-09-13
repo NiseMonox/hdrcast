@@ -8,6 +8,8 @@ using HdrCast.Sender.Model;
 
 namespace HdrCast.Sender
 {
+    // Lives in shared/ rather than sender/ so the output parsing can be unit-tested on Linux; the ffmpeg
+    // process it drives is platform-neutral too.
     /// <summary>Result of probing one encoder with the real option string.</summary>
     public sealed class EncoderProbeResult
     {
@@ -55,6 +57,10 @@ namespace HdrCast.Sender
                     }
                     else
                     {
+                        // The timed overload returns as soon as the process is gone; only the parameterless one
+                        // also waits for the async readers, and without it the tail of the output can be missing
+                        // (a truncated -encoders listing would look like "this encoder is not in the build").
+                        p.WaitForExit();
                         exitCode = p.ExitCode;
                     }
                     lock (sb) return sb.ToString();
@@ -111,18 +117,39 @@ namespace HdrCast.Sender
             return results;
         }
 
-        static string FirstError(string output)
+        /// <summary>
+        /// The most useful line of a failed run. ffmpeg's last line is usually the generic
+        /// "Nothing was written into output file…"; the real reason ("Could not open encoder", "Invalid value…")
+        /// comes earlier, so those are preferred.
+        /// </summary>
+        internal static string FirstError(string output)
         {
             string[] lines = output.Split('\n');
+            string[] interesting =
+            {
+                "could not open encoder", "error initializing", "invalid", "not supported", "no capable devices",
+                "cannot load", "failed to", "unknown encoder", "no such", "unsupported", "out of memory",
+                "driver does not", "requires", "error setting",
+            };
+            foreach (string raw in lines)
+            {
+                string t = raw.Trim();
+                if (t.Length == 0) continue;
+                string lower = t.ToLowerInvariant();
+                foreach (string needle in interesting)
+                    if (lower.Contains(needle)) return Trim(t);
+            }
             for (int i = lines.Length - 1; i >= 0; i--)
             {
                 string t = lines[i].Trim();
                 if (t.Length == 0) continue;
                 if (t.StartsWith("frame=", StringComparison.OrdinalIgnoreCase)) continue;
-                return t.Length > 200 ? t.Substring(0, 200) : t;
+                return Trim(t);
             }
             return "failed";
         }
+
+        static string Trim(string s) => s.Length > 200 ? s.Substring(0, 200) : s;
 
         /// <summary>First working encoder in <see cref="EncoderProfiles.AutoOrder"/>, or null.</summary>
         public static VideoEncoder? PickBest(IEnumerable<EncoderProbeResult> results)
