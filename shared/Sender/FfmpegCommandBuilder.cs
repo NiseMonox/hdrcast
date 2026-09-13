@@ -144,16 +144,16 @@ namespace HdrCast.Sender.Model
                 Lookahead = encoder.Lookahead,
                 MasteringMaxNits = encoder.MasteringMaxNits,
             };
+            // One second of source, not a few frames: SVT-AV1 fills a pipeline before it emits anything and
+            // ffmpeg fails with "no packets" on a shorter clip. The pixel format comes from the encoder profile.
             var a = new List<string>
             {
                 "-hide_banner", "-loglevel", "error", "-nostdin",
                 "-f", "lavfi",
-                "-i", "color=c=black:s=" + width.ToString(CultureInfo.InvariantCulture) + "x" +
-                      height.ToString(CultureInfo.InvariantCulture) + ":r=30:d=0.2",
-                "-pix_fmt", e.Hdr ? "p010le" : "nv12",
+                "-i", "testsrc2=size=" + width.ToString(CultureInfo.InvariantCulture) + "x" +
+                      height.ToString(CultureInfo.InvariantCulture) + ":rate=30:duration=1",
             };
             a.AddRange(EncoderProfiles.BuildVideoArgs(e));
-            a.Add("-frames:v"); a.Add("3");
             a.Add("-f"); a.Add("null");
             a.Add("-");
             return a;

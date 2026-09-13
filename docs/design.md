@@ -142,6 +142,9 @@ ffmpeg -hide_banner -loglevel warning -stats_period 1 -progress pipe:1 -nostdin
 
 - `-progress pipe:1` 输出 `key=value` 行（fps、bitrate、speed、frame、drop_frames、dup_frames、out_time_us），GUI 解析显示。
 - 默认编码器：`hevc_nvenc`，`-profile:v main10`（HDR）/ `main`（SDR）。备选按探测结果：`hevc_amf`、`hevc_qsv`、`libx265`。AV1（`av1_nvenc`）**只在直连模式**可选，此时封装用 `-f matroska -live 1`（MediaMTX 不支持）。
+- 输出像素格式按编码器显式指定：硬件编码器吃 `p010le` / `nv12`（即采集引擎的原生输出），CPU 编码器只收平面格式，必须写 `yuv420p10le` / `yuv420p`，否则 ffmpeg 可能协商成 8 bit，HDR 精度悄悄丢失。
+- **libx265 的坑（本机实测 7.1.5）**：ffmpeg 的 libx265 封装只把 `-colorspace` 和 `-color_range` 传给 x265，`-color_primaries` 与 `-color_trc` **不会**进 VUI（ffprobe 读回是 `unknown`）。必须在 `-x265-params` 里写 `colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:range=limited`，否则观众端拿到的是无标记流，会按 SDR 显示。
+- **libsvtav1 的坑（本机实测）**：`-maxrate` 只在 CRF 模式可用（否则报 "Max Bitrate only supported with CRF mode"），`rc=2`（CBR）要求低延迟预测结构（否则报 "CBR Rate control is currently not supported for SVT_AV1_PRED_RANDOM_ACCESS"）。所以这条路走 VBR（`rc=1`），码率由 SRT 侧兜。
 - 编码器探测：启动时运行 `ffmpeg -hide_banner -encoders`，再对候选编码器做 1 帧 `-f lavfi -i nullsrc ... -f null -` 试编码判断可用。
 
 ### 2.6 SRT 参数（单位：`latency` 等是**微秒**）

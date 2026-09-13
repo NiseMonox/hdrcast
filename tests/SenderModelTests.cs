@@ -279,14 +279,54 @@ namespace HdrCast.Tests
         }
 
         [Fact]
-        public void Probe_encodes_a_few_frames_to_null()
+        public void Probe_encodes_a_synthetic_second_to_null()
         {
             List<string> a = FfmpegCommandBuilder.BuildProbe(new EncoderSettings { Encoder = VideoEncoder.HevcNvenc, Hdr = true });
             Assert.Contains("lavfi", a);
-            Assert.Contains("-frames:v", a);
+            Assert.Contains(a, x => x.Contains("duration=1"));   // SVT-AV1 emits nothing for a shorter clip
             Assert.Equal("null", LastValue(a, "-f"));
             Assert.Equal("hevc_nvenc", Value(a, "-c:v"));
             Assert.Equal("p010le", Value(a, "-pix_fmt"));
+        }
+
+        [Fact]
+        public void Cpu_encoders_get_a_planar_pixel_format()
+        {
+            // The capture engine only produces p010/nv12; libx265 and SVT-AV1 accept neither, so the profile
+            // must name the planar format or ffmpeg may negotiate 8-bit and silently drop HDR precision.
+            Assert.Equal("p010le", EncoderProfiles.PixelFormat(VideoEncoder.HevcNvenc, true));
+            Assert.Equal("nv12", EncoderProfiles.PixelFormat(VideoEncoder.HevcNvenc, false));
+            Assert.Equal("yuv420p10le", EncoderProfiles.PixelFormat(VideoEncoder.LibX265, true));
+            Assert.Equal("yuv420p", EncoderProfiles.PixelFormat(VideoEncoder.LibSvtAv1, false));
+        }
+
+        [Fact]
+        public void X265_writes_the_colour_description_into_x265_params()
+        {
+            // ffmpeg's libx265 wrapper drops -color_primaries / -color_trc; without these the viewer gets an
+            // untagged stream and shows HDR as washed-out SDR.
+            var s = new EncoderSettings { Encoder = VideoEncoder.LibX265, Hdr = true, BitrateKbps = 20000, Fps = 60 };
+            string p = Value(EncoderProfiles.BuildVideoArgs(s), "-x265-params");
+            Assert.Contains("colorprim=bt2020", p);
+            Assert.Contains("transfer=smpte2084", p);
+            Assert.Contains("colormatrix=bt2020nc", p);
+
+            s.Hdr = false;
+            p = Value(EncoderProfiles.BuildVideoArgs(s), "-x265-params");
+            Assert.Contains("colorprim=bt709", p);
+            Assert.Contains("transfer=bt709", p);
+        }
+
+        [Fact]
+        public void Svtav1_uses_vbr_without_maxrate()
+        {
+            // Verified against libsvtav1: -maxrate is "only supported with CRF mode" and rc=2 (CBR) needs a
+            // low-delay prediction structure, so this encoder runs VBR.
+            var s = new EncoderSettings { Encoder = VideoEncoder.LibSvtAv1, Hdr = true, BitrateKbps = 20000, Fps = 60 };
+            List<string> a = EncoderProfiles.BuildVideoArgs(s);
+            Assert.DoesNotContain("-maxrate", a);
+            Assert.DoesNotContain("-bufsize", a);
+            Assert.Contains("rc=1", Value(a, "-svtav1-params"));
         }
 
         [Fact]

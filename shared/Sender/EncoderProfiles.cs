@@ -79,6 +79,22 @@ namespace HdrCast.Sender.Model
             throw new ArgumentOutOfRangeException(nameof(e));
         }
 
+        /// <summary>
+        /// Pixel format the encoder actually wants. The capture engine always produces p010/nv12, so the CPU
+        /// encoders need a conversion — naming it explicitly keeps ffmpeg from negotiating 8-bit for an HDR stream.
+        /// </summary>
+        public static string PixelFormat(VideoEncoder e, bool hdr)
+        {
+            switch (e)
+            {
+                case VideoEncoder.LibX265:
+                case VideoEncoder.LibSvtAv1:
+                    return hdr ? "yuv420p10le" : "yuv420p";      // neither accepts p010/nv12
+                default:
+                    return hdr ? "p010le" : "nv12";              // NVENC / AMF / QSV take the capture format as is
+            }
+        }
+
         public static EncoderInfo? ByFfmpegName(string name)
         {
             foreach (EncoderInfo i in All) if (string.Equals(i.FfmpegName, name, StringComparison.OrdinalIgnoreCase)) return i;
@@ -110,7 +126,7 @@ namespace HdrCast.Sender.Model
         {
             if (s == null) throw new ArgumentNullException(nameof(s));
             EncoderInfo info = Info(s.Encoder);
-            var a = new List<string> { "-c:v", info.FfmpegName };
+            var a = new List<string> { "-c:v", info.FfmpegName, "-pix_fmt", PixelFormat(s.Encoder, s.Hdr) };
             int gop = Math.Max(1, (int)Math.Round(s.Fps * s.GopSeconds));
             string kbps = s.BitrateKbps.ToString(CultureInfo.InvariantCulture) + "k";
             string bufsize = ((int)Math.Round(s.BitrateKbps * s.BufferSeconds)).ToString(CultureInfo.InvariantCulture) + "k";
@@ -193,14 +209,16 @@ namespace HdrCast.Sender.Model
                 }
                 case VideoEncoder.LibSvtAv1:
                 {
+                    // SVT-AV1 is fussy about rate control (both verified against libsvtav1 on this box):
+                    //   -maxrate  -> "Max Bitrate only supported with CRF mode"
+                    //   rc=2 (CBR) -> "CBR Rate control is currently not supported for SVT_AV1_PRED_RANDOM_ACCESS"
+                    // so this path uses VBR around the target bitrate and leaves the VBV to the SRT sender.
                     a.Add("-preset"); a.Add(SvtPreset(s.Preset));
                     a.Add("-b:v"); a.Add(kbps);
-                    a.Add("-maxrate"); a.Add(kbps);
-                    a.Add("-bufsize"); a.Add(bufsize);
                     a.Add("-g"); a.Add(gop.ToString(CultureInfo.InvariantCulture));
                     a.Add("-svtav1-params");
-                    a.Add("rc=2:lookahead=" + Math.Max(0, lookahead).ToString(CultureInfo.InvariantCulture) +
-                          ":keyint=" + gop.ToString(CultureInfo.InvariantCulture));
+                    a.Add("rc=1:keyint=" + gop.ToString(CultureInfo.InvariantCulture) +
+                          ":lookahead=" + Math.Max(0, lookahead).ToString(CultureInfo.InvariantCulture));
                     break;
                 }
                 default:
@@ -267,6 +285,13 @@ namespace HdrCast.Sender.Model
                 "vbv-maxrate=" + s.BitrateKbps.ToString(CultureInfo.InvariantCulture),
                 "vbv-bufsize=" + ((int)Math.Round(s.BitrateKbps * s.BufferSeconds)).ToString(CultureInfo.InvariantCulture),
             };
+            // ffmpeg's libx265 wrapper forwards -colorspace and -color_range to x265 but NOT -color_primaries
+            // or -color_trc (verified on 7.1.5: they come back as "unknown"), so the VUI has to be set here or
+            // the viewer's player sees an untagged stream and shows HDR as washed-out SDR.
+            parts.Add("colorprim=" + (s.Hdr ? "bt2020" : "bt709"));
+            parts.Add("transfer=" + (s.Hdr ? "smpte2084" : "bt709"));
+            parts.Add("colormatrix=" + (s.Hdr ? "bt2020nc" : "bt709"));
+            parts.Add("range=limited");
             if (s.Hdr)
             {
                 int maxNits = s.MasteringMaxNits > 0 ? s.MasteringMaxNits : 1000;
