@@ -7,8 +7,8 @@ Linux 这边能验证的（`dotnet build` / `dotnet test` / `relay/selftest.sh`�
 ## 0. 准备
 
 - [ ] Windows HDR 已打开（`Win + Alt + B`，或 设置 → 显示 → 使用 HDR）。
-- [ ] ffmpeg：从 <https://www.gyan.dev/ffmpeg/builds/> 下载 **full** 版（release full），解压后把 `bin\ffmpeg.exe`（和 `ffprobe.exe`）放到 `HdrCast\` 或 `HdrCast\tools\`。essentials 也带 libsrt，但 full 才有 libplacebo/librist。
-- [ ] mpv（本机也装一个方便自测）：<https://github.com/shinchiro/mpv-winbuild-cmake/releases> 或 <https://github.com/zhongfly/mpv-winbuild/releases> 的 `mpv-x86_64-*.7z`，把 `mpv.exe` 放到 `HdrCast\` 或 `HdrCast\tools\`。
+- [ ] **工具一键装**：双击 `scripts\get-tools.cmd`（两个都装）。它下载 BtbN 的 ffmpeg win64-gpl（含 nvenc/amf/qsv、libsrt、libplacebo、ddagrab）和 zhongfly 的 mpv（含 libsrt）到 `HdrCast\tools\`，装完自己验证 srt 支持并列出可用编码器。已经装过会跳过，`get-tools.cmd force` 强制重下。
+- [ ] 手动装（脚本失败时）：ffmpeg 取 <https://www.gyan.dev/ffmpeg/builds/> 的 **release full**，mpv 取 <https://github.com/zhongfly/mpv-winbuild/releases> 的 `mpv-x86_64-*.7z`，把 `ffmpeg.exe` / `ffprobe.exe` / `mpv.exe` 放进 `HdrCast\tools\`。
 - [ ] .NET Framework 4.8 是 Windows 10 1903+/11 自带的，不用装。
 - [ ] 中继：LXC 上已运行 `relay/setup.sh` 与 `relay/up.sh`（见 §5）。
 

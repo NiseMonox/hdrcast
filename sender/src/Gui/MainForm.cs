@@ -18,9 +18,11 @@ namespace HdrCast.Sender.Gui
         const string FfmpegExeName = "ffmpeg.exe";
         const int MaxLogLines = 500;
         const string FfmpegDownloadHint =
-            "ffmpeg.exe was not found.\n\nDownload a Windows build that includes NVENC/AMF/QSV and libsrt " +
-            "(gyan.dev \"full\" or BtbN win64-gpl), put ffmpeg.exe next to HdrCastSender.exe " +
-            "(or in a tools\\ subfolder), or pick it with Browse.";
+            "ffmpeg.exe was not found.\n\n" +
+            "Easiest fix: run scripts\\get-tools.cmd (double-click it). It downloads a build with NVENC/AMF/QSV " +
+            "and libsrt into the tools\\ folder, then checks it.\n\n" +
+            "By hand: take the gyan.dev \"full\" or BtbN win64-gpl build and put ffmpeg.exe next to " +
+            "HdrCastSender.exe (or in tools\\), or pick it with Browse.";
 
         readonly SenderSettings _settings;
         readonly string _settingsPath;

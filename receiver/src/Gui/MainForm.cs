@@ -16,8 +16,11 @@ namespace HdrCast.Receiver.Gui
         private const string FfmpegExeName = "ffmpeg.exe";
         private const int MaxLogLines = 500;
         private const string MpvDownloadHint =
-            "mpv.exe was not found.\n\nDownload a Windows build that includes libsrt (shinchiro or zhongfly mpv-winbuild), " +
-            "put mpv.exe next to HdrCastReceiver.exe (or in a tools\\ subfolder), or pick it with Browse.";
+            "mpv.exe was not found.\n\n" +
+            "Easiest fix: run scripts\\get-tools.cmd viewer (double-click get-tools.cmd). It downloads an mpv " +
+            "build with libsrt into the tools\\ folder, then checks it.\n\n" +
+            "By hand: take a shinchiro or zhongfly mpv-winbuild and put mpv.exe next to HdrCastReceiver.exe " +
+            "(or in tools\\), or pick it with Browse.";
 
         private readonly ReceiverSettings _settings;
         private readonly string _settingsPath;

@@ -5,14 +5,14 @@ Your friend is sharing their Windows desktop (HDR10, with audio) through a priva
 ## What you need
 
 - Windows 10 (1903+) or 11. Nothing to install: `HdrCastReceiver.exe` runs on the .NET Framework that Windows already ships.
-- **mpv** built with SRT support: download `mpv-x86_64-<date>.7z` from <https://github.com/shinchiro/mpv-winbuild-cmake/releases> or <https://github.com/zhongfly/mpv-winbuild/releases>, extract it and put `mpv.exe` next to `HdrCastReceiver.exe` (or in the `tools\` folder next to it).
+- **mpv** built with SRT support. Easiest: double-click `scripts\get-tools.cmd` and it downloads one into `tools\` for you (or run `get-tools.cmd viewer` to skip the sender's ffmpeg, which you do not need). By hand: take `mpv-x86_64-<date>.7z` from <https://github.com/zhongfly/mpv-winbuild/releases> or <https://github.com/shinchiro/mpv-winbuild-cmake/releases>, extract it and put `mpv.exe` next to `HdrCastReceiver.exe` (or in `tools\`).
 - A GPU that decodes HEVC 10-bit in hardware (NVIDIA GTX 10-series+, AMD RX 400+, Intel 7th gen+ iGPU). 4K60 needs something recent (RTX 20+/RX 5000+).
 - Download bandwidth of at least 1.3 x the stream bitrate (a 40 Mbps stream needs ~50 Mbps).
 - The five values from your friend: **host**, **port** (8890), **user** (`viewer`), **password**, **passphrase**.
 
 ## Steps
 
-1. Unzip the HdrCast folder anywhere. Run `scripts\check-tools.cmd` once: it must say `mpv ... srt : yes`.
+1. Unzip the HdrCast folder anywhere. Run `scripts\get-tools.cmd viewer` to fetch mpv, then `scripts\check-tools.cmd` to confirm: it must say `mpv ... srt : yes`.
 2. If you have an **HDR monitor**, switch Windows HDR on: `Win + Alt + B` (or Settings > System > Display > Use HDR). mpv cannot turn it on for you; without it the picture looks washed out.
 3. Run `HdrCastReceiver.exe`. Mode "Relay", paste host / port / user / password / passphrase.
 4. Pick your region preset (Japan 1500 ms, Australia 2000 ms, China 3500 ms). It sets the SRT buffer; a bigger value survives worse networks at the cost of delay.

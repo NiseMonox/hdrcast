@@ -82,14 +82,23 @@ mkdir -p "$DIST/relay" "$DIST/scripts" "$DIST/docs"
 for f in docker-compose.yml mediamtx.template.yml setup.sh selftest.sh up.sh down.sh logs.sh .gitignore; do
   [ -f "$ROOT/relay/$f" ] && cp "$ROOT/relay/$f" "$DIST/relay/"
 done
-cp "$ROOT"/scripts/*.cmd "$DIST/scripts/" 2>/dev/null || true
+# .cmd launchers plus the .ps1 payloads they call (get-tools.cmd is useless without get-tools.ps1)
+cp "$ROOT"/scripts/*.cmd "$ROOT"/scripts/*.ps1 "$DIST/scripts/" 2>/dev/null || true
 # docs: markdown only (research JSON stays in the repo)
 cp "$ROOT"/docs/*.md "$DIST/docs/" 2>/dev/null || true
 for f in README.md README.en.md LICENSE; do [ -f "$ROOT/$f" ] && cp "$ROOT/$f" "$DIST/"; done
 mkdir -p "$DIST/tools"
 cat > "$DIST/tools/README.txt" <<'TXT'
-Put ffmpeg.exe (sender, gyan.dev "full" build) and/or mpv.exe (receiver, shinchiro or zhongfly build) here,
-or next to the HdrCast exe, or anywhere on PATH. See README.md.
+Put ffmpeg.exe + ffprobe.exe (sender) and/or mpv.exe (viewer) here.
+
+Easiest: double-click ..\scripts\get-tools.cmd - it downloads both into this folder and verifies them.
+  get-tools.cmd sender    only ffmpeg + ffprobe
+  get-tools.cmd viewer    only mpv
+  get-tools.cmd force     replace what is already here
+
+By hand: ffmpeg from https://www.gyan.dev/ffmpeg/builds/ (the "release full" build, it needs libsrt),
+mpv from https://github.com/zhongfly/mpv-winbuild/releases (mpv-x86_64-*.7z, also needs libsrt).
+Anything on PATH works too. See README.md.
 TXT
 
 step "dist tree"

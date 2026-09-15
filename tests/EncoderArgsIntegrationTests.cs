@@ -40,6 +40,15 @@ namespace HdrCast.Tests
             return output.Contains(" " + name + " ");
         }
 
+        /// <summary>ffprobe next to the given ffmpeg. Replacing "ffmpeg" in the whole path would also rewrite
+        /// the directory name when ffmpeg lives in a folder that contains its own name.</summary>
+        static string ProbeTool(string ffmpeg)
+        {
+            string? dir = Path.GetDirectoryName(ffmpeg);
+            string name = Path.GetFileName(ffmpeg).Replace("ffmpeg", "ffprobe");
+            return string.IsNullOrEmpty(dir) ? name : Path.Combine(dir!, name);
+        }
+
         static string Run(string exe, IEnumerable<string> args, out int exitCode)
         {
             var psi = new ProcessStartInfo(exe, ArgQuote.Join(args))
@@ -119,7 +128,7 @@ namespace HdrCast.Tests
                 Assert.True(exit == 0, "encode failed:\n" + ArgQuote.Join(args) + "\n" + Tail(log));
 
                 // Read it back: the colour tags the viewer depends on must survive the muxer.
-                string probe = Run(ffmpeg.Replace("ffmpeg", "ffprobe"), new[]
+                string probe = Run(ProbeTool(ffmpeg), new[]
                 {
                     "-hide_banner", "-loglevel", "error", "-show_streams", "-select_streams", "v:0", ts,
                 }, out int probeExit);
@@ -160,7 +169,7 @@ namespace HdrCast.Tests
                 }, out int exit);
 
                 if (exit != 0) return;                            // refused outright: also fine
-                string probe = Run(ffmpeg.Replace("ffmpeg", "ffprobe"), new[]
+                string probe = Run(ProbeTool(ffmpeg), new[]
                 {
                     "-hide_banner", "-loglevel", "error", "-show_streams", ts,
                 }, out int probeExit);

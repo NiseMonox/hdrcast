@@ -36,7 +36,8 @@
 
 ## 快速开始：发送端（你）
 
-1. **下载 ffmpeg**：<https://www.gyan.dev/ffmpeg/builds/> 的 **release full** 版，解压后把 `bin\ffmpeg.exe`（顺便 `ffprobe.exe`）放到 `HdrCastSender.exe` 旁边或 `tools\` 子目录（也可以放在 PATH 里）。
+1. **装工具**：双击 `scripts\get-tools.cmd`，它会把 ffmpeg 和 mpv 下载到 `tools\` 并自检（只要发送端就 `get-tools.cmd sender`）。
+   手动装也行：<https://www.gyan.dev/ffmpeg/builds/> 的 **release full** 版，把 `bin\ffmpeg.exe`（顺便 `ffprobe.exe`）放到 `HdrCastSender.exe` 旁边、`tools\` 子目录或 PATH 里。
 2. **在 LXC 上启动中继**：
    ```bash
    cd /projects/hdrcast
@@ -52,7 +53,7 @@
 
 英文版给朋友看：[README.en.md](README.en.md)。
 
-1. **下载 mpv**（必须是带 libsrt 的构建）：<https://github.com/shinchiro/mpv-winbuild-cmake/releases> 或 <https://github.com/zhongfly/mpv-winbuild/releases> 的 `mpv-x86_64-*.7z`，把 `mpv.exe` 放到 `HdrCastReceiver.exe` 旁边或 `tools\`。
+1. **装 mpv**：双击 `scripts\get-tools.cmd`（或命令行 `get-tools.cmd viewer`）。手动装就下 <https://github.com/zhongfly/mpv-winbuild/releases> 或 <https://github.com/shinchiro/mpv-winbuild-cmake/releases> 的 `mpv-x86_64-*.7z`（必须带 libsrt），把 `mpv.exe` 放到 `HdrCastReceiver.exe` 旁边或 `tools\`。
 2. **运行 `HdrCastReceiver.exe`**：粘贴你发给他的 主机（公网 IP / DDNS）、端口 8890、用户 `viewer` + 密码、**read** passphrase；地区选 日本 1500 ms / 澳洲 2000 ms / 中国 3500 ms；点连接。推流没开始时会显示"等待推流…"并自动重试。
 3. **HDR 显示器**先在 Windows 里打开 HDR（`Win + Alt + B`），mpv 才能直通；SDR 显示器选"SDR 色调映射"。全屏按钮 = 真 HDR 全屏。
 
@@ -67,6 +68,8 @@
 | Docker + Compose | 中继（LXC） | 已装 | 镜像 `bluenviron/mediamtx:1.21.0` |
 | .NET Framework 4.8 | 两端 | Windows 自带 | 无需安装 |
 
+`scripts\get-tools.cmd` 一键下载上面两个（`sender` / `viewer` / `both`，加 `force` 重新下载）。零依赖：ffmpeg 是 zip 用 Windows 自带解压，mpv 是 7z 用 Windows 自带的 `tar.exe`（libarchive），都不行时自动取官方 7zr.exe。
+
 `scripts\check-tools.cmd` 会检查 ffmpeg / mpv 是否找到、hevc_nvenc / av1_nvenc / hevc_amf / hevc_qsv 是否可用、mpv 是否支持 `srt://`。
 
 ## 目录结构
@@ -77,7 +80,7 @@ receiver/    HdrCastReceiver.exe：WinForms GUI，启动 mpv.exe 并通过 JSON 
 shared/      平台无关逻辑（SRT URL / 缓冲计算、ffmpeg -progress 与 mpv IPC 解析、设置模型、编码器档位），同时编进两个 exe 与测试
 tests/       xunit（net10，在 Linux 上跑）
 relay/       MediaMTX：docker-compose.yml、mediamtx.template.yml、setup.sh / up.sh / down.sh / logs.sh、selftest.sh
-scripts/     Windows 批处理：check-tools / send-example / receive-example / dump-check
+scripts/     Windows 批处理：get-tools（一键装 ffmpeg/mpv）/ check-tools / send-example / receive-example / dump-check
 docs/        design.md（规格）、network.md、windows-checklist.md、faq.md、obs-alternative.md、research/（调研报告 JSON）
 build.sh     在 Linux 上构建并打包 dist/HdrCast-<版本>/
 ```
