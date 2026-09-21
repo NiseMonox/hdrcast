@@ -196,7 +196,7 @@ namespace HdrCast.Tests
         }
 
         [Fact]
-        public void Hdr10_hevc_reaches_several_viewers_through_punched_links()
+        public async Task Hdr10_hevc_reaches_several_viewers_through_punched_links()
         {
             string? ffmpeg = Find("ffmpeg"), ffprobe = Find("ffprobe");
             if (ffmpeg == null || ffprobe == null) return;
@@ -261,7 +261,7 @@ namespace HdrCast.Tests
                     Viewer a = Join("A"), b = Join("B");
                     Task<string> pa = Task.Run(() => Probe(a));
                     Task<string> pb = Task.Run(() => Probe(b));
-                    foreach (string result in new[] { pa.Result, pb.Result })
+                    foreach (string result in await Task.WhenAll(pa, pb))
                     {
                         Assert.Contains("codec_name=hevc", result);
                         Assert.Contains("profile=Main 10", result);

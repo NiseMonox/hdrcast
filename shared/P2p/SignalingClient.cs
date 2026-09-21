@@ -6,6 +6,7 @@ using System.IO;
 using System.Net;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using HdrCast.Common;
 using HdrCast.Group;
 
@@ -183,20 +184,53 @@ namespace HdrCast.P2p
             req.Accept = "application/json";
             if (authenticate) req.Headers[RequestAuth.HeaderName] = RequestAuth.Header(_keys.ServerKey, method, pathAndQuery, bytes);
 
-            using (ct.Register(() => { try { req.Abort(); } catch (Exception) { } }))
+            try
             {
-                try
+                if (method == "PUT" || method == "POST")
                 {
-                    if (method == "PUT" || method == "POST")
-                    {
-                        req.ContentType = "application/json";
-                        req.ContentLength = bytes.Length;
-                        using (Stream s = req.GetRequestStream()) s.Write(bytes, 0, bytes.Length);
-                    }
-                    using (var resp = (HttpWebResponse)req.GetResponse())
-                        return new Response { Status = (int)resp.StatusCode, Body = ReadBody(resp) };
+                    req.ContentType = "application/json";
+                    req.ContentLength = bytes.Length;
+                    using (Stream s = req.GetRequestStream()) s.Write(bytes, 0, bytes.Length);
                 }
-                catch (WebException ex) when (ex.Response is HttpWebResponse er)
+            }
+            catch (WebException ex)
+            {
+                ct.ThrowIfCancellationRequested();
+                throw new SignalingException("signaling server unreachable (" + ex.Status + ")", 0, unreachable: true, inner: ex);
+            }
+            catch (IOException ex)
+            {
+                throw new SignalingException("signaling connection failed", 0, unreachable: true, inner: ex);
+            }
+
+            // Wait on the response with the token rather than blocking in GetResponse: HttpWebRequest.Abort() does not
+            // interrupt a blocking GetResponse on every runtime, and a stop must not sit out a 20 s long-poll.
+            Task<WebResponse> pending = req.GetResponseAsync();
+            int done;
+            try
+            {
+                done = Task.WaitAny(new Task[] { pending }, timeoutMs, ct);
+            }
+            catch (OperationCanceledException)
+            {
+                Abandon(req, pending);
+                throw;
+            }
+            if (done < 0)
+            {
+                Abandon(req, pending);
+                throw new SignalingException("signaling server did not answer in time", 0, unreachable: true);
+            }
+
+            try
+            {
+                using (var resp = (HttpWebResponse)pending.Result)
+                    return new Response { Status = (int)resp.StatusCode, Body = ReadBody(resp) };
+            }
+            catch (AggregateException agg)
+            {
+                Exception inner = agg.InnerException ?? agg;
+                if (inner is WebException ex && ex.Response is HttpWebResponse er)
                 {
                     int status = (int)er.StatusCode;
                     string text;
@@ -204,17 +238,26 @@ namespace HdrCast.P2p
                     string error = MiniJson.GetString(SafeParse(text), "error") ?? er.StatusDescription;
                     throw new SignalingException("signaling " + status + ": " + error, status, unreachable: false, inner: ex);
                 }
-                catch (WebException ex)
-                {
-                    ct.ThrowIfCancellationRequested();
-                    throw new SignalingException("signaling server unreachable (" + ex.Status + ")", 0, unreachable: true, inner: ex);
-                }
-                catch (IOException ex)
-                {
-                    ct.ThrowIfCancellationRequested();
-                    throw new SignalingException("signaling connection failed", 0, unreachable: true, inner: ex);
-                }
+                ct.ThrowIfCancellationRequested();
+                string why = inner is WebException wex ? "unreachable (" + wex.Status + ")" : "connection failed";
+                throw new SignalingException("signaling server " + why, 0, unreachable: true, inner: inner);
             }
+            catch (IOException ex)
+            {
+                ct.ThrowIfCancellationRequested();
+                throw new SignalingException("signaling connection failed", 0, unreachable: true, inner: ex);
+            }
+        }
+
+        /// <summary>Gives up on a request: aborts it and quietly disposes whatever arrives later.</summary>
+        static void Abandon(HttpWebRequest req, Task<WebResponse> pending)
+        {
+            try { req.Abort(); } catch (Exception) { }
+            pending.ContinueWith(t =>
+            {
+                if (t.IsFaulted) { Exception? _ = t.Exception; }
+                else if (t.Status == TaskStatus.RanToCompletion) { try { t.Result.Dispose(); } catch (Exception) { } }
+            }, TaskContinuationOptions.ExecuteSynchronously);
         }
 
         static string ReadBody(HttpWebResponse resp)

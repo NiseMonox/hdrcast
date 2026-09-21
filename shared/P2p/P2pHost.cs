@@ -476,7 +476,11 @@ namespace HdrCast.P2p
                 foreach (Viewer v in _viewers.Values) { v.Ended = true; v.Child = null; }
                 _viewers.Clear();
             }
-            foreach (RemuxChild c in children) c.Dispose();
+            // children in parallel: each kill waits for the process to exit
+            var done = new CountdownEvent(children.Count);
+            foreach (RemuxChild c in children)
+                ThreadPool.QueueUserWorkItem(_ => { try { c.Dispose(); } finally { done.Signal(); } });
+            done.Wait(5000);
             _fan?.Dispose();
             SetStatus("Offline");
         }

@@ -129,9 +129,11 @@ namespace HdrCast.P2p
                     {
                         bool temporary = false, preferred = true;
                         long lifetime = long.MaxValue;
+#pragma warning disable CA1416 // Windows-only; elsewhere they throw PlatformNotSupportedException, caught here
                         try { temporary = u.SuffixOrigin == SuffixOrigin.Random; } catch (Exception) { }
                         try { preferred = u.DuplicateAddressDetectionState == DuplicateAddressDetectionState.Preferred; } catch (Exception) { }
                         try { lifetime = u.AddressPreferredLifetime; } catch (Exception) { }
+#pragma warning restore CA1416
                         list.Add(new AddressCandidate(u.Address, nic.Id, temporary, preferred, lifetime));
                     }
                 }

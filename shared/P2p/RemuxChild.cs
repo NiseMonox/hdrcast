@@ -81,8 +81,11 @@ namespace HdrCast.P2p
 
         public void Dispose()
         {
-            try { _process.StdinStream?.Dispose(); } catch (Exception) { }
+            // Kill first: a child still waiting for its viewer is not reading stdin, and closing a full pipe blocks
+            // until someone reads it — which would be never.
+            Stream? stdin = _process.StdinStream;
             _process.Dispose();
+            try { stdin?.Dispose(); } catch (Exception) { }
         }
     }
 }
