@@ -262,6 +262,7 @@ namespace HdrCast.Tests
     /// Everything but the GUI and the capture engine: real signaling server, real HEVC Main10 PQ encoder, P2pHost,
     /// two ViewerSessions, ffprobe standing in for mpv. Skipped without python3 / ffmpeg / ffprobe / libx265.
     /// </summary>
+    [Collection("media")]
     public class P2pFullStackTests
     {
         static string? Find(string exe)
@@ -350,11 +351,19 @@ namespace HdrCast.Tests
                         return vs;
                     }
 
-                    string Probe(ViewerSession vs) => Run(ffprobe, new[]
+                    string Probe(ViewerSession vs)
                     {
-                        "-hide_banner", "-v", "error", "-show_entries", "stream=codec_name,profile,color_transfer", "-of", "compact",
-                        "srt://127.0.0.1:" + vs.LocalPort + "?passphrase=" + vs.SrtPassphrase + "&pbkeylen=32&latency=300000&connect_timeout=4000",
-                    }, 15000);
+                        string result = "";
+                        for (int attempt = 0; attempt < 3 && !result.Contains("codec_name="); attempt++)
+                        {
+                            result = Run(ffprobe, new[]
+                            {
+                                "-hide_banner", "-v", "error", "-show_entries", "stream=codec_name,profile,color_transfer", "-of", "compact",
+                                "srt://127.0.0.1:" + vs.LocalPort + "?passphrase=" + vs.SrtPassphrase + "&pbkeylen=32&latency=300000&connect_timeout=4000",
+                            }, 15000);
+                        }
+                        return result;
+                    }
 
                     ViewerSession red = Watch("小红"), blue = Watch("小蓝");
                     foreach (string r in new[] { Probe(red), Probe(blue) })

@@ -19,6 +19,7 @@ namespace HdrCast.Tests
     ///
     /// Skipped when ffmpeg is missing.
     /// </summary>
+    [Collection("media")]
     public class EncoderArgsIntegrationTests
     {
         static string? FindFfmpeg()

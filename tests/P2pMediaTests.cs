@@ -141,6 +141,14 @@ namespace HdrCast.Tests
     /// The whole P2P media path on one machine: libx265 Main10 PQ → TsFanOut → remux children (SRT listeners) →
     /// HostLink → stateful firewalls → ViewerLink → ffprobe as the viewer. Skipped without ffmpeg/ffprobe/libx265.
     /// </summary>
+    /// <summary>
+    /// The heavy media tests (libx265 encoders, remux children, ffprobe) run one at a time: in parallel they starve each
+    /// other of CPU and a remux child opens its SRT listener only after its first input arrives.
+    /// </summary>
+    [CollectionDefinition("media", DisableParallelization = true)]
+    public sealed class MediaCollection { }
+
+    [Collection("media")]
     public class P2pMediaEndToEndTests
     {
         static string? Find(string exe)
@@ -247,15 +255,21 @@ namespace HdrCast.Tests
                         return v;
                     }
 
+                    // Like mpv's retry loop in the app: a child that has not seen input yet is not listening yet.
                     string Probe(Viewer v)
                     {
                         string url = "srt://127.0.0.1:" + v.Link.LocalPort + "?passphrase=" + keys.SrtPassphrase +
                                      "&pbkeylen=32&latency=" + (latencyMs * 1000) + "&connect_timeout=4000";
-                        return Run(ffprobe, new[]
+                        string result = "";
+                        for (int attempt = 0; attempt < 3 && !result.Contains("codec_name="); attempt++)
                         {
-                            "-hide_banner", "-v", "error", "-show_entries", "stream=codec_name,profile,pix_fmt,color_transfer,color_primaries",
-                            "-of", "compact", url,
-                        }, 12000, out _);
+                            result = Run(ffprobe, new[]
+                            {
+                                "-hide_banner", "-v", "error", "-show_entries", "stream=codec_name,profile,pix_fmt,color_transfer,color_primaries",
+                                "-of", "compact", url,
+                            }, 12000, out _);
+                        }
+                        return result;
                     }
 
                     Viewer a = Join("A"), b = Join("B");
