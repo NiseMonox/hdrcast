@@ -1,0 +1,15 @@
+# Windows scripts must keep CRLF: cmd.exe finds :labels by seeking, and a label that straddles a
+# 512-byte block in an LF file can be missed. PowerShell 5.1 reads BOM-less files as the ANSI code page,
+# so .ps1/.cmd stay pure ASCII (tests/PackagingTests.cs enforces both).
+*.cmd  text eol=crlf
+*.bat  text eol=crlf
+*.ps1  text eol=crlf
+
+*.sh   text eol=lf
+*.py   text eol=lf
+*.yml  text eol=lf
+*.service text eol=lf
+
+*.cs   text
+*.md   text
+*.json text

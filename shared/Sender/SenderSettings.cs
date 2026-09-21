@@ -101,6 +101,8 @@ namespace HdrCast.Sender.Model
         [DataMember(Name = "latencyMs", Order = 37)] public int LatencyMs { get; set; }
         [DataMember(Name = "overheadPercent", Order = 38)] public int OverheadPercent { get; set; }
         [DataMember(Name = "rateControl", Order = 39)] public bool RateControl { get; set; }
+        /// <summary>Listen mode only: the address to bind (empty = IPv4 0.0.0.0; IPv6 needs this PC's own address).</summary>
+        [DataMember(Name = "listenAddress", Order = 40)] public string ListenAddress { get; set; } = "";
 
         // ---- tools / behaviour ----
         [DataMember(Name = "ffmpegPath", Order = 50)] public string FfmpegPath { get; set; } = "";
@@ -138,6 +140,7 @@ namespace HdrCast.Sender.Model
             LatencyMs = RelayPublishLatencyMs;
             OverheadPercent = 25;
             RateControl = true;
+            ListenAddress = "";
 
             FfmpegPath = "";
             AutoRestart = false;
@@ -167,6 +170,12 @@ namespace HdrCast.Sender.Model
             if (OverheadPercent > 100) OverheadPercent = 100;
             if (string.IsNullOrWhiteSpace(StreamPath)) StreamPath = "screen";
             if (string.IsNullOrWhiteSpace(AudioDevice)) AudioDevice = "default";
+            Host = (Host ?? "").Trim();
+            ListenAddress = (ListenAddress ?? "").Trim();
+            User ??= "";
+            Password ??= "";
+            Passphrase ??= "";
+            if (!Enum.IsDefined(typeof(SendMode), Mode)) Mode = SendMode.Relay;
             return this;
         }
 
@@ -210,9 +219,12 @@ namespace HdrCast.Sender.Model
         public List<string> Validate()
         {
             var problems = new List<string>();
-            if (Mode != SendMode.DirectListen && string.IsNullOrWhiteSpace(Host))
-                problems.Add("Host is required.");
             if (Port < 1 || Port > 65535) problems.Add("Port must be 1..65535.");
+            else if (Mode == SendMode.DirectListen)
+            {
+                if (!SrtUrl.TryListenHost(ListenAddress, out _, out string listenError)) problems.Add(listenError);
+            }
+            else if (!SrtUrl.TryCallerHost(Host, Port, out _, out string hostError)) problems.Add(hostError);
             if (Mode == SendMode.Relay)
             {
                 if (string.IsNullOrWhiteSpace(StreamPath)) problems.Add("Path is required in relay mode.");
@@ -246,6 +258,7 @@ namespace HdrCast.Sender.Model
                 Role = SrtRole.Publish,
                 Host = Host,
                 Port = Port,
+                ListenAddress = Mode == SendMode.DirectListen ? ListenAddress : null,
                 StreamPath = StreamPath,
                 User = string.IsNullOrEmpty(User) ? null : User,
                 Password = string.IsNullOrEmpty(Password) ? null : Password,

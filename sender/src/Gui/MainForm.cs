@@ -994,12 +994,13 @@ namespace HdrCast.Sender.Gui
 
         void AppendLogThreadSafe(string line)
         {
-            lock (_pendingLog) _pendingLog.Enqueue(line);
+            lock (_pendingLog) _pendingLog.Enqueue(SecretRedactor.Redact(line));
         }
 
         void AppendLog(string line)
         {
             if (_closing) return;
+            line = SecretRedactor.Redact(line);
             _logLines.Add(line);
             if (_logLines.Count > MaxLogLines) _logLines.RemoveRange(0, _logLines.Count - MaxLogLines);
             _log.Lines = _logLines.ToArray();

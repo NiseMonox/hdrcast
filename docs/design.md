@@ -227,3 +227,131 @@ mpv --vo=gpu-next --gpu-api=d3d11 --hwdec=d3d11va
 
 Linux 本机：`dotnet build` 0 警告；`dotnet test` 覆盖命令行构造 / URL / 缓冲计算 / 解析器；`relay/selftest.sh` 跑通合成 HDR10 → MediaMTX → ffprobe。
 Windows（只能由用户做）：`list-outputs` 正确识别 HDR；`capture` 单独跑 10 s 落盘为 `.p010` 用 ffmpeg 转 PNG 检查亮度；完整推流；朋友端 mpv HDR 直通 / SDR 色调映射；4K60 下采集 fps 与 GPU 占用。
+
+## 8. 点对点模式协议（v1）
+
+> P2P 模式：主播 PC 自己把流分给每个观众，**不需要中继**。腾讯云上的 `hdrcast-signal` 只做牵线（谁在播、交换候选地址），
+> 所有消息都用组密钥签名，服务器既看不到密钥也伪造不了地址；视频从不经过它。本节是 C# 客户端与 `signal/hdrcast_signal.py`
+> 共同遵守的契约，golden 向量在 `tests/vectors/group-v1.json`，两边的测试都读它。
+
+### 8.1 编码约定
+
+- `b64u(x)`：base64url（RFC 4648 §5），**无** `=` 填充。解码时也接受有填充的输入。
+- 所有 JSON 用 UTF-8，不带 BOM；签名永远针对**原样字节**（`p` 字段里的 base64url 串），不做 JSON 规范化。
+- 时间戳：`t`、`now` 等是 Unix 毫秒（整数）；`age_ms` 是服务器算的“存了多久”。
+- id：`gid`、`host`、`viewer`、`sid` 都是 16 个随机字节的 `b64u`，正好 22 字符，匹配 `^[A-Za-z0-9_-]{22}$`。
+
+### 8.2 邀请码
+
+```
+hdrcast:<B>.<C>
+B = b64u(UTF-8 JSON)        C = b64u(SHA-256(JSON 字节)) 的前 8 个字符
+JSON = {"v":1,"s":"http://101.43.23.94:18650","g":"<gid>","k":"<b64u(32 字节组密钥 K)>","n":"<组名>"}
+```
+
+- `v` 必须是 1（更大 → “邀请码来自更新的版本”）；`s` 是信令服务的 base URL（`http://` 或 `https://`，无结尾 `/`）；
+  `k` 解码后必须正好 32 字节；`n` 1–40 个字符。未知字段忽略。
+- 从聊天文本里提取：先做 NFKC（全角 `ｈｄｒｃａｓｔ：` 也认），不区分大小写找 `hdrcast:`；之后只收 base64url 字母和 `.`，
+  跳过空白（空格、制表、CR、LF）和零宽字符（U+200B/200C/200D/2060/FEFF），遇到其他字符停止；按最后一个 `.` 切开。
+  没有 `.` 或校验不足 8 位 → “不完整”；校验不符 → “已损坏”。文本里有多个时取第一个校验通过的。
+- 撤销 = 新建一个组重新发码（旧组的 K 作废）。
+
+### 8.3 密钥派生
+
+`sub(label) = HMAC-SHA256(K, UTF-8("hdrcast/v1/" + label))`，32 字节。
+
+| 用途 | 派生 | 说明 |
+|---|---|---|
+| 请求鉴权 | `serverKey = sub("server")` | 建组时交给信令服务器 |
+| 消息签名 | `msgKey = sub("msg")` | 服务器不知道，伪造不了在播信息 / 加入 / 应答 |
+| SRT 加密 | `passphrase = b64u(sub("srt"))` 的前 32 个字符，`pbkeylen=32` | 端到端 AES-256 |
+| 打洞 | `punchKey(sid) = sub("punch/" + sid)` | 每个会话一把 |
+
+### 8.4 签名信封
+
+```
+{"p":"<b64u(payload JSON)>","m":"<b64u(HMAC-SHA256(msgKey, kind + "\n" + gid + "\n" + key + "\n" + p))>"}
+```
+
+| kind | key | payload |
+|---|---|---|
+| `live` | host id | `{"v":1,"t":ms,"host":id,"name":"小明","since":ms,"cands":["[2400:…]:51234","192.168.1.5:51235"],"codec":"hevc","mbps":40,"max":4,"viewers":1}` |
+| `join` | host id | `{"v":1,"t":ms,"sid":id,"viewer":id,"name":"小红","cands":[…],"latency":3500,"overhead":50}` |
+| `answer` | sid | `{"v":1,"t":ms,"sid":id,"ok":true,"reason":"","cands":[…]}`（`reason`：`full` / `stopped` / `busy`） |
+
+- 收方先验 `m`（常量时间比较），再解 `p`；payload 里的 `host` / `sid` 必须等于信封所在的 key。
+- `t` 与本机时间相差超过 10 分钟的 `join` 丢弃；主播缓存已处理的 `sid` 10 分钟防重放。
+- `cands` 每项是 `Endpoint` 能解析的 `host:port`（IPv6 带方括号），最多 8 项。
+
+### 8.5 信令 HTTP API（`<s>/v1`）
+
+鉴权头（`/v1/g/...` 全部需要）：
+
+```
+X-Hdrcast-Auth: <ts>.<nonce>.<mac>
+ts    = Unix 毫秒              nonce = b64u(8 个随机字节)（11 字符）
+mac   = b64u(HMAC-SHA256(serverKey, METHOD + "\n" + PATH_AND_QUERY + "\n" + ts + "\n" + nonce + "\n" + b64u(SHA-256(body))))
+```
+
+服务器要求 `|now - ts| ≤ 300 000`，nonce 10 分钟内不得重复（重复 → 401），mac 不符 → 401，组不存在 → 404。
+`PATH_AND_QUERY` 是请求行里的原样目标（例如 `/v1/g/<gid>/live/<host>/joins?after=3&wait=20`）。空 body 的哈希是 SHA-256 of 空串。
+
+| 方法 & 路径 | body | 成功 | 说明 |
+|---|---|---|---|
+| `GET /v1/health` | – | 200 `{"ok":true,"v":1}` | 不需要鉴权 |
+| `PUT /v1/g/{gid}` | `{"serverKey":"<b64u 32 字节>"}` | 201 新建 / 200 已存在且相同 | 先到先得；鉴权头用 body 里的 serverKey 计算（证明持有）；不同 key → 409 |
+| `PUT /v1/g/{gid}/live/{host}` | 信封（live） | 204 | 心跳，每 10 s 一次，30 s 未续期即过期 |
+| `DELETE /v1/g/{gid}/live/{host}` | – | 204 | 下播；同时清空该主播的加入信箱 |
+| `GET /v1/g/{gid}/live` | – | 200 `{"now":ms,"hosts":[{"host":id,"p":…,"m":…,"age_ms":n}]}` | 只含未过期的 |
+| `POST /v1/g/{gid}/live/{host}/join` | 信封（join） | 202 `{"seq":n}` | 主播不在线 → 404；信箱满（32）→ 429 |
+| `GET /v1/g/{gid}/live/{host}/joins?after={seq}&wait={s}` | – | 200 `{"joins":[{"seq":n,"p":…,"m":…}],"next":n}` | long-poll，`wait` ≤ 25；超时返回空数组；`next` = 最大 seq（没有则回显 `after`） |
+| `PUT /v1/g/{gid}/answer/{sid}` | 信封（answer） | 204 | 60 s 过期 |
+| `GET /v1/g/{gid}/answer/{sid}?wait={s}` | – | 200 信封 / 204 超时 | long-poll，`wait` ≤ 25 |
+
+- 错误统一 `{"error":"<短句>"}`：400 格式错、401 鉴权失败、404、405、409、413 body > 8192 字节、429 限流、503 long-poll 满（64 个）、507 组数达上限（500）。
+- 限流：按来源 IP 令牌桶（每秒 10 个、突发 40）。加入信箱每个主播最多 32 条、60 s 过期；每组最多 32 个在播主播。
+- 持久化：只有组注册表（gid → serverKey）写盘（原子替换）；在播 / 信箱 / 应答只在内存。日志不打印 key、mac、body。
+- 服务实现：`signal/hdrcast_signal.py`（仅标准库，Python ≥ 3.6，ThreadingMixIn），systemd 单元 `signal/hdrcast-signal.service`，
+  部署 `signal/deploy.sh`。
+
+### 8.6 打洞控制包（UDP，58 字节）
+
+```
+偏移 长度
+ 0   8   magic  "HDRCP2P1"（ASCII）
+ 8   1   type   1 PUNCH  2 PUNCH_ACK  3 KEEPALIVE  4 BYE
+ 9   1   role   1 主播  2 观众
+10  16   sid    （原始 16 字节）
+26   8   ts     发送方单调时钟微秒，大端 uint64
+34   8   echo   PUNCH_ACK 回显所答 PUNCH 的 ts；其他为 0
+42  16   mac    HMAC-SHA256(punchKey(sid), 字节 0..41) 的前 16 字节
+```
+
+- 长度 ≠ 58、magic 不符、type/role 未知、sid 未知、mac 不符、role 与自己相同 → 不是控制包。
+- 双方拿到对方候选后，每 100 ms 向对方**每个**候选发 PUNCH，最多 15 s；收到有效 PUNCH 立刻回 PUNCH_ACK（发回来源地址）。
+  观众以第一个 PUNCH_ACK 的来源为路径；200 ms 内 IPv6 也确认则优先 IPv6。主播把数据发往观众**最近一次数据的来源**（限已确认地址）。
+- 路径确认后停止 PUNCH；2 s 内没往对方发过任何包就发 KEEPALIVE；15 s 收不到对方任何包判定断开；主动结束发 3 次 BYE。
+- 不是控制包、且来源是本会话已确认地址的数据报按 SRT 数据转发；其他来源一律丢弃。
+
+### 8.7 候选地址
+
+- IPv6：UDP `connect` 到 `[2001:4860:4860::8888]:53`（不发包）得到出口源地址；Windows 上再换成同一网卡上的**非临时**全球地址
+  （SuffixOrigin ≠ Random，DAD Preferred，排除 link-local / ULA / Teredo 2001::/32 / 6to4 2002::/16）。WAN socket **绑在这个具体地址上**，
+  否则 Windows 出站会用临时地址，与公布的候选对不上。
+- IPv4：绑 `0.0.0.0`；候选为出口局域网地址（connect `8.8.8.8:53` 取源地址，只对同一局域网有用），以及（可选）经信令服务器 UDP 回显得到的公网映射。
+- UDP 回显（可选，默认端口 18651）：请求 `"HDRCECHO"` + 16 字节 nonce；回复 `"HDRCECHO"` + nonce + 族（4 或 6，1 字节）+ 端口（大端 2 字节）+ 地址（4 或 16 字节）。
+
+### 8.8 主播端分发
+
+编码 ffmpeg 把 MPEG-TS 写进命名管道 `\\.\pipe\hdrcast-ts-<pid>`；`TsFanOut` 按观众各一条有界队列（约 256 KB，满了清空，
+解码器在下一个关键帧恢复）喂给每个观众自己的 remux 子进程：
+
+```
+ffmpeg -hide_banner -loglevel warning -probesize 65536 -analyzeduration 500000 -f mpegts -i pipe:0
+       -map 0 -c copy -f mpegts -mpegts_flags +resend_headers -muxdelay 0 -muxpreload 0
+       "srt://127.0.0.1:<Y>?mode=listener&passphrase=…&pbkeylen=32&latency=<观众要求>&maxbw=0&inputbw=…&oheadbw=<观众要求>&…"
+```
+
+`HostLink` 为每个会话开一个 `127.0.0.1` 本地 socket 连到 `<Y>`，在 WAN 与子进程之间原样搬运数据报。
+观众端 `ViewerLink` 在 `127.0.0.1:<L>` 上等 mpv（`srt://127.0.0.1:<L>`，caller），搬到主播的已确认地址。
+本机已实测：SRT（含 AES）穿过这种透明转发器正常；一路编码分给两个 remux 子进程，中途加入的观众也能读到 HEVC Main10 / PQ。

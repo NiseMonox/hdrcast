@@ -747,6 +747,9 @@ namespace HdrCast.Receiver.Gui
 
         private void AppendLog(string line)
         {
+            // Everything that reaches the log file or the log box is masked here, whatever its source
+            // ("Copy command" used to write the full URL, passphrase included, straight into the log file).
+            line = SecretRedactor.Redact(line);
             ReceiverLog.Write(line);
             lock (_pendingLog) _pendingLog.Enqueue(line);
         }

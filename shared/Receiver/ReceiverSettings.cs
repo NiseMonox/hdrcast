@@ -92,6 +92,8 @@ namespace HdrCast.Receiver
         [DataMember(Name = "autoCatchUp", Order = 18)] public bool AutoCatchUp { get; set; }
         /// <summary>0 = let mpv/Windows decide; otherwise --target-peak=&lt;nits&gt; (bogus display peaks).</summary>
         [DataMember(Name = "targetPeakNits", Order = 19)] public int TargetPeakNits { get; set; }
+        /// <summary>Listen mode only: the address to bind (empty = IPv4 0.0.0.0; IPv6 needs this PC's own address).</summary>
+        [DataMember(Name = "listenAddress", Order = 20)] public string ListenAddress { get; set; } = "";
 
         public void SetDefaults()
         {
@@ -115,6 +117,7 @@ namespace HdrCast.Receiver
             FfmpegPath = "";
             AutoCatchUp = true;
             TargetPeakNits = 0;
+            ListenAddress = "";
         }
 
         [OnDeserializing]
@@ -124,6 +127,7 @@ namespace HdrCast.Receiver
         public ReceiverSettings Normalize()
         {
             Host = (Host ?? "").Trim();
+            ListenAddress = (ListenAddress ?? "").Trim();
             StreamPath = string.IsNullOrWhiteSpace(StreamPath) ? "screen" : StreamPath.Trim();
             User = (User ?? "").Trim();
             Password ??= "";
@@ -154,9 +158,12 @@ namespace HdrCast.Receiver
         public List<string> Validate()
         {
             var problems = new List<string>();
-            if (Mode != ConnectionMode.DirectListen && string.IsNullOrWhiteSpace(Host))
-                problems.Add("Host is required.");
             if (Port < 1 || Port > 65535) problems.Add("Port must be 1..65535.");
+            else if (Mode == ConnectionMode.DirectListen)
+            {
+                if (!SrtUrl.TryListenHost(ListenAddress, out _, out string listenError)) problems.Add(listenError);
+            }
+            else if (!SrtUrl.TryCallerHost(Host, Port, out _, out string hostError)) problems.Add(hostError);
             if (Mode == ConnectionMode.Relay)
             {
                 if (string.IsNullOrWhiteSpace(StreamPath)) problems.Add("Path is required in relay mode.");
@@ -182,6 +189,7 @@ namespace HdrCast.Receiver
                 Role = SrtRole.Read,
                 Host = Host,
                 Port = Port,
+                ListenAddress = Mode == ConnectionMode.DirectListen ? ListenAddress : null,
                 StreamPath = StreamPath,
                 User = string.IsNullOrEmpty(User) ? null : User,
                 Password = string.IsNullOrEmpty(Password) ? null : Password,

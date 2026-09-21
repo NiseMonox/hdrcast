@@ -10,7 +10,7 @@ namespace HdrCast.Common
     {
         /// <summary>Caller to a MediaMTX relay; credentials travel in the streamid.</summary>
         Relay = 0,
-        /// <summary>mode=listener on 0.0.0.0 (this side needs the UDP port forwarded).</summary>
+        /// <summary>mode=listener on <see cref="SrtUrlOptions.ListenAddress"/> (default 0.0.0.0).</summary>
         DirectListener = 1,
         /// <summary>mode=caller straight to the peer's public address.</summary>
         DirectCaller = 2,
@@ -29,9 +29,15 @@ namespace HdrCast.Common
         public SrtTopology Topology { get; set; } = SrtTopology.Relay;
         public SrtRole Role { get; set; } = SrtRole.Read;
 
-        /// <summary>Relay host or remote peer; ignored (0.0.0.0) for listeners.</summary>
+        /// <summary>Relay host or remote peer (name, IPv4 or IPv6, brackets optional); ignored for listeners.</summary>
         public string Host { get; set; } = "";
         public int Port { get; set; } = 8890;
+
+        /// <summary>
+        /// Listener bind address: null/empty = 0.0.0.0 (IPv4 only). An IPv6 listener must name a concrete address:
+        /// libsrt refuses the IPv6 wildcard "::" unless SRTO_IPV6ONLY is set, and ffmpeg has no option for it.
+        /// </summary>
+        public string? ListenAddress { get; set; }
 
         /// <summary>MediaMTX path (relay only).</summary>
         public string StreamPath { get; set; } = "screen";
@@ -107,9 +113,7 @@ namespace HdrCast.Common
                 throw new ArgumentException("oheadbw must be 5..100", nameof(o));
 
             bool listener = o.Topology == SrtTopology.DirectListener;
-            string host = listener ? ListenerHost : (o.Host ?? "").Trim();
-            if (host.Length == 0) throw new ArgumentException("host is required", nameof(o));
-            if (host.IndexOf(':') >= 0 && !host.StartsWith("[", StringComparison.Ordinal)) host = "[" + host + "]";
+            string host = listener ? ListenHostFor(o.ListenAddress) : CallerHostFor(o.Host, o.Port);
 
             var q = new List<KeyValuePair<string, string>>();
             void Add(string k, string v) => q.Add(new KeyValuePair<string, string>(k, v));
@@ -161,6 +165,76 @@ namespace HdrCast.Common
                 sb.Append(q[i].Key).Append('=').Append(q[i].Value);
             }
             return sb.ToString();
+        }
+
+        /// <summary>The bracketed host for a listener URL; throws for the IPv6 wildcard and for names.</summary>
+        public static string ListenHostFor(string? listenAddress)
+        {
+            if (!TryListenHost(listenAddress, out string host, out string error)) throw new ArgumentException(error, nameof(listenAddress));
+            return host;
+        }
+
+        /// <summary>The bracketed host for a caller URL; a port typed into the host must agree with <paramref name="port"/>.</summary>
+        public static string CallerHostFor(string? host, int port)
+        {
+            if (!TryCallerHost(host, port, out string formatted, out string error)) throw new ArgumentException(error, nameof(host));
+            return formatted;
+        }
+
+        /// <summary>Listener bind address check: empty = 0.0.0.0; an IP literal; never "::" (see <see cref="SrtUrlOptions.ListenAddress"/>).</summary>
+        public static bool TryListenHost(string? listenAddress, out string host, out string error)
+        {
+            host = ListenerHost;
+            error = "";
+            if (string.IsNullOrWhiteSpace(listenAddress)) return true;
+            string text = Endpoint.Normalize(listenAddress);
+            if (text == "::" || text == "[::]")
+            {
+                error = "An SRT listener cannot use '::' (libsrt refuses the IPv6 wildcard and ffmpeg cannot change that). " +
+                        "Enter this PC's IPv6 address, or leave it empty for IPv4.";
+                return false;
+            }
+            if (!Endpoint.TryParse(text, out HostPort? hp, out string why, allowUnspecified: true))
+            {
+                error = "Listen address: " + why + ".";
+                return false;
+            }
+            if (!hp!.IsLiteral)
+            {
+                error = "Listen address must be an IP address of this PC, not a host name.";
+                return false;
+            }
+            if (hp.Port.HasValue)
+            {
+                error = "Listen address must not contain a port; use the Port box.";
+                return false;
+            }
+            host = Endpoint.FormatHost(hp.Host);
+            return true;
+        }
+
+        /// <summary>Caller target check: name / IPv4 / IPv6 (brackets optional); an embedded port must equal <paramref name="port"/>.</summary>
+        public static bool TryCallerHost(string? host, int port, out string formatted, out string error)
+        {
+            formatted = "";
+            error = "";
+            if (string.IsNullOrWhiteSpace(host))
+            {
+                error = "Host is required.";
+                return false;
+            }
+            if (!Endpoint.TryParse(host, out HostPort? hp, out string why))
+            {
+                error = "Host: " + why + ".";
+                return false;
+            }
+            if (hp!.Port.HasValue && hp.Port.Value != port)
+            {
+                error = "Host contains port " + hp.Port.Value + " but the Port box says " + port + ".";
+                return false;
+            }
+            formatted = Endpoint.FormatHost(hp.Host);
+            return true;
         }
 
         /// <summary>
@@ -291,6 +365,8 @@ namespace HdrCast.Common
             else
             {
                 int colon = authority.LastIndexOf(':');
+                if (colon >= 0 && authority.IndexOf(':') != colon)
+                    throw new FormatException("an IPv6 address in a URL must be in [brackets]");
                 hostPart = colon >= 0 ? authority.Substring(0, colon) : authority;
                 portPart = colon >= 0 ? authority.Substring(colon + 1) : "";
             }

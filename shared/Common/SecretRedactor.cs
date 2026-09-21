@@ -4,9 +4,10 @@ using System.Text;
 namespace HdrCast.Common
 {
     /// <summary>
-    /// Removes the SRT passphrase and the MediaMTX credentials from anything that goes into a log file.
-    /// The command line has to carry them, but the log does not: the app invites the user to open the log
-    /// folder and send it when something breaks, and mpv echoes the whole URL on a failed connection.
+    /// Removes the SRT passphrase, the MediaMTX credentials and HdrCast invite codes from anything that goes
+    /// into a log file. The command line has to carry them, but the log does not: the app invites the user to
+    /// open the log folder and send it when something breaks, and mpv echoes the whole URL on a failed connection.
+    /// An invite code carries the group key, so it is as secret as a password.
     /// </summary>
     public static class SecretRedactor
     {
@@ -18,8 +19,36 @@ namespace HdrCast.Common
             if (string.IsNullOrEmpty(text)) return text ?? "";
             string result = RedactQueryValue(text!, "passphrase");
             result = RedactStreamIdCredentials(result);
+            result = RedactInviteCodes(result);
             return result;
         }
+
+        /// <summary>hdrcast:eyJ2Ijox….AbCdEfGh → hdrcast:*** (the prefix stays so the log still says an invite was there).</summary>
+        public static string RedactInviteCodes(string text)
+        {
+            const string needle = "hdrcast:";
+            var sb = new StringBuilder(text.Length);
+            int i = 0;
+            while (i < text.Length)
+            {
+                int at = IndexOfIgnoreCase(text, needle, i);
+                if (at < 0)
+                {
+                    sb.Append(text, i, text.Length - i);
+                    break;
+                }
+                int valueStart = at + needle.Length;
+                int valueEnd = valueStart;
+                while (valueEnd < text.Length && IsInviteChar(text[valueEnd])) valueEnd++;
+                sb.Append(text, i, valueStart - i);
+                if (valueEnd > valueStart) sb.Append(Mask);
+                i = valueEnd;
+            }
+            return sb.ToString();
+        }
+
+        static bool IsInviteChar(char c) =>
+            (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
 
         /// <summary>Replaces the value of <paramref name="key"/>=… up to the next &amp; or whitespace or quote.</summary>
         public static string RedactQueryValue(string text, string key)

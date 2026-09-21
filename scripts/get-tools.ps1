@@ -174,7 +174,7 @@ function Show-FfmpegReport([string] $Exe) {
 function Install-Ffmpeg {
     $ffmpegExe = Join-Path $ToolsDir 'ffmpeg.exe'
     if (-not $Force -and (Test-Ffmpeg $ffmpegExe)) {
-        Write-Ok "ffmpeg.exe is already in tools\ and supports srt — skipping (use -Force to replace it)"
+        Write-Ok "ffmpeg.exe is already in tools\ and supports srt - skipping (use -Force to replace it)"
         Show-FfmpegReport $ffmpegExe
         return
     }
@@ -196,7 +196,7 @@ function Install-Ffmpeg {
     Copy-Tool $unpacked 'ffprobe.exe' (Join-Path $ToolsDir 'ffprobe.exe')
     Remove-Item $zip, $unpacked -Recurse -Force -ErrorAction SilentlyContinue
 
-    if (-not (Test-Ffmpeg $ffmpegExe)) { throw "the downloaded ffmpeg does not support srt:// — wrong build?" }
+    if (-not (Test-Ffmpeg $ffmpegExe)) { throw "the downloaded ffmpeg does not support srt:// - wrong build?" }
     Write-Ok "installed tools\ffmpeg.exe and tools\ffprobe.exe"
     Show-FfmpegReport $ffmpegExe
 }
@@ -216,7 +216,7 @@ function Resolve-MpvAsset {
 function Install-Mpv {
     $mpvExe = Join-Path $ToolsDir 'mpv.exe'
     if (-not $Force -and (Test-Mpv $mpvExe)) {
-        Write-Ok "mpv.exe is already in tools\ and supports srt — skipping (use -Force to replace it)"
+        Write-Ok "mpv.exe is already in tools\ and supports srt - skipping (use -Force to replace it)"
         Write-Ok ((& $mpvExe --version 2>&1 | Select-Object -First 1))
         return
     }
@@ -232,7 +232,7 @@ function Install-Mpv {
     Copy-Tool $unpacked 'mpv.exe' $mpvExe
     Remove-Item $archive, $unpacked -Recurse -Force -ErrorAction SilentlyContinue
 
-    if (-not (Test-Mpv $mpvExe)) { throw "the downloaded mpv does not support srt:// — wrong build?" }
+    if (-not (Test-Mpv $mpvExe)) { throw "the downloaded mpv does not support srt:// - wrong build?" }
     Write-Ok "installed tools\mpv.exe"
     Write-Ok ((& $mpvExe --version 2>&1 | Select-Object -First 1))
 }
