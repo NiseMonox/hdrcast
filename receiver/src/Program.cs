@@ -8,7 +8,7 @@ namespace HdrCast.Receiver
     internal static class Program
     {
         [STAThread]
-        static void Main()
+        static void Main(string[] args)
         {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
@@ -17,7 +17,9 @@ namespace HdrCast.Receiver
             AppDomain.CurrentDomain.UnhandledException += (s, e) => ReceiverLog.Write("crash", (e.ExceptionObject ?? "?").ToString() ?? "?");
 
             ReceiverLog.Write("app", "HdrCast Receiver " + typeof(Program).Assembly.GetName().Version + " starting");
-            Application.Run(new MainForm());
+            // "HdrCastReceiver.exe hdrcast:…" (a shortcut or a script): open and offer to join that group.
+            string? invite = args.Length > 0 && args[0].StartsWith("hdrcast:", StringComparison.OrdinalIgnoreCase) ? string.Join(" ", args) : null;
+            Application.Run(new MainForm(invite));
             ReceiverLog.Write("app", "exit");
         }
 

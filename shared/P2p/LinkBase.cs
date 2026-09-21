@@ -112,7 +112,59 @@ namespace HdrCast.P2p
         {
             if (_disposed) return;
             if (ControlPacket.LooksLikeControl(buf, n)) OnControl(buf, from);
+            else if (EchoProtocol.LooksLikeReply(buf, n)) OnEchoReply(buf, n, from);
             else OnWanData(buf, n, from);
+        }
+
+        // ---- UDP echo (docs/design.md §8.7): what does the internet see as this socket's IPv4 address? ----
+
+        readonly object _echoLock = new object();
+        byte[]? _echoNonce;
+        IPEndPoint? _echoServer;
+        IPEndPoint? _echoResult;
+        ManualResetEventSlim? _echoDone;
+
+        /// <summary>
+        /// Asks the signaling server's UDP echo what address and port it saw for the IPv4 socket (the NAT mapping
+        /// peers must punch towards). Null without an IPv4 socket, or when no answer comes in time.
+        /// </summary>
+        public IPEndPoint? DiscoverPublicIpv4(IPEndPoint echoServer, int timeoutMs)
+        {
+            if (_v4 == null || echoServer.AddressFamily != AddressFamily.InterNetwork) return null;
+            byte[] nonce = GroupKeys.RandomBytes(EchoProtocol.NonceLength);
+            var done = new ManualResetEventSlim(false);
+            lock (_echoLock)
+            {
+                _echoNonce = nonce;
+                _echoServer = echoServer;
+                _echoResult = null;
+                _echoDone = done;
+            }
+            byte[] request = EchoProtocol.BuildRequest(nonce);
+            for (int i = 0; i < 3 && !done.IsSet; i++)
+            {
+                _v4.Send(request, echoServer);
+                done.Wait(Math.Max(100, timeoutMs / 3));
+            }
+            lock (_echoLock)
+            {
+                IPEndPoint? result = _echoResult;
+                _echoNonce = null;
+                _echoDone = null;
+                return result;
+            }
+        }
+
+        void OnEchoReply(byte[] buf, int n, IPEndPoint from)
+        {
+            lock (_echoLock)
+            {
+                if (_echoNonce == null || _echoServer == null || !from.Equals(_echoServer)) return;
+                IPEndPoint? mapped = EchoProtocol.ParseReply(buf, n, _echoNonce);
+                if (mapped == null) return;
+                _echoResult = mapped;
+                _echoDone?.Set();
+            }
         }
 
         /// <summary>A datagram that looks like a control packet (authenticity not yet checked).</summary>

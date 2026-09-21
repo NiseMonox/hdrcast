@@ -31,6 +31,8 @@ namespace HdrCast.Sender
         public string Summary { get; set; } = "";
         /// <summary>Named pipes the capture engine creates and ffmpeg opens; ffmpeg waits until they exist.</summary>
         public string[] PipeNames { get; set; } = new string[0];
+        /// <summary>P2P mode: ffmpeg writes MPEG-TS to stdout (for the fan-out) and -progress to stderr.</summary>
+        public bool TsOnStdout { get; set; }
     }
 
     /// <summary>
@@ -62,6 +64,8 @@ namespace HdrCast.Sender
 
         public event Action<string>? LogLine;
         public event Action<RunnerState, string>? StateChanged;
+        /// <summary>P2P mode: a (re)started ffmpeg's stdout, carrying the MPEG-TS for the fan-out.</summary>
+        public event Action<Stream>? TsStreamStarted;
 
         /// <summary>Job object the children are assigned to, so they die with the GUI (set by the form).</summary>
         public ProcessJob? Job { get; set; }
@@ -74,6 +78,10 @@ namespace HdrCast.Sender
         public int Attempt => _attempt;
         public bool IsRunning => State == RunnerState.Starting || State == RunnerState.Streaming;
 
+        /// <summary>
+        /// Starts a session and returns at once: waiting for the capture engine's pipes can take seconds on a cold
+        /// start, which used to freeze the window ("Not Responding") because it ran on the UI thread.
+        /// </summary>
         public void Start(SendPlan plan, bool autoRestart)
         {
             Stop();
@@ -84,7 +92,8 @@ namespace HdrCast.Sender
                 _userStopped = false;
                 _attempt = 0;
             }
-            Launch();
+            SetState(RunnerState.Starting, "Starting…");
+            ThreadPool.QueueUserWorkItem(_ => Launch());
         }
 
         /// <summary>Stops on a background thread so the UI thread is not blocked by the process waits.</summary>
@@ -150,9 +159,21 @@ namespace HdrCast.Sender
                 capture.StderrLine += line => Emit("[capture] " + line);
                 capture.Exited += code => OnCaptureExited(gen, code);
 
-                ffmpeg = new LineProcess(plan.FfmpegExe, ArgQuote.Join(plan.FfmpegArgv)) { Job = Job };
-                ffmpeg.StdoutLine += line => OnFfmpegProgress(gen, line);
-                ffmpeg.StderrLine += line => Emit("[ffmpeg] " + line);
+                ffmpeg = new LineProcess(plan.FfmpegExe, ArgQuote.Join(plan.FfmpegArgv)) { Job = Job, ReadStdoutLines = !plan.TsOnStdout };
+                if (plan.TsOnStdout)
+                {
+                    // stdout is the stream itself; -progress shares stderr with ffmpeg's log messages
+                    ffmpeg.StderrLine += line =>
+                    {
+                        if (FfmpegProgressParser.IsProgressLine(line)) OnFfmpegProgress(gen, line);
+                        else Emit("[ffmpeg] " + line);
+                    };
+                }
+                else
+                {
+                    ffmpeg.StdoutLine += line => OnFfmpegProgress(gen, line);
+                    ffmpeg.StderrLine += line => Emit("[ffmpeg] " + line);
+                }
                 ffmpeg.Exited += code => OnFfmpegExited(gen, code);
 
                 // SafeCommandLine masks passphrase= and the stream-id credentials: the log folder is meant
@@ -190,6 +211,7 @@ namespace HdrCast.Sender
                 }
                 lock (_gate) { if (gen != _generation || _userStopped) return; }
                 ffmpeg.Start();
+                if (plan.TsOnStdout && ffmpeg.StdoutStream != null) TsStreamStarted?.Invoke(ffmpeg.StdoutStream);
                 SetState(RunnerState.Streaming, "Streaming");
             }
             catch (Exception ex)
@@ -286,7 +308,13 @@ namespace HdrCast.Sender
             lock (_gate)
             {
                 _restartTimer?.Dispose();
-                _restartTimer = new Timer(_ => Launch(), null, RestartDelayMs, Timeout.Infinite);
+                // Disposing a Timer does not stop a callback that is already due, so the callback checks that it
+                // still belongs to this session; otherwise a Stop+Start in that window launched twice.
+                _restartTimer = new Timer(_ =>
+                {
+                    lock (_gate) { if (gen != _generation || _userStopped) return; }
+                    Launch();
+                }, null, RestartDelayMs, Timeout.Infinite);
             }
         }
 

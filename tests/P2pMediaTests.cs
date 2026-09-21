@@ -16,15 +16,18 @@ namespace HdrCast.Tests
 {
     public class TsFanOutTests
     {
+        /// <summary>Counters live outside the Stream (a MarshalByRefObject) so Interlocked can use them.</summary>
+        sealed class Counter { public long Value; }
+
         /// <summary>A sink whose writes block until released: a remux child still waiting for its viewer.</summary>
         sealed class StuckStream : Stream
         {
             public readonly ManualResetEventSlim Release = new ManualResetEventSlim(false);
-            public long Written;
+            public readonly Counter Written = new Counter();
             public override void Write(byte[] buffer, int offset, int count)
             {
                 Release.Wait();
-                Interlocked.Add(ref Written, count);
+                Interlocked.Add(ref Written.Value, count);
             }
             public override void Flush() { }
             public override bool CanRead => false;
@@ -39,8 +42,8 @@ namespace HdrCast.Tests
 
         sealed class CountingStream : Stream
         {
-            public long Written;
-            public override void Write(byte[] buffer, int offset, int count) => Interlocked.Add(ref Written, count);
+            public readonly Counter Written = new Counter();
+            public override void Write(byte[] buffer, int offset, int count) => Interlocked.Add(ref Written.Value, count);
             public override void Flush() { }
             public override bool CanRead => false;
             public override bool CanSeek => false;
@@ -83,8 +86,8 @@ namespace HdrCast.Tests
                 fan.InputEnded += () => ended.Set();
                 fan.Start();
                 Assert.True(ended.Wait(5000));
-                SpinWait.SpinUntil(() => Interlocked.Read(ref fast.Written) == 8 * 1024 * 1024, 5000);
-                Assert.Equal(8 * 1024 * 1024, Interlocked.Read(ref fast.Written));
+                SpinWait.SpinUntil(() => Interlocked.Read(ref fast.Written.Value) == 8 * 1024 * 1024, 5000);
+                Assert.Equal(8 * 1024 * 1024, Interlocked.Read(ref fast.Written.Value));
                 Assert.Equal(0, fan.Stats("fast")!.Value.clears);
                 Assert.True(fan.Stats("stuck")!.Value.clears > 0, "the stuck sink's queue should have been cleared");
                 stuck.Release.Set();

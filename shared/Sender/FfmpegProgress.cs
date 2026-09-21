@@ -31,6 +31,23 @@ namespace HdrCast.Sender.Model
         /// <summary>Raised once per complete block.</summary>
         public event Action<FfmpegProgress>? Block;
 
+        /// <summary>
+        /// True for a -progress line ("key=value", key of [a-z0-9_]). Used when -progress shares stderr with log
+        /// messages (P2P mode), which start with '[' or contain spaces before any '='.
+        /// </summary>
+        public static bool IsProgressLine(string? line)
+        {
+            if (string.IsNullOrEmpty(line)) return false;
+            int eq = line!.IndexOf('=');
+            if (eq <= 0) return false;
+            for (int i = 0; i < eq; i++)
+            {
+                char c = line[i];
+                if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')) return false;
+            }
+            return true;
+        }
+
         /// <summary>Feeds one stdout line. Returns the finished block when the line closed one, else null.</summary>
         public FfmpegProgress? Feed(string? line)
         {

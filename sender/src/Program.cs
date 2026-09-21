@@ -18,7 +18,9 @@ namespace HdrCast.Sender
         [STAThread]
         static int Main(string[] args)
         {
-            if (args.Length == 0) return RunGui();
+            if (args.Length == 0) return RunGui(null);
+            // "HdrCastSender.exe hdrcast:…" (e.g. from a shortcut or a script): open the GUI and offer to join.
+            if (args[0].StartsWith("hdrcast:", StringComparison.OrdinalIgnoreCase)) return RunGui(string.Join(" ", args));
 
             string verb = args[0].ToLowerInvariant();
             var rest = new string[args.Length - 1];
@@ -43,7 +45,7 @@ namespace HdrCast.Sender
             }
         }
 
-        static int RunGui()
+        static int RunGui(string? invite)
         {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
@@ -53,7 +55,7 @@ namespace HdrCast.Sender
                 (s, e) => SenderLog.Write("crash", (e.ExceptionObject ?? "?").ToString() ?? "?");
 
             SenderLog.Write("app", "HdrCast Sender " + typeof(Program).Assembly.GetName().Version + " starting");
-            Application.Run(new Gui.MainForm());
+            Application.Run(new Gui.MainForm(invite));
             SenderLog.Write("app", "exit");
             return ExitCodes.Ok;
         }

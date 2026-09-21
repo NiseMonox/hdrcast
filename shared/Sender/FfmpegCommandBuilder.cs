@@ -38,6 +38,8 @@ namespace HdrCast.Sender.Model
         public string OutputUrl { get; set; } = "";
         /// <summary>Emit -progress pipe:1 so the GUI can read encoder statistics.</summary>
         public bool Progress { get; set; } = true;
+        /// <summary>Where -progress writes: stdout normally; stderr (pipe:2) when stdout carries the stream (P2P mode).</summary>
+        public string ProgressUrl { get; set; } = "pipe:1";
         public string LogLevel { get; set; } = "warning";
     }
 
@@ -70,7 +72,7 @@ namespace HdrCast.Sender.Model
                 "-loglevel", p.LogLevel,
                 "-nostdin",
             };
-            if (p.Progress) { a.Add("-stats_period"); a.Add("1"); a.Add("-progress"); a.Add("pipe:1"); }
+            if (p.Progress) { a.Add("-stats_period"); a.Add("1"); a.Add("-progress"); a.Add(p.ProgressUrl); }
 
             // Video input: raw frames from the capture engine, paced by the engine itself.
             a.Add("-thread_queue_size"); a.Add("1024");

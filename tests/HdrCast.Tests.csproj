@@ -12,5 +12,7 @@
   </ItemGroup>
   <ItemGroup>
     <Compile Include="../shared/**/*.cs" LinkBase="Shared" />
+    <!-- WinForms dialogs shared by the two apps; the Linux test build has no WinForms -->
+    <Compile Remove="../shared/Gui/**/*.cs" />
   </ItemGroup>
 </Project>

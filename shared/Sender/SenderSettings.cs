@@ -15,6 +15,8 @@ namespace HdrCast.Sender.Model
         DirectListen = 1,
         /// <summary>Direct: this PC dials the viewer (mode=caller). The viewer needs the port forward.</summary>
         DirectDial = 2,
+        /// <summary>Group (P2P): friends in the invite's group connect straight to this PC through punched paths.</summary>
+        P2p = 3,
     }
 
     /// <summary>How the output resolution is chosen.</summary>
@@ -103,6 +105,10 @@ namespace HdrCast.Sender.Model
         [DataMember(Name = "rateControl", Order = 39)] public bool RateControl { get; set; }
         /// <summary>Listen mode only: the address to bind (empty = IPv4 0.0.0.0; IPv6 needs this PC's own address).</summary>
         [DataMember(Name = "listenAddress", Order = 40)] public string ListenAddress { get; set; } = "";
+        /// <summary>P2P mode: how many friends may watch at once (each one costs a full stream of upload).</summary>
+        [DataMember(Name = "maxViewers", Order = 41)] public int MaxViewers { get; set; }
+        /// <summary>P2P mode: this line's upload in Mbps, for the "upload needed" warning (0 = unknown).</summary>
+        [DataMember(Name = "uploadMbps", Order = 42)] public int UploadMbps { get; set; }
 
         // ---- tools / behaviour ----
         [DataMember(Name = "ffmpegPath", Order = 50)] public string FfmpegPath { get; set; } = "";
@@ -141,6 +147,8 @@ namespace HdrCast.Sender.Model
             OverheadPercent = 25;
             RateControl = true;
             ListenAddress = "";
+            MaxViewers = 4;
+            UploadMbps = 0;
 
             FfmpegPath = "";
             AutoRestart = false;
@@ -176,6 +184,10 @@ namespace HdrCast.Sender.Model
             Password ??= "";
             Passphrase ??= "";
             if (!Enum.IsDefined(typeof(SendMode), Mode)) Mode = SendMode.Relay;
+            if (MaxViewers < 1) MaxViewers = 1;
+            if (MaxViewers > 16) MaxViewers = 16;
+            if (UploadMbps < 0) UploadMbps = 0;
+            if (UploadMbps > 100000) UploadMbps = 100000;
             return this;
         }
 
@@ -219,6 +231,16 @@ namespace HdrCast.Sender.Model
         public List<string> Validate()
         {
             var problems = new List<string>();
+            if (Mode == SendMode.P2p)
+            {
+                // The group and the per-viewer SRT settings come from the invite and each viewer's join request.
+                if (BitrateMbps < 1 || BitrateMbps > 500) problems.Add("Bitrate must be 1..500 Mbps.");
+                if (Fps < 1 || Fps > 480) problems.Add("Frame rate must be 1..480.");
+                EncoderInfo p2pInfo = EncoderProfiles.Info(Encoder);
+                if (!p2pInfo.MpegTsCompatible)
+                    problems.Add(p2pInfo.DisplayName + " cannot be shared with the group (AV1 has no MPEG-TS mapping). Use HEVC.");
+                return problems;
+            }
             if (Port < 1 || Port > 65535) problems.Add("Port must be 1..65535.");
             else if (Mode == SendMode.DirectListen)
             {
@@ -250,6 +272,7 @@ namespace HdrCast.Sender.Model
 
         public SrtUrlOptions ToSrtOptions()
         {
+            if (Mode == SendMode.P2p) throw new InvalidOperationException("P2P mode has no single SRT URL (one per viewer)");
             return new SrtUrlOptions
             {
                 Topology = Mode == SendMode.Relay ? SrtTopology.Relay

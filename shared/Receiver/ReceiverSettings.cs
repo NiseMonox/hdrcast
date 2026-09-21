@@ -14,6 +14,8 @@ namespace HdrCast.Receiver
         DirectListen = 1,
         /// <summary>Direct: this PC dials the sender (mode=caller).</summary>
         DirectDial = 2,
+        /// <summary>Group (P2P): watch a friend in the invite's group straight from their PC.</summary>
+        P2p = 3,
     }
 
     public enum DisplayMode
@@ -94,6 +96,8 @@ namespace HdrCast.Receiver
         [DataMember(Name = "targetPeakNits", Order = 19)] public int TargetPeakNits { get; set; }
         /// <summary>Listen mode only: the address to bind (empty = IPv4 0.0.0.0; IPv6 needs this PC's own address).</summary>
         [DataMember(Name = "listenAddress", Order = 20)] public string ListenAddress { get; set; } = "";
+        /// <summary>P2P mode: the host (peer id) watched last, preselected in the live list.</summary>
+        [DataMember(Name = "lastHost", Order = 21)] public string LastHost { get; set; } = "";
 
         public void SetDefaults()
         {
@@ -118,6 +122,7 @@ namespace HdrCast.Receiver
             AutoCatchUp = true;
             TargetPeakNits = 0;
             ListenAddress = "";
+            LastHost = "";
         }
 
         [OnDeserializing]
@@ -128,6 +133,7 @@ namespace HdrCast.Receiver
         {
             Host = (Host ?? "").Trim();
             ListenAddress = (ListenAddress ?? "").Trim();
+            LastHost = (LastHost ?? "").Trim();
             StreamPath = string.IsNullOrWhiteSpace(StreamPath) ? "screen" : StreamPath.Trim();
             User = (User ?? "").Trim();
             Password ??= "";
@@ -158,6 +164,12 @@ namespace HdrCast.Receiver
         public List<string> Validate()
         {
             var problems = new List<string>();
+            if (Mode == ConnectionMode.P2p)
+            {
+                if (LatencyMs < 20) problems.Add("Latency must be at least 20 ms.");
+                if (ExpectedBitrateMbps < 1) problems.Add("Expected bitrate must be at least 1 Mbps.");
+                return problems;
+            }
             if (Port < 1 || Port > 65535) problems.Add("Port must be 1..65535.");
             else if (Mode == ConnectionMode.DirectListen)
             {
@@ -179,8 +191,26 @@ namespace HdrCast.Receiver
             return problems;
         }
 
+        /// <summary>oheadbw a P2P viewer asks the host for: cross-border (China) presets get more retransmission headroom.</summary>
+        public int P2pOverheadPercent => LatencyMs >= 3000 ? 50 : 25;
+
+        /// <summary>
+        /// The settings mpv actually uses in P2P mode: a plain caller to the local end of the punched path
+        /// (<see cref="HdrCast.P2p.ViewerLink.LocalPort"/>) with the group's passphrase.
+        /// </summary>
+        public ReceiverSettings ForP2pLocalPort(int localPort, string passphrase) => this with
+        {
+            Mode = ConnectionMode.DirectDial,
+            Host = "127.0.0.1",
+            Port = localPort,
+            User = "",
+            Password = "",
+            Passphrase = passphrase,
+        };
+
         public SrtUrlOptions ToSrtOptions()
         {
+            if (Mode == ConnectionMode.P2p) throw new InvalidOperationException("P2P mode connects through ForP2pLocalPort");
             return new SrtUrlOptions
             {
                 Topology = Mode == ConnectionMode.Relay ? SrtTopology.Relay
