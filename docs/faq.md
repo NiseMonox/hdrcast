@@ -1,8 +1,32 @@
 # HdrCast 常见问题
 
-## 为什么 AV1 只能直连，不能走中继？
+## 连不上怎么办？
 
-ffmpeg（7.1 与 master）的 MPEG-TS 封装器不支持 AV1：会写成 private stream (0x06)，读回来变成 `bin_data`；MediaMTX 的 SRT/MPEG-TS 也只认 H264 / H265 / MPEG 视频和 Opus / AAC / MP3 / AC-3 音频。所以走中继只能 **HEVC Main10**。
+点对点（Group）模式下，接收端状态栏会直接说原因，对照 `docs/network.md` §1.2：
+
+- **"This PC has no IPv6…" / "The host's PC has no IPv6…"**：哪一方没 IPv6 就去哪一方的路由器打开 IPv6（`docs/network.md` §2），
+  <https://test-ipv6.com> 可以自查。手机热点通常自带 IPv6，可以先用热点试一下。
+- **"Both sides have IPv6 but the path is blocked"**：关掉 VPN / 加速器；路由器里有"IPv6 防火墙：阻止所有入站"之类的严格选项就改回默认。
+- **"Not live right now"**：主播还没开播，列表每 10 s 刷新。**"… is full"**：主播的 Max viewers 满了。
+- **"The signaling server cannot be reached"**：本机断网或信令服务器挂了；已经在看的人不受影响。
+- 能连上但**画面一直不出来**：mpv 在等第一个关键帧（最多一个 GOP，默认 2 s）；超过 10 s 看日志里 `[remux …]` 的报错（在主播那边）。
+
+## IPv6 是必须的吗？
+
+点对点靠 IPv6 打洞：IPv6 没有 NAT，双方同时发包就能穿过两边的有状态防火墙，不用任何设置。
+没有 IPv6 时 app 也会试 IPv4（经信令服务器的 UDP 回显拿到公网映射再打洞），但国内家宽、日本 v6プラス / DS-Lite、
+澳洲部分 ISP 的 IPv4 都在运营商级 NAT 后面，基本打不通。你选了"不走腾讯云中转"，所以这种情况会明确提示，不会偷偷绕路。
+同一局域网里的人不需要 IPv6（走局域网 IPv4）。
+
+## 腾讯云服务器会看到什么？
+
+只看到"谁在播"（主播名字、候选地址、码率、观众数）和加入 / 应答消息，全部用组密钥签名；
+看不到组密钥、SRT passphrase，也碰不到视频。服务器被人控制的最坏结果是让人连不上，没法把观众引到别处。详见 `docs/network.md` §6。
+
+## 为什么 AV1 只能直连，不能走中继 / 点对点？
+
+ffmpeg（7.1 与 master）的 MPEG-TS 封装器不支持 AV1：会写成 private stream (0x06)，读回来变成 `bin_data`；MediaMTX 的 SRT/MPEG-TS 也只认 H264 / H265 / MPEG 视频和 Opus / AAC / MP3 / AC-3 音频。
+点对点模式的分发也是按 MPEG-TS 做的（中途加入的观众靠 TS 的重复头恢复）。所以中继和点对点都只能 **HEVC Main10**。
 AV1（`av1_nvenc`，RTX 40 系）只在「直连模式」可选：封装改成 `-f matroska -live 1`（或 NUT）直接 SRT 到对方。代价：Matroska 没有 TS 那样的包级重同步，丢包严重时恢复更慢；观众的 GPU 也要能硬解 AV1 10-bit（RTX 30+/RX 6000+/Intel Arc/12 代+ 核显），软解 dav1d 4K60 很吃 CPU。
 
 ## 观众的 mpv 为什么要先在 Windows 里打开 HDR？
@@ -32,13 +56,12 @@ HEVC 10-bit、60 fps、桌面/游戏混合内容的经验值：
 
 - 文字多的桌面比游戏更需要码率（高频细节），快速运动的游戏 + 高码率才不糊。
 - 4K 显示器分享游戏时，在 GUI 里把输出分辨率降到 2560×1440 通常比 4K 低码率更清楚，也少占一半带宽。
-- 码率上限由**你的上行带宽 ÷ (观众数 × 1.25)** 决定，而不是画质意愿，见下一条。
-- 中继模式下发送端 → LXC 只走局域网，随便用；瓶颈永远在家里的公网上行。
+- 码率上限由**主播的上行带宽 ÷ (观众数 × 1.25)** 决定，而不是画质意愿，见下一条。
 - GOP 保持 1~2 s（默认 2 s）：观众加入时要等到下一个 IDR 才有画面，mpv 在此期间会刷 "Could not find ref with POC"，是正常现象。
 
 ## 上传带宽怎么估？
 
-中继把每个观众各发一份，所以：
+点对点模式由主播的电脑给每个观众各发一份（中继模式由中继发，道理一样），所以：
 
 ```
 上行需求 ≈ 码率 × 观众数 × 1.25（SRT 开销 oheadbw=25 %；中国观众 oheadbw=50 % 时按 ×1.5）
@@ -46,17 +69,19 @@ HEVC 10-bit、60 fps、桌面/游戏混合内容的经验值：
 
 - 40 Mbps × 2 人 = 100 Mbps；40 Mbps × 3 人（含一位中国）≈ 160 Mbps。
 - 先 speedtest 看上行，留 30 % 余量。上行不够就降码率或减少人数，不要把 oheadbw 调低（Haivision 的原话：太低时线路一有丢包"流就会立刻卡死"）。
-- MediaMTX API（LXC 上 `curl -s http://127.0.0.1:9997/v3/srtconns/list | jq`）能看到每条连接的 `mbpsSendRate`、`packetsRetrans`、`packetsReceivedLoss`，是判断带宽是否够的最直接依据。
+- 发送端界面按 Max viewers 估算上行，填了 *my upload* 会在超过 80 % 时标红；状态栏 **Viewers** 显示当前实际需要的上行。
+- 国内家宽上行常见 30~100 Mbps、澳洲 NBN 常见 20~50 Mbps：朋友开播给两三个人看时，码率一般要降到 10~20 Mbps。
 
 ## 画面卡顿 / 断线，按什么顺序排查？
 
-1. 接收端 mpv 日志里有 `No room to store incoming packet` → 接收缓冲不够，GUI 的「码率上限」填大一点（它决定 rcvbuf/ffs），见 `docs/network.md` §3。
-2. 中继 API 里该观众的 `packetsReceivedLoss` / `packetsRetrans` 持续增长 → 线路丢包，给这位观众把 latency 加 500~1000 ms；仍不行就降码率。
+1. 接收端 mpv 日志里有 `No room to store incoming packet` → 接收缓冲不够，GUI 的「码率上限」填大一点（它决定 rcvbuf/ffs），见 `docs/network.md` §4。
+2. 线路丢包：让这位观众把 latency 加 500~1000 ms 再 Play（点对点模式下这个值直接用于主播给他的那条连接）；仍不行就降码率。
+   主播的上行不够时所有观众一起卡：看状态栏 **Viewers** 里的 upload 估算。
 3. 发送端状态栏 `speed` 持续 < 1.0× 或 `drop_frames` 增长 → 编码器跟不上：降分辨率 / 帧率，或质量档改成"速度优先"。
 4. 采集统计 `dropped` 增长而 `captured` 正常 → 管道写入被 ffmpeg 阻塞，一般是上一条的编码器问题。
-5. 中继日志 `reader is too slow` → 已经把 `writeQueueSize` 调到 2048，再出现说明观众线路太差，只能降码率。
+5. （中继模式）中继日志 `reader is too slow` → 已经把 `writeQueueSize` 调到 2048，再出现说明观众线路太差，只能降码率。
 
-## 观众连不上？
+## 中继 / 直连模式的观众连不上？
 
 - 显示"等待推流…"：发送端还没开始，MediaMTX 不会让读者排队，接收端每 3 s 重试是正常的。
 - 立即断开、日志 `invalid passphrase` / `passphrase not provided` → read passphrase 填错了（注意 publish 与 read 是两把不同的 passphrase）。
@@ -74,10 +99,19 @@ ddagrab 能拿到正确的 scRGB FP16 帧，但 ffmpeg 内部没有任何无损�
 
 ## 安全性如何？
 
+点对点模式：
+
+- 邀请码里的 32 字节组密钥是一切的根：派生出信令鉴权 key、消息签名 key、SRT passphrase（AES-256，`pbkeylen=32`）和每个会话的打洞 key。
+  **有邀请码就能进组看**，只发给信得过的人；要踢人就新建一个组、把新邀请码发给其余的人。
+- 视频从主播的 remux 子进程到观众的 mpv 端到端 AES-256；打洞包带 HMAC，未通过验证的来源发来的数据一律丢弃，碰不到主播本机的 ffmpeg。
+- 信令服务器只见签名的元数据（见上面"腾讯云服务器会看到什么"）。
+
+中继模式：
+
 - 两条 SRT 腿都是 AES-256（passphrase 24 位随机，`pbkeylen=32`），载荷加密。
 - SRT 握手本身不加密，streamid 里的用户名/密码是明文——它们只是"低价值令牌"，真正的保密靠 passphrase；不要在别处复用这些密码。
 - MediaMTX 的 API 只绑定 LXC 的 127.0.0.1；HLS 端口有 basic auth；其余协议（RTSP/RTMP/WebRTC）全部关闭。
-- 想更保险就走 Tailscale（`docs/network.md` §1.4），完全不开公网端口。
+- 想更保险就走 Tailscale（`docs/network.md` §8.4），完全不开公网端口。
 
 ## 延迟能再低一点吗？
 

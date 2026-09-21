@@ -1,111 +1,109 @@
 # HdrCast
 
-把 Windows 桌面（含 HDR10 与桌面音频）以 10~100 Mbps 的高码率"推流式"分享给中国 / 日本 / 澳大利亚的朋友，延迟 1.5~5 s，画面不糊不卡。私人用，不走任何第三方平台：中继只跑在家里的 Linux 容器上。
+把 Windows 桌面（含 HDR10 与桌面音频）以 10~100 Mbps 的高码率"推流式"分享给中国 / 日本 / 澳大利亚的朋友，延迟 1.5~5 s，画面不糊不卡。私人用，**点对点**：谁都能开播，同组的朋友直接从主播的电脑收流，不需要中继、不需要公网 IPv4、不用改路由器。
 
-- **HDR10 全链路**：DXGI 桌面复制 → 自研 D3D11 compute shader（scRGB → PQ / BT.2020 / P010）→ NVENC HEVC Main10 → SRT（AES-256）→ MediaMTX 中继 → mpv HDR 直通。SDR 观众由 mpv 做色调映射，SDR 桌面自动走 NV12。
-- **码率、帧率、分辨率随便选**：10~100 Mbps、30/60/120 fps、原生 / 1440p / 1080p；支持 hevc_nvenc / hevc_amf / hevc_qsv / libx265，直连模式还可选 AV1。
-- **多人同时看**：MediaMTX 给每位观众各发一份；推流与拉流分别鉴权、分别加密。
+- **点对点（IPv6 打洞）**：双方经信令服务器交换地址后同时给对方发包，两边路由器和 Windows 防火墙都会放行这条流。信令服务器只转几百字节的签名元数据（谁在播、候选地址），**视频从不经过它**。
+- **一次邀请码，永久可用**：主播建组后发一段 `hdrcast:…` 给朋友，朋友复制整条消息打开任一 app 就会提示加入，贴一次两个 app 都配好。
+- **HDR10 全链路**：DXGI 桌面复制 → 自研 D3D11 compute shader（scRGB → PQ / BT.2020 / P010）→ NVENC HEVC Main10 → SRT（AES-256，每位观众单独重传）→ mpv HDR 直通。SDR 观众由 mpv 做色调映射。
+- **码率、帧率、分辨率随便选**：10~100 Mbps、30/60/120 fps、原生 / 1440p / 1080p；支持 hevc_nvenc / hevc_amf / hevc_qsv / libx265。
+- **多人同时看**：一路编码，按观众各起一个只转封装的 ffmpeg（不重编码），每人按自己地区的延迟重传；谁卡了只影响他自己。
 - **桌面音频**：WASAPI loopback，不用虚拟声卡；与视频同一时钟。
-- **两个绿色 exe**：`HdrCastSender.exe`（发送端 GUI + 采集引擎）与 `HdrCastReceiver.exe`（观众 GUI），.NET Framework 4.8，Windows 10/11 直接跑；ffmpeg 与 mpv 另行下载放旁边即可。
+- **两个绿色 exe**：`HdrCastSender.exe`（开播）与 `HdrCastReceiver.exe`（观看），.NET Framework 4.8，Windows 10/11 直接跑；ffmpeg 与 mpv 用 `scripts\get-tools.cmd` 一键下载。
 
-## 架构
+> 现状：点对点整条链路（邀请码、信令、打洞、多观众分发、HEVC Main10 PQ）已在 Linux 上用模拟的有状态防火墙端到端测过；
+> **Windows 上的运行时（采集、GPU shader、WASAPI、真实路由器打洞）还没实测**，步骤见 [docs/windows-checklist.md](docs/windows-checklist.md)。
+
+## 架构（点对点模式）
 
 ```
-┌──────────────── 发送端 Windows PC ─────────────────┐
-│ HdrCastSender.exe (GUI)                             │
-│   ├─ HdrCastSender.exe capture   采集引擎（同一 exe）│
-│   │     DXGI 桌面复制 (scRGB FP16 / BGRA8)          │
-│   │     → D3D11 compute shader → P010 (HDR) / NV12  │
-│   │     → 命名管道 \\.\pipe\hdrcast-video            │
-│   │     WASAPI loopback → f32le 48k → hdrcast-audio  │
-│   └─ ffmpeg.exe   只做编码 + MPEG-TS + SRT 发送      │
-│         hevc_nvenc main10 / aac 192k                 │
-└──────────────────────┬──────────────────────────────┘
-                       │ SRT (AES-256, 800 ms, 局域网)
-                       ▼
-┌────── 家里的 LXC 192.168.1.201 (Docker) ──────┐
-│ MediaMTX 1.21  路径 screen                     │  路由器转发 8890/udp（可选 8888/tcp HLS）
-│ sender 只能 publish / viewer 只能 read          │
-│ publish 与 read 各一把 passphrase              │
-└──────────┬──────────────┬─────────────────────┘
-           │ SRT 1.5 s     │ SRT 2~3.5 s
-           ▼              ▼
-   观众 A（日本）      观众 B/C（澳洲 / 中国）
-   HdrCastReceiver.exe → mpv.exe (gpu-next + d3d11, HDR 直通或色调映射)
+┌──────────────── 主播 Windows PC ─────────────────────────────┐
+│ HdrCastSender.exe                                             │
+│   采集引擎 (DXGI + D3D11 shader + WASAPI) → 命名管道          │
+│   → ffmpeg 编码 HEVC Main10 → MPEG-TS (stdout)                │
+│   → 分发器：每位观众一个 remux ffmpeg（-c copy，SRT，127.0.0.1）│
+│   → HostLink：[本机 IPv6]:端口 ⇄ 打洞 ⇄ 各位观众               │
+└───────────────┬───────────────────────────────┬──────────────┘
+                │ IPv6 直连（打洞）                │ IPv6 直连（打洞）
+                ▼                               ▼
+   HdrCastReceiver.exe → mpv（日本）   HdrCastReceiver.exe → mpv（中国 / 澳洲）
+
+   腾讯云 hdrcast-signal（signal/）：只存"谁在播 + 候选地址"，全部用组密钥签名；不转视频
 ```
 
-## 快速开始：发送端（你）
+- 只要**双方至少有一方的 IPv6 能用**并且另一方也有 IPv6 就能连（IPv6 没有 NAT，打洞几乎总能成功）；IPv4 打洞只是额外尝试。
+- 主播要为每位观众各上传一份：3 人 × 40 Mbps ≈ 150 Mbps 上行（含重传余量）。发送端界面会估算并在超过你填的上行带宽时提醒。
+- 旧的"中继"与"直连"模式仍在（下拉框里），适合有公网 IP 或自建 MediaMTX 的人，见 [docs/network.md](docs/network.md)。
 
-1. **装工具**：双击 `scripts\get-tools.cmd`，它会把 ffmpeg 和 mpv 下载到 `tools\` 并自检（只要发送端就 `get-tools.cmd sender`）。
-   手动装也行：<https://www.gyan.dev/ffmpeg/builds/> 的 **release full** 版，把 `bin\ffmpeg.exe`（顺便 `ffprobe.exe`）放到 `HdrCastSender.exe` 旁边、`tools\` 子目录或 PATH 里。
-2. **在 LXC 上启动中继**：
-   ```bash
-   cd /projects/hdrcast
-   relay/setup.sh      # 生成密码与 passphrase，打印给两端填的值（保存在 relay/.env）
-   relay/up.sh         # docker compose 启动 MediaMTX；relay/logs.sh 看日志，relay/down.sh 停止
-   ```
-   路由器把 **UDP 8890** 转发到 `192.168.1.201`；宿主执行一次 `sysctl -w net.core.rmem_max=16777216`（脚本会提醒）。想先在本机验证整条链路：`relay/selftest.sh`（合成 HDR10 → 中继 → ffprobe/mpv 全自动校验）。
-3. **运行 `HdrCastSender.exe`**：选显示器（HDR 状态会显示）、码率（预设 20/40/80 Mbps）、帧率；目标选"中继"，填 `192.168.1.201:8890`、用户 `sender` + 密码、**publish** passphrase，延迟 800 ms；点开始。状态栏显示采集 fps / 编码 fps / 码率 / 丢帧。
+## 快速开始：开播的人
 
-不想用 GUI 时：`scripts\send-example.cmd` 是同一条 ffmpeg 命令的裸奔版（先在第二个窗口起采集引擎）。
+1. **装工具**：双击 `scripts\get-tools.cmd`（只开播就 `get-tools.cmd sender`，会下载 ffmpeg；只看就 `viewer`，下载 mpv）。
+2. **运行 `HdrCastSender.exe`**，右上 **Mode** 选 **Group: friends watch straight from this PC (P2P)**。
+3. **Create group…**：起个组名和你的名字，邀请码自动复制到剪贴板。把它发到微信 / LINE / Discord 群里（**只发给信得过的人**：有码就能看）。
+   朋友已经发过你邀请码的话，直接复制那条消息、点 **Paste invite**（或者打开 app 时它会自己提示）。
+4. 选显示器、码率、**Max viewers**（可以顺手填 *my upload*，你家上行 Mbps），点 **Start**。
+   状态栏 **Viewers** 一行显示谁在看、走 IPv6 还是 IPv4、往返延迟，以及当前需要的上行。
 
-## 快速开始：观众（朋友）
+## 快速开始：看的人
 
 英文版给朋友看：[README.en.md](README.en.md)。
 
-1. **装 mpv**：双击 `scripts\get-tools.cmd`（或命令行 `get-tools.cmd viewer`）。手动装就下 <https://github.com/zhongfly/mpv-winbuild/releases> 或 <https://github.com/shinchiro/mpv-winbuild-cmake/releases> 的 `mpv-x86_64-*.7z`（必须带 libsrt），把 `mpv.exe` 放到 `HdrCastReceiver.exe` 旁边或 `tools\`。
-2. **运行 `HdrCastReceiver.exe`**：粘贴你发给他的 主机（公网 IP / DDNS）、端口 8890、用户 `viewer` + 密码、**read** passphrase；地区选 日本 1500 ms / 澳洲 2000 ms / 中国 3500 ms；点连接。推流没开始时会显示"等待推流…"并自动重试。
-3. **HDR 显示器**先在 Windows 里打开 HDR（`Win + Alt + B`），mpv 才能直通；SDR 显示器选"SDR 色调映射"。全屏按钮 = 真 HDR 全屏。
+1. **装 mpv**：双击 `scripts\get-tools.cmd viewer`（或 `get-tools.cmd`，两个都装）。
+2. **复制朋友发来的整条邀请消息**，打开 `HdrCastReceiver.exe`：会弹出"要加入这个组吗"，点是、填你的名字。没弹的话点 **Paste invite**。
+3. Mode 自动切到 **Group**，**Watch** 列表里是正在直播的朋友（每 10 秒刷新）。**Latency** 按你在哪选：日本 1500 / 澳洲 2000 / 中国 3500 ms。点 **Play**。
+4. 连不上时状态栏会直接说原因，比如"这台电脑没有 IPv6"或"主播没有 IPv6"。先去 <https://test-ipv6.com> 看看自己的 IPv6，见 [docs/faq.md](docs/faq.md)。
+5. **HDR 显示器**先在 Windows 里打开 HDR（`Win + Alt + B`）；SDR 显示器选"SDR tone-map"。
 
-裸奔版：`scripts\receive-example.cmd`。浏览器兜底：`http://viewer:密码@主机:8888/screen`（SDR 观感看浏览器）。
+## 信令服务器（只需部署一次）
+
+`signal/` 是一个只用 Python 标准库的小服务，跑在腾讯云上（默认 `http://101.43.23.94:18650`），部署方法见 [signal/README.md](signal/README.md)：
+`signal/deploy.sh --ssh ubuntu@101.43.23.94`，然后在腾讯云安全组放行 **TCP 18650** 和 **UDP 18651**（后者是 IPv4 打洞用的地址回显，可选）。
+它看不到任何密码或组密钥，也伪造不了地址（所有消息用组密钥签名）；挂了的话，已经在看的人不受影响，只是新的人加入不了。
 
 ## 工具下载
 
 | 工具 | 谁需要 | 下载 | 备注 |
 |---|---|---|---|
-| ffmpeg（full） | 发送端 | <https://www.gyan.dev/ffmpeg/builds/> | essentials 也带 libsrt；BtbN gpl 构建亦可 |
-| mpv | 观众 | <https://github.com/shinchiro/mpv-winbuild-cmake/releases> / <https://github.com/zhongfly/mpv-winbuild/releases> | 两家都带 libsrt；mpv.io 官网列表里的也是这两家 |
-| Docker + Compose | 中继（LXC） | 已装 | 镜像 `bluenviron/mediamtx:1.21.0` |
+| ffmpeg（full） | 开播的人 | <https://www.gyan.dev/ffmpeg/builds/> | 需要 libsrt；BtbN gpl 构建亦可 |
+| mpv | 看的人 | <https://github.com/shinchiro/mpv-winbuild-cmake/releases> / <https://github.com/zhongfly/mpv-winbuild/releases> | 两家都带 libsrt |
 | .NET Framework 4.8 | 两端 | Windows 自带 | 无需安装 |
+| Python 3 | 信令服务器 | Ubuntu 自带 | 只用标准库 |
 
-`scripts\get-tools.cmd` 一键下载上面两个（`sender` / `viewer` / `both`，加 `force` 重新下载）。零依赖：ffmpeg 是 zip 用 Windows 自带解压，mpv 是 7z 用 Windows 自带的 `tar.exe`（libarchive），都不行时自动取官方 7zr.exe。
-
-`scripts\check-tools.cmd` 会检查 ffmpeg / mpv 是否找到、hevc_nvenc / av1_nvenc / hevc_amf / hevc_qsv 是否可用、mpv 是否支持 `srt://`。
+`scripts\get-tools.cmd` 一键下载 ffmpeg / mpv（`sender` / `viewer` / `both`，加 `force` 重新下载）；`scripts\check-tools.cmd` 检查编码器和 `srt://` 支持。
 
 ## 目录结构
 
 ```
 sender/      HdrCastSender.exe：WinForms GUI + capture 采集引擎（DXGI / D3D11 / WASAPI）+ list-outputs
 receiver/    HdrCastReceiver.exe：WinForms GUI，启动 mpv.exe 并通过 JSON IPC 显示状态
-shared/      平台无关逻辑（SRT URL / 缓冲计算、ffmpeg -progress 与 mpv IPC 解析、设置模型、编码器档位），同时编进两个 exe 与测试
-tests/       xunit（net10，在 Linux 上跑）
-relay/       MediaMTX：docker-compose.yml、mediamtx.template.yml、setup.sh / up.sh / down.sh / logs.sh、selftest.sh
-scripts/     Windows 批处理：get-tools（一键装 ffmpeg/mpv）/ check-tools / send-example / receive-example / dump-check
-docs/        design.md（规格）、network.md、windows-checklist.md、faq.md、obs-alternative.md、research/（调研报告 JSON）
+shared/      平台无关逻辑，同时编进两个 exe 与测试：
+               Common（地址解析、SRT URL、日志脱敏）、Group（组、邀请码、密钥、签名消息）、
+               P2p（打洞、HostLink/ViewerLink、分发、信令客户端、P2pHost/ViewerSession）、Gui（两个 app 共用的对话框）
+signal/      信令服务器（Python 标准库）+ systemd 单元 + deploy.sh
+tests/       xunit（net10，在 Linux 上跑，含打洞 / 真 ffmpeg / 真信令服务器的端到端测试）；vectors/ 是协议 golden 向量
+relay/       可选：MediaMTX 中继（旧的中继模式）
+scripts/     Windows 批处理：get-tools / check-tools / send-example / receive-example / dump-check
+docs/        design.md（规格，§8 是点对点协议）、network.md、windows-checklist.md、faq.md、obs-alternative.md
 build.sh     在 Linux 上构建并打包 dist/HdrCast-<版本>/
 ```
 
 ## 构建
 
-Linux（本机：Debian 13 + .NET 10 SDK）或 Windows 都可以；Linux 上用 `Microsoft.NETFramework.ReferenceAssemblies` 交叉构建 net48 WinForms，已验证。
-
 ```bash
-./build.sh              # dotnet build 两个 exe (Release) → dotnet test → 打包 dist/HdrCast-0.1.0/
+./build.sh              # dotnet build 两个 exe (Release) → dotnet test → 打包 dist/HdrCast-<版本>/
 ./build.sh --no-test    # 跳过测试
-./build.sh --e2e        # 额外跑 docker 中继回环：用代码生成的 URL 与 ffmpeg 参数推到 MediaMTX 再读回校验
+./build.sh --e2e        # 额外跑 docker 中继回环（只和旧的中继模式有关）
+python3 -m unittest discover -s signal/tests    # 信令服务器自己的测试
 ```
 
-产物 `dist/HdrCast-<版本>/`：两个 exe（及可能的 DLL）、`relay/`（不含密码文件）、`scripts/`、`docs/`、README、LICENSE、空的 `tools/`。把整个目录复制到 Windows，ffmpeg.exe / mpv.exe 放进 `tools\` 即可。
-
-单独构建：`dotnet build sender/HdrCast.Sender.csproj -c Release`，`dotnet test tests/HdrCast.Tests.csproj`。
+产物 `dist/HdrCast-<版本>/`：两个 exe、`scripts/`、`docs/`、`signal/`、`relay/`（不含密码文件）、README、LICENSE、空的 `tools/`。
 
 ## 文档
 
-- [docs/design.md](docs/design.md) —— 设计定稿，所有参数的来源。
-- [docs/network.md](docs/network.md) —— 三种拓扑、地区延迟预设的理由、缓冲公式、防火墙、为何不用腾讯云、上行带宽估算。
-- [docs/windows-checklist.md](docs/windows-checklist.md) —— Windows 上逐步验证（list-outputs → --selftest → dump → 推流 → 观众）及预期输出。
-- [docs/faq.md](docs/faq.md) —— AV1 为何只能直连、mpv 与 Windows HDR、SDR 屏、码率与带宽、排障顺序。
-- [docs/obs-alternative.md](docs/obs-alternative.md) —— 用 OBS 当备用发送端（未实测）。
+- [docs/design.md](docs/design.md) —— 设计定稿；§8 是点对点协议（邀请码、密钥派生、签名、信令 API、打洞包）。
+- [docs/network.md](docs/network.md) —— 点对点怎么穿过防火墙、谁需要什么、上行带宽、IPv6 自查、旧的中继 / 直连模式。
+- [docs/faq.md](docs/faq.md) —— 连不上怎么办（按状态栏提示查）、HDR 与 SDR、码率与带宽。
+- [docs/windows-checklist.md](docs/windows-checklist.md) —— Windows 上逐步验证及预期输出。
+- [signal/README.md](signal/README.md) —— 信令服务器部署。
 
 ## 许可
 

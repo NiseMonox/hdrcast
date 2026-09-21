@@ -10,7 +10,8 @@ Linux 这边能验证的（`dotnet build` / `dotnet test` / `relay/selftest.sh`�
 - [ ] **工具一键装**：双击 `scripts\get-tools.cmd`（两个都装）。它下载 BtbN 的 ffmpeg win64-gpl（含 nvenc/amf/qsv、libsrt、libplacebo、ddagrab）和 zhongfly 的 mpv（含 libsrt）到 `HdrCast\tools\`，装完自己验证 srt 支持并列出可用编码器。已经装过会跳过，`get-tools.cmd force` 强制重下。
 - [ ] 手动装（脚本失败时）：ffmpeg 取 <https://www.gyan.dev/ffmpeg/builds/> 的 **release full**，mpv 取 <https://github.com/zhongfly/mpv-winbuild/releases> 的 `mpv-x86_64-*.7z`，把 `ffmpeg.exe` / `ffprobe.exe` / `mpv.exe` 放进 `HdrCast\tools\`。
 - [ ] .NET Framework 4.8 是 Windows 10 1903+/11 自带的，不用装。
-- [ ] 中继：LXC 上已运行 `relay/setup.sh` 与 `relay/up.sh`（见 §5）。
+- [ ] 点对点：信令服务器已部署（`signal/deploy.sh`，腾讯云安全组放行 TCP 18650 / UDP 18651），`curl http://101.43.23.94:18650/v1/health` 返回 ok。
+- [ ] 中继模式（可选）：LXC 上已运行 `relay/setup.sh` 与 `relay/up.sh`（见 §6）。
 
 ## 1. `scripts\check-tools.cmd`
 
@@ -74,7 +75,32 @@ idx  device         name                      size        pos          hz     hd
 - [ ] 把 `FORMAT` 改成 `nv12` 再跑一次（可先关闭 Windows HDR），`frame1-sdr.png` 应同样正确。
 - [ ] 结束后删掉 `scripts\dump\frames.*`。
 
-## 5. 中继（在 LXC 上）
+## 5. 点对点（Group 模式，默认）
+
+先在两台自己的电脑上测（同一局域网即可），再测外网。
+
+- [ ] 发送端 Mode 选 **Group: friends watch straight from this PC (P2P)** → **Create group…** → 起名 → 弹框说邀请已复制；
+      粘贴出来是一行说明加一行 `hdrcast:…`（约 200 字符）。`%APPDATA%\HdrCast\group.json` 已生成。
+- [ ] 另一台电脑复制这条消息后打开 `HdrCastReceiver.exe`：弹"要加入吗" → 是 → 填名字 → Mode 自动变成 **Group**。
+      点"否"的话，同一个邀请不应再问第二次。
+- [ ] 发送端 **Start**：日志有 `[p2p] candidates: [2400:…]:NNNNN, 192.168.x.x:NNNNN`。IPv6 必须是**稳定地址**：
+      PowerShell 里 `Get-NetIPAddress -AddressFamily IPv6 | ft IPAddress,PrefixOrigin,SuffixOrigin,AddressState`，
+      日志里的地址那一行 SuffixOrigin 应为 **Link**（不是 Random = 临时地址）。
+- [ ] 信令服务器的 UDP 18651 放行后，日志还有 `[p2p] public IPv4 mapping: …`（没有也不影响 IPv6）。
+- [ ] 状态栏 **Viewers**：`Live in "…" - 0 viewers | nobody yet`。
+- [ ] 第一次 Start 可能弹 Windows 防火墙"允许访问"：**先点取消**，看观众还能不能连上（记录结果：打洞理论上不需要放行），再点允许。
+- [ ] 接收端 **Watch** 列表 10 s 内出现主播 → **Play** → 状态 `Connected to …（IPv6 [2400:…]:NNNNN, N ms）` → mpv 出画面；
+      发送端 **Viewers** 显示这位观众（IPv6 / RTT）。
+- [ ] **外网**：笔记本连手机热点（确认 test-ipv6.com 有 IPv6），不改任何路由器设置，Play 能连上。这是打洞穿过家里路由器
+      （如 光BBユニット）的关键一步。
+- [ ] 关掉 mpv 窗口：约 10 s 内自动重连出画面（主播端日志会看到那位观众的 remux 子进程重启）。
+- [ ] 发送端 **Stop**：观众显示 `The stream ended - waiting …`；再 **Start**，观众自动重新接上。
+- [ ] 任务管理器里结束发送端的 ffmpeg.exe：自动重启后观众几秒内恢复，不需要重新 Play。
+- [ ] **Max viewers** 设 1：第二个观众显示 `… is full`。
+- [ ] 上行估算：码率 40、Max viewers 3、my upload 100 → 提示标红。
+- [ ] 朋友（中国 / 澳洲）按 `README.en.md` 操作；连不上时把状态栏原话和两边 test-ipv6.com 的结果记下来。
+
+## 6. 中继（在 LXC 上，可选）
 
 ```
 cd /projects/hdrcast
@@ -89,7 +115,7 @@ relay/logs.sh             # 看日志，Ctrl+C 退出
 - [ ] 路由器：UDP 8890 → 192.168.1.201。
 - [ ] `docker ps` 里 `mediamtx-relay` 是 `Up`；日志里有 `[SRT] started with listener on :8890 (UDP/SRT)` 且没有 `ERR`。
 
-## 6. GUI 推流到中继
+## 7. GUI 推流到中继（中继模式，可选）
 
 运行 `HdrCastSender.exe`：
 
@@ -110,7 +136,7 @@ relay/logs.sh             # 看日志，Ctrl+C 退出
 - [ ] 把 ffmpeg 进程在任务管理器里杀掉：GUI 应提示异常退出并停止采集进程；勾选"自动重连"后 3 s 内重新开始。
 - [ ] "复制 ffmpeg 命令"得到的命令与 `scripts\send-example.cmd` 结构一致，可粘贴到终端单独跑。
 
-## 7. 观众端（先自己测）
+## 8. 观众端（先自己测，中继模式）
 
 同一台 PC（第二块显示器）或局域网里另一台 PC，运行 `HdrCastReceiver.exe`：
 
@@ -127,19 +153,19 @@ relay/logs.sh             # 看日志，Ctrl+C 退出
 - [ ] 关闭 mpv 窗口 / 点断开：mpv 进程消失。
 - [ ] 「用 ffmpeg 拉流」兜底模式也能出画面（把 mpv 的 srt 支持想成坏掉时的备胎）。
 
-## 8. 外网观众
+## 9. 外网观众（中继模式）
 
-- [ ] 用手机热点连接一台笔记本，按 §7 填公网 IP，能出画面 → 端口转发正确。
-- [ ] 朋友按 `README.en.md` 操作；他那边 `docs/network.md` §2 的地区预设。跨境（中国）若卡顿，先把 latency 提到 4000~5000 ms 再降码率。
+- [ ] 用手机热点连接一台笔记本，按 §8 填公网 IP，能出画面 → 端口转发正确。
+- [ ] 朋友按 `README.en.md` 操作；他那边 `docs/network.md` §3 的地区预设。跨境（中国）若卡顿，先把 latency 提到 4000~5000 ms 再降码率。
 - [ ] LXC `srtconns/list` 里每位观众的 `msSendTsbPdDelay` 等于他填的 latency，`packetsRetrans` 有少量是正常的，`packetsReceivedLoss` 应为 0（那是发送端那条腿）。
 
-## 9. 4K60 压力
+## 10. 4K60 压力
 
 - [ ] 输出分辨率改"原生"（3840×2160）、80 Mbps、60 fps 推 10 分钟：采集 fps 稳定 60，`gpu_ms` < 8，编码 speed ≥ 1.0x，GPU 占用（任务管理器 Video Encode + 3D）不影响正在玩的游戏帧率太多。
 - [ ] 120 fps 档位：采集 fps 能到 120 说明 DXGI 帧率跟得上；否则退回 60。
 - [ ] 观众端 4K60 HEVC 10-bit 的 d3d11va 解码在 RTX 30/40、RX 6000+、Intel Arc 上没问题；老机器降到 1440p。
 
-## 10. 只有在分享「旋转过的显示器」时才需要看
+## 11. 只有在分享「旋转过的显示器」时才需要看
 
 shader 里 90° 与 270° 的映射（`desk_to_src`）互为逆运算，DXGI 文档没写清 `DXGI_MODE_ROTATION_ROTATE90` 到底对应哪一个，只能实测：
 
@@ -147,7 +173,7 @@ shader 里 90° 与 270° 的映射（`desk_to_src`）互为逆运算，DXGI 文
 - [ ] 画面方向正确即可；若上下颠倒 90°（即转了 180° 的样子），把 `shared/Capture/ConvertShaderSource.cs` 里 `desk_to_src` 的 `rotation == 1` 与 `rotation == 3` 两行对调。
 - 180° 那条已确认正确；不旋转的显示器走 `FlagExact` 路径，与此无关。
 
-## 10. 出问题时看哪里
+## 12. 出问题时看哪里
 
 - 日志：`%APPDATA%\HdrCast\logs\`（sender / receiver / capture / ffmpeg / mpv 分文件，按天）。
 - 配置：`%APPDATA%\HdrCast\sender.json`、`receiver.json`（删掉即恢复默认）。

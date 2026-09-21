@@ -1,4 +1,4 @@
-# HdrCast 设计定稿（v0.1）
+# HdrCast 设计定稿（v0.2：点对点）
 
 > 本文是实装的唯一规格来源。所有参数都有来源：`docs/research/` 下的调研报告（读源码 + 本机实测）。
 > 与本文冲突的实现以本文为准；本文有错就改本文。
@@ -8,7 +8,9 @@
 - 用户：本人（东京，Windows 11 + RTX 4090 + AW3225QF 4K HDR）和朋友们（中国 / 日本 / 澳大利亚，可能同时观看）。
 - 码率可自定义（10~100 Mbps）；画面不糊、不卡；延迟可以大（1~5 s，"推流式"而非远程桌面式）。
 - HDR10 全链路；带桌面音频。
-- 不使用腾讯云服务器；中继只放家里的 LXC（192.168.1.201）。
+- v0.2（2026-09）：**不依赖用户家的 LXC**，做成点对点：谁都能开播，同组朋友直接从主播电脑收流（§1.3、§8）。
+  腾讯云服务器只做信令（几百字节的签名元数据），**不转视频**；连不上时不中转，只提示原因。
+- 很多人没有公网 IPv4，但大多有 IPv6：点对点优先走 IPv6 打洞，IPv4 打洞只是额外尝试。配对用邀请码，不手输地址。
 
 ## 1. 架构
 
@@ -39,6 +41,8 @@
 └─────────────────────────────────────────┘
 ```
 
+上图是 v0.1 的中继模式（仍保留为可选模式，见 §4）。默认的点对点模式见 §1.3。
+
 ### 1.1 为什么采集不用 ffmpeg 的 ddagrab
 
 ddagrab 本身能拿到正确标注的 scRGB FP16 D3D11 帧，但 ffmpeg **没有任何无损桥梁**把打包 FP16 送进 zscale / libplacebo：
@@ -50,6 +54,25 @@ zscale 不收打包浮点；Vulkan / CUDA 不能导入 D3D11 纹理；libplacebo
 
 ffmpeg（7.1 与 master）的 mpegts 封装器和 MediaMTX 都**不支持 AV1-in-MPEG-TS**（本机实测：写成 private stream，读回是 bin_data）。
 走中继就只能 HEVC Main10。AV1 只在「直连模式」（无中继，`-f matroska -live 1` over SRT）可选。
+
+### 1.3 点对点模式（v0.2 默认）
+
+```
+主播 PC                                                                     观众 PC
+ 采集引擎 → ffmpeg 编码 → MPEG-TS(stdout) → SwitchableStream → TsFanOut
+    → 每位观众一个 remux ffmpeg（-c copy，SRT listener 127.0.0.1:Y，观众的 latency/oheadbw）
+    → HostLink（WAN socket：[稳定 IPv6]:P、0.0.0.0:P4） ⇄ 打洞后的 UDP 路径 ⇄ ViewerLink ⇄ mpv（srt://127.0.0.1:L）
+        │                                                                    │
+        └──── 签名的 live / join / answer ──── 腾讯云 hdrcast-signal ────────┘
+```
+
+- 为什么这样分：SRT 本身端到端不变（AES、重传、按观众的 latency），HdrCast 只在两端各加一个透明 UDP 转发器负责打洞；
+  ffmpeg 的 SRT listener 只接受一个连接，所以每位观众一个 remux 子进程，一路编码喂给所有子进程。媒体不经过 MediaMTX，
+  gosrt 的大帧断连问题（mediamtx#6249）在这个模式下不存在。
+- 编码器 stdout 直接进分发器（`-progress` 改到 stderr，按"key=value"行过滤）：比让 ffmpeg 往 Windows 命名管道写输出更稳
+  （后者要 `-y` 且依赖 CreateFile 对管道的处理，无法在 Linux 上验证）。编码器自动重启时新 stdout 接进同一个 SwitchableStream，观众不掉线。
+- 实现：`shared/Group`（邀请码、密钥、签名消息、group.json）、`shared/P2p`（打洞、链路、分发、信令客户端、P2pHost、ViewerSession）、
+  `signal/`（信令服务器）。协议与格式见 §8。
 
 ## 2. 发送端
 
@@ -200,7 +223,9 @@ mpv --vo=gpu-next --gpu-api=d3d11 --hwdec=d3d11va
 - 直连模式：接收端也可做 `mode=listener`（朋友转发端口）或 `mode=caller`。
 - 配置：`%APPDATA%\HdrCast\receiver.json`。
 
-## 4. 中继（relay/）
+## 4. 中继（relay/，可选）
+
+> v0.2 起默认用点对点模式（§1.3），中继是给有公网入口、愿意自己跑 MediaMTX 的人的可选模式。
 
 - `docker-compose.yml` + `mediamtx.yml`：见调研交付（已 `--validate-conf` 并跑通 50/100 Mbps HEVC10）。要点：`writeQueueSize: 2048`、`udpReadBufferSize: 4000000`（宿主 `sysctl -w net.core.rmem_max=16777216`）、`authInternalUsers` 分 sender / viewer、路径 `screen` 分 `srtPublishPassphrase` / `srtReadPassphrase`、`hls: yes`（浏览器兜底，SDR 观感由浏览器决定）。
 - `relay/setup.sh`：生成随机密码与 passphrase 写入 `mediamtx.yml` 与 `relay/.env`，打印给发送端 / 接收端填的 URL；`relay/selftest.sh`：用本机 ffmpeg 生成合成 HDR10 HEVC 源推到中继，再用 ffprobe 读回校验 `smpte2084 / bt2020 / yuv420p10le`。
@@ -215,6 +240,7 @@ mpv --vo=gpu-next --gpu-api=d3d11 --hwdec=d3d11va
 | 中国（跨境丢包） | 60~120 ms + 丢包 | 3500 ms | 50 |
 
 发送端 → 中继在 LAN 内：800 ms 足够。总延迟 ≈ 发送 SRT + 接收 SRT + mpv `cache-pause-wait` + 编码 lookahead（~0.1 s）。
+点对点模式没有"发送端 → 中继"那一跳：观众的地区预设随加入请求发给主播，主播给他的 remux 子进程就用这个 latency / oheadbw。
 
 ## 6. 工程与构建
 
@@ -345,8 +371,9 @@ mac   = b64u(HMAC-SHA256(serverKey, METHOD + "\n" + PATH_AND_QUERY + "\n" + ts +
 
 ### 8.8 主播端分发
 
-编码 ffmpeg 把 MPEG-TS 写进命名管道 `\\.\pipe\hdrcast-ts-<pid>`；`TsFanOut` 按观众各一条有界队列（约 256 KB，满了清空，
-解码器在下一个关键帧恢复）喂给每个观众自己的 remux 子进程：
+编码 ffmpeg 把 MPEG-TS 写到 **stdout**（`-progress pipe:2`，进度行与日志共用 stderr，按 `key=value` 形状区分），经 `SwitchableStream`
+（编码器重启时接上新的 stdout）进 `TsFanOut`：按观众各一条有界队列（码率 × 0.5 s，至少 512 KB；满了清空，解码器在下一个关键帧恢复）
+喂给每个观众自己的 remux 子进程：
 
 ```
 ffmpeg -hide_banner -loglevel warning -probesize 65536 -analyzeduration 500000 -f mpegts -i pipe:0

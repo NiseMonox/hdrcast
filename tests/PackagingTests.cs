@@ -46,6 +46,20 @@ namespace HdrCast.Tests
         }
 
         [Fact]
+        public void Build_script_packages_the_signaling_server()
+        {
+            string root = RepoRoot();
+            if (root.Length == 0) return;
+            string build = File.ReadAllText(Path.Combine(root, "build.sh"));
+            foreach (string f in new[] { "hdrcast_signal.py", "hdrcast-signal.service", "deploy.sh", "README.md" })
+            {
+                Assert.True(File.Exists(Path.Combine(root, "signal", f)), "signal/" + f + " is missing");
+                Assert.Contains(f, build);
+            }
+            Assert.Contains("$DIST/signal", build);
+        }
+
+        [Fact]
         public void Build_script_packages_both_cmd_and_ps1()
         {
             string root = RepoRoot();

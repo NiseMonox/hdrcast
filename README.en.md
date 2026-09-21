@@ -1,40 +1,57 @@
-# HdrCast - how to watch
+# HdrCast - how to watch (and stream)
 
-Your friend is sharing their Windows desktop (HDR10, with audio) through a private relay. This page is for the **viewer** side only.
+Your friend shares their Windows desktop (HDR10, with audio) straight from their PC to yours: **peer-to-peer**, no relay server,
+no port forwarding. A small signaling server only introduces the two PCs to each other; the video never passes through it.
+Anyone in the group can also stream to the others.
 
 ## What you need
 
-- Windows 10 (1903+) or 11. Nothing to install: `HdrCastReceiver.exe` runs on the .NET Framework that Windows already ships.
-- **mpv** built with SRT support. Easiest: double-click `scripts\get-tools.cmd` and it downloads one into `tools\` for you (or run `get-tools.cmd viewer` to skip the sender's ffmpeg, which you do not need). By hand: take `mpv-x86_64-<date>.7z` from <https://github.com/zhongfly/mpv-winbuild/releases> or <https://github.com/shinchiro/mpv-winbuild-cmake/releases>, extract it and put `mpv.exe` next to `HdrCastReceiver.exe` (or in `tools\`).
-- A GPU that decodes HEVC 10-bit in hardware (NVIDIA GTX 10-series+, AMD RX 400+, Intel 7th gen+ iGPU). 4K60 needs something recent (RTX 20+/RX 5000+).
-- Download bandwidth of at least 1.3 x the stream bitrate (a 40 Mbps stream needs ~50 Mbps).
-- The five values from your friend: **host**, **port** (8890), **user** (`viewer`), **password**, **passphrase**.
+- Windows 10 (1903+) or 11. Nothing to install: the apps run on the .NET Framework that Windows already ships.
+- **IPv6.** Peer-to-peer works over IPv6 (it has no NAT, so the two PCs can reach each other). Check at <https://test-ipv6.com>:
+  "10/10" or at least "IPv6 address detected" is what you want. No IPv6? It can often be switched on in the router, or your ISP
+  can enable it. Without IPv6 on either side the app tries IPv4 too, but that usually fails behind carrier NAT.
+- **mpv** built with SRT support. Easiest: double-click `scripts\get-tools.cmd` (or run `get-tools.cmd viewer`), which puts one
+  into `tools\`. By hand: `mpv-x86_64-<date>.7z` from <https://github.com/zhongfly/mpv-winbuild/releases>, `mpv.exe` next to
+  `HdrCastReceiver.exe` (or in `tools\`).
+- A GPU that decodes HEVC 10-bit in hardware (NVIDIA GTX 10-series+, AMD RX 400+, Intel 7th gen+). 4K60 needs RTX 20+/RX 5000+.
+- Download bandwidth of about 1.3 x the stream bitrate (a 40 Mbps stream needs ~50 Mbps).
+- **The invite** your friend sent you: a message with a line starting with `hdrcast:`.
 
-## Steps
+## Watching
 
-1. Unzip the HdrCast folder anywhere. Run `scripts\get-tools.cmd viewer` to fetch mpv, then `scripts\check-tools.cmd` to confirm: it must say `mpv ... srt : yes`.
-2. If you have an **HDR monitor**, switch Windows HDR on: `Win + Alt + B` (or Settings > System > Display > Use HDR). mpv cannot turn it on for you; without it the picture looks washed out.
-3. Run `HdrCastReceiver.exe`. Mode "Relay", paste host / port / user / password / passphrase.
-4. Pick your region preset (Japan 1500 ms, Australia 2000 ms, China 3500 ms). It sets the SRT buffer; a bigger value survives worse networks at the cost of delay.
-5. Display: "Auto" (HDR passthrough when Windows HDR is on, tone-mapping otherwise). On an SDR monitor choose "SDR tone-map".
-6. Click Connect. "Waiting for stream..." means the sender is not live yet; the app retries every 3 s. Use the fullscreen button for real HDR fullscreen.
+1. Unzip the HdrCast folder anywhere. Run `scripts\get-tools.cmd viewer`.
+2. **Copy the whole invite message** from the chat, then start `HdrCastReceiver.exe`. It asks "Join this group?": say yes and
+   type the name your friends will see. If it does not ask, click **Paste invite**.
+3. Mode switches to **Group**. The **Watch** list shows who is live right now (refreshed every 10 s). Pick your region in
+   **Latency**: Japan 1500 ms, Australia 2000 ms, China 3500 ms. Click **Play**.
+4. On an **HDR monitor**, switch Windows HDR on first: `Win + Alt + B` (or Settings > System > Display > Use HDR). On an SDR
+   monitor choose "SDR tone-map" under Display.
 
-The end-to-end delay is 3-6 seconds by design (it is a broadcast, not a remote desktop).
+The delay is 3-6 seconds by design: it is a broadcast, not a remote desktop.
+
+## Streaming to the group
+
+1. Run `scripts\get-tools.cmd sender` (downloads ffmpeg), start `HdrCastSender.exe`.
+2. Mode **Group: friends watch straight from this PC (P2P)**. If you already joined with the receiver, the group is there;
+   otherwise **Paste invite**.
+3. Pick the monitor and bitrate, set **Max viewers**, click **Start**. Every viewer costs one full stream of *your upload*:
+   three viewers at 20 Mbps need about 75 Mbps up. The app estimates it; enter your upload next to "my upload" to get a warning.
 
 ## If something is wrong
 
-| Symptom | Fix |
+The status line under **Watch** says what happened. The usual ones:
+
+| Message | What to do |
 |---|---|
-| "Waiting for stream..." forever | The sender has not started, or host / port is wrong, or the sender's router does not forward UDP 8890. |
-| Disconnects immediately, log says `invalid passphrase` | Wrong passphrase (the viewer passphrase differs from the sender's one). |
-| `authentication failed` | Wrong viewer password. |
-| Picture stutters, then recovers every few seconds | Raise the latency preset (China: try 4000-5000 ms) or ask the sender to lower the bitrate. |
-| Log says `No room to store incoming packet` | Raise "max bitrate" in the app (it sizes the receive buffer). |
+| This PC has no IPv6 internet connection | Turn IPv6 on in your router, or ask your ISP. test-ipv6.com shows the state. |
+| The host's PC has no IPv6 internet connection | The friend streaming needs IPv6 (same advice, their side). |
+| Both sides have IPv6 but the path is blocked | A VPN or a very strict firewall drops incoming UDP. Turn the VPN off; on the router look for "IPv6 firewall: block all". |
+| Not live right now / Nobody in the group is live | Your friend has not pressed Start yet. The list refreshes by itself. |
+| ... is full | The streamer's "Max viewers" is reached. |
+| The signaling server cannot be reached | Your internet is down, or the signaling server is. People already watching keep watching. |
+| Picture stutters, then recovers every few seconds | Raise the latency (China: try 4000-5000 ms) or ask for a lower bitrate. |
 | Colours look grey / flat on an HDR monitor | Windows HDR is off (`Win + Alt + B`). |
-| Too dark / too bright on an SDR monitor | Choose "SDR tone-map" in the app. |
-| mpv says it cannot open `srt://` | Your mpv build lacks libsrt. Use the shinchiro / zhongfly build, or pick the "ffmpeg pipe" frontend in the app. |
-| No sound | Check the mpv window's audio device (press `#` in mpv to cycle) and Windows volume mixer. |
+| mpv says it cannot open `srt://` | Your mpv lacks libsrt: use the zhongfly / shinchiro build (get-tools.cmd does). |
 
-No GUI? `scripts\receive-example.cmd` contains the raw mpv command: edit the values at the top and run it.
-
-Privacy: the stream is AES-256 encrypted between you and the relay; only people with the passphrase can decode it.
+Privacy: the video is AES-256 encrypted end to end with a key derived from the invite. The invite itself is the key to the
+group: only share it with people you trust. To lock someone out, the owner creates a new group and sends the new invite to the others.

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # HdrCast build script (run from the repo root on Linux with the .NET 10 SDK):
-#   builds sender + receiver (net48 WinForms, Release), runs the Linux test project,
-#   and assembles dist/HdrCast-<version>/ for distribution.
+#   builds sender + receiver (net48 WinForms, Release), runs the Linux test project and the signaling
+#   server's Python tests, and assembles dist/HdrCast-<version>/ for distribution.
 # A failing sender/receiver build is reported but does not abort the script (the rest is still packaged);
 # the exit code is non-zero if anything failed.
 #   ./build.sh            full run
@@ -58,6 +58,17 @@ if [ "$RUN_TESTS" = 1 ]; then
   if ! grep -qE 'Passed!|Test Run Successful|Passed: *[0-9]+, *Failed: *0' "$LOGDIR/test.log" || grep -qE 'Failed!|error [A-Z]+[0-9]+' "$LOGDIR/test.log"; then
     echo "!! tests FAILED (see $LOGDIR/test.log)"; FAILED+=("tests")
   fi
+
+  step "test (signal/tests, python3 unittest)"
+  if command -v python3 >/dev/null 2>&1 && [ -d "$ROOT/signal/tests" ]; then
+    if (cd "$ROOT" && python3 -m unittest discover -s signal/tests) > "$LOGDIR/test-signal.log" 2>&1; then
+      tail -n 3 "$LOGDIR/test-signal.log"
+    else
+      tail -n 20 "$LOGDIR/test-signal.log"; echo "!! signal tests FAILED (see $LOGDIR/test-signal.log)"; FAILED+=("signal-tests")
+    fi
+  else
+    echo "  (skipped: no python3)"
+  fi
 fi
 
 step "assemble $DIST"
@@ -81,6 +92,11 @@ mkdir -p "$DIST/relay" "$DIST/scripts" "$DIST/docs"
 # relay: compose, template, scripts - never the rendered mediamtx.yml / .env (they hold secrets)
 for f in docker-compose.yml mediamtx.template.yml setup.sh selftest.sh up.sh down.sh logs.sh .gitignore; do
   [ -f "$ROOT/relay/$f" ] && cp "$ROOT/relay/$f" "$DIST/relay/"
+done
+# signaling server for P2P mode (deployed once on a small server; never video) - no state, no tests
+mkdir -p "$DIST/signal"
+for f in hdrcast_signal.py hdrcast-signal.service deploy.sh README.md; do
+  [ -f "$ROOT/signal/$f" ] && cp "$ROOT/signal/$f" "$DIST/signal/"
 done
 # .cmd launchers plus the .ps1 payloads they call (get-tools.cmd is useless without get-tools.ps1)
 cp "$ROOT"/scripts/*.cmd "$ROOT"/scripts/*.ps1 "$DIST/scripts/" 2>/dev/null || true
