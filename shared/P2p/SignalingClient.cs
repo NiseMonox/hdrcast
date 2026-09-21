@@ -54,9 +54,18 @@ namespace HdrCast.P2p
             TimeoutMs = timeoutMs;
             if (Uri.TryCreate(_base, UriKind.Absolute, out Uri? u))
             {
-                // net48 allows 2 connections per host by default; a long-poll plus a heartbeat plus a live-list
-                // refresh would queue behind each other.
-                try { ServicePointManager.FindServicePoint(u).ConnectionLimit = 16; } catch (Exception) { }
+                try
+                {
+                    ServicePoint sp = ServicePointManager.FindServicePoint(u);
+                    // net48 allows 2 connections per host by default; a long-poll plus a heartbeat plus a live-list
+                    // refresh would queue behind each other.
+                    sp.ConnectionLimit = 16;
+                    // The server closes idle keep-alive connections after 30 s; the default 100 s would reuse dead ones.
+                    sp.MaxIdleTime = 20000;
+                    // Every heartbeat / join / answer would otherwise wait a round trip for "100 Continue".
+                    sp.Expect100Continue = false;
+                }
+                catch (Exception) { }
             }
         }
 
@@ -182,6 +191,7 @@ namespace HdrCast.P2p
             req.KeepAlive = true;
             req.UserAgent = "HdrCast/1";
             req.Accept = "application/json";
+            req.ServicePoint.Expect100Continue = false;
             if (authenticate) req.Headers[RequestAuth.HeaderName] = RequestAuth.Header(_keys.ServerKey, method, pathAndQuery, bytes);
 
             try
@@ -260,14 +270,26 @@ namespace HdrCast.P2p
             }, TaskContinuationOptions.ExecuteSynchronously);
         }
 
+        /// <summary>
+        /// Largest body we accept: 32 live hosts or 32 queued joins at up to 8 KB each stay well below it;
+        /// anything bigger is not our server.
+        /// </summary>
+        const int MaxBodyChars = 512 * 1024;
+
         static string ReadBody(HttpWebResponse resp)
         {
             using (Stream s = resp.GetResponseStream())
             using (var r = new StreamReader(s, Encoding.UTF8))
             {
+                var sb = new StringBuilder();
                 var buf = new char[16384];
-                int n = r.ReadBlock(buf, 0, buf.Length);   // bodies are small; never read unbounded
-                return new string(buf, 0, n);
+                int n;
+                while ((n = r.Read(buf, 0, buf.Length)) > 0)
+                {
+                    if (sb.Length + n > MaxBodyChars) throw new IOException("the signaling response is too large");
+                    sb.Append(buf, 0, n);
+                }
+                return sb.ToString();
             }
         }
 

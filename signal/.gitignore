@@ -1,0 +1,3 @@
+__pycache__/
+# local runs: `python3 hdrcast_signal.py` keeps the group registry (serverKeys) in ./state
+state/

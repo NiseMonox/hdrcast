@@ -1,0 +1,47 @@
+# hdrcast-signal: rendezvous server for HdrCast peer-to-peer mode (docs/design.md section 8).
+# Relays small signed metadata (who is live, candidate addresses); video never passes through it.
+# Installed by signal/deploy.sh, which rewrites the ExecStart= line with the chosen ports.
+
+[Unit]
+Description=HdrCast signaling server (P2P rendezvous, metadata only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/hdrcast-signal/hdrcast_signal.py --listen [::]:18650 --echo-port 18651 --state-dir ${STATE_DIRECTORY}
+# systemd < 240 (e.g. Ubuntu 18.04) does not export $STATE_DIRECTORY; this is the same path newer versions set.
+Environment=STATE_DIRECTORY=/var/lib/hdrcast-signal
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+Restart=always
+RestartSec=2
+TimeoutStopSec=10
+
+# The group registry (gid -> serverKey) lives in /var/lib/private/hdrcast-signal/groups.json (0600).
+DynamicUser=yes
+StateDirectory=hdrcast-signal
+StateDirectoryMode=0700
+UMask=0077
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+MemoryMax=64M
+# One thread per open connection. The server caps itself at 100 connections (up to 64 of them
+# long-polls, section 8.5) plus 3 service threads; TasksMax=64 would starve the long-poll limit.
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target

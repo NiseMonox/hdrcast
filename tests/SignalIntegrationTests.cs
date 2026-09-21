@@ -171,6 +171,34 @@ namespace HdrCast.Tests
             }
         }
 
+        /// <summary>A full live list (32 hosts, 8 candidates each) is ~30 KB of JSON: the reader used to stop at 16 KB.</summary>
+        [Fact]
+        public void A_full_live_list_is_read_completely()
+        {
+            using (SignalServer? server = SignalServer.TryStart())
+            {
+                if (server == null) return;
+                GroupConfig g = NewGroup(server);
+                GroupKeys keys = g.Keys();
+                var c = new SignalingClient(g);
+                c.RegisterGroup(CancellationToken.None);
+                for (int i = 0; i < 32; i++)
+                {
+                    string host = GroupKeys.NewId();
+                    var rec = new LiveRecord
+                    {
+                        HostId = host, Name = "host number " + i, TimeMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                        SinceMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), Mbps = 40, MaxViewers = 4,
+                    };
+                    for (int k = 0; k < 8; k++) rec.Candidates.Add("[2400:aaaa:bbbb:cccc:1122:33ff:fe44:" + (0x9000 + k).ToString("x") + "]:" + (50000 + k));
+                    c.PutLive(host, SignedEnvelope.Seal(keys, SignedEnvelope.KindLive, g.GroupId, host, rec.ToPayload()), CancellationToken.None);
+                }
+                List<LiveEntry> live = c.GetLive(CancellationToken.None);
+                Assert.Equal(32, live.Count);
+                Assert.All(live, e => Assert.Equal(8, e.Record.Candidates.Count));
+            }
+        }
+
         [Fact]
         public void Wrong_keys_and_unreachable_servers_are_reported_distinctly()
         {
