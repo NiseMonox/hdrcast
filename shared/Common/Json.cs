@@ -54,18 +54,28 @@ namespace HdrCast.Common
             }
         }
 
-        /// <summary>Writes atomically (temp file + replace) and creates the directory when needed.</summary>
+        /// <summary>
+        /// Writes atomically (unique temp file + replace) and creates the directory when needed. The temp name is
+        /// unique because both apps may save the shared group.json at the same moment.
+        /// </summary>
         public static void SaveFile<T>(string path, T value)
         {
             string? dir = Path.GetDirectoryName(path);
             if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-            string tmp = path + ".tmp";
-            using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
+            string tmp = path + "." + Guid.NewGuid().ToString("N").Substring(0, 8) + ".tmp";
+            try
             {
-                Write(fs, value, indent: true);
+                using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
+                {
+                    Write(fs, value, indent: true);
+                }
+                if (File.Exists(path)) File.Replace(tmp, path, null);
+                else File.Move(tmp, path);
             }
-            if (File.Exists(path)) File.Delete(path);
-            File.Move(tmp, path);
+            finally
+            {
+                try { if (File.Exists(tmp)) File.Delete(tmp); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+            }
         }
 
         /// <summary>Returns null when the file is missing or unreadable (callers fall back to defaults).</summary>

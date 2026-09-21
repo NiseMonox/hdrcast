@@ -164,7 +164,7 @@ namespace HdrCast.Common
         public static string Normalize(string? input)
         {
             if (string.IsNullOrEmpty(input)) return "";
-            string s = input!.Normalize(NormalizationForm.FormKC).Replace('。', '.').Trim();
+            string s = input!.Normalize(NormalizationForm.FormKC).Replace('\u3002', '.').Trim();
             string[] pairs = { "\"\"", "''", "「」", "『』", "<>", "（）", "()" };
             bool changed = true;
             while (changed && s.Length >= 2)

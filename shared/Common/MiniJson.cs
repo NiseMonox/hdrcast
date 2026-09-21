@@ -4,10 +4,10 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Text;
 
-namespace HdrCast.Receiver
+namespace HdrCast.Common
 {
     /// <summary>
-    /// Minimal recursive-descent JSON reader/writer for mpv's JSON IPC lines (no System.Text.Json on net48).
+    /// Minimal recursive-descent JSON reader/writer (mpv JSON IPC, invites, signaling; no System.Text.Json on net48).
     /// Objects become Dictionary&lt;string, object?&gt;, arrays List&lt;object?&gt;, numbers long (integral) or double,
     /// plus string / bool / null. Tolerant of surrounding whitespace and of trailing garbage after the value.
     /// </summary>
