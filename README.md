@@ -13,7 +13,7 @@
 > 现状：点对点整条链路（邀请码、信令、打洞、多观众分发、HEVC Main10 PQ）已在 Linux 上用模拟的有状态防火墙端到端测过；
 > **Windows 上的运行时（采集、GPU shader、WASAPI、真实路由器打洞）还没实测**，步骤见 [docs/windows-checklist.md](docs/windows-checklist.md)。
 
-## 架构（点对点模式）
+## 架构
 
 ```
 ┌──────────────── 主播 Windows PC ─────────────────────────────┐
@@ -23,7 +23,7 @@
 │   → 分发器：每位观众一个 remux ffmpeg（-c copy，SRT，127.0.0.1）│
 │   → HostLink：[本机 IPv6]:端口 ⇄ 打洞 ⇄ 各位观众               │
 └───────────────┬───────────────────────────────┬──────────────┘
-                │ IPv6 直连（打洞）                │ IPv6 直连（打洞）
+                │ IPv6 点对点（打洞）              │ IPv6 点对点（打洞）
                 ▼                               ▼
    HdrCastReceiver.exe → mpv（日本）   HdrCastReceiver.exe → mpv（中国 / 澳洲）
 
@@ -32,12 +32,11 @@
 
 - 只要**双方至少有一方的 IPv6 能用**并且另一方也有 IPv6 就能连（IPv6 没有 NAT，打洞几乎总能成功）；IPv4 打洞只是额外尝试。
 - 主播要为每位观众各上传一份：3 人 × 40 Mbps ≈ 150 Mbps 上行（含重传余量）。发送端界面会估算并在超过你填的上行带宽时提醒。
-- 旧的"中继"与"直连"模式仍在（下拉框里），适合有公网 IP 或自建 MediaMTX 的人，见 [docs/network.md](docs/network.md)。
 
 ## 快速开始：开播的人
 
 1. **装工具**：双击 `scripts\get-tools.cmd`（只开播就 `get-tools.cmd sender`，会下载 ffmpeg；只看就 `viewer`，下载 mpv）。
-2. **运行 `HdrCastSender.exe`**，右上 **Mode** 选 **Group: friends watch straight from this PC (P2P)**。
+2. **运行 `HdrCastSender.exe`**，右上是 **Share with your group**。
 3. **Create group…**：起个组名和你的名字，邀请码自动复制到剪贴板。把它发到微信 / LINE / Discord 群里（**只发给信得过的人**：有码就能看）。
    朋友已经发过你邀请码的话，直接复制那条消息、点 **Paste invite**（或者打开 app 时它会自己提示）。
 4. 选显示器、码率、**Max viewers**（可以顺手填 *my upload*，你家上行 Mbps），点 **Start**。
@@ -49,13 +48,13 @@
 
 1. **装 mpv**：双击 `scripts\get-tools.cmd viewer`（或 `get-tools.cmd`，两个都装）。
 2. **复制朋友发来的整条邀请消息**，打开 `HdrCastReceiver.exe`：会弹出"要加入这个组吗"，点是、填你的名字。没弹的话点 **Paste invite**。
-3. Mode 自动切到 **Group**，**Watch** 列表里是正在直播的朋友（每 10 秒刷新）。**Latency** 按你在哪选：日本 1500 / 澳洲 2000 / 中国 3500 ms。点 **Play**。
+3. **Watch** 列表里是正在直播的朋友（每 10 秒刷新）。**Latency** 按你在哪选：日本 1500 / 澳洲 2000 / 中国 3500 ms。点 **Play**。
 4. 连不上时状态栏会直接说原因，比如"这台电脑没有 IPv6"或"主播没有 IPv6"。先去 <https://test-ipv6.com> 看看自己的 IPv6，见 [docs/faq.md](docs/faq.md)。
 5. **HDR 显示器**先在 Windows 里打开 HDR（`Win + Alt + B`）；SDR 显示器选"SDR tone-map"。
 
 ## 信令服务器（只需部署一次）
 
-`signal/` 是一个只用 Python 标准库的小服务，跑在腾讯云上（默认 `http://101.43.23.94:18650`），部署方法见 [signal/README.md](signal/README.md)：
+`signal/` 是一个只用 Python 标准库的小服务，已部署在腾讯云上（`http://101.43.23.94:18650`，邀请码里写的就是它），部署 / 升级方法见 [signal/README.md](signal/README.md)：
 `signal/deploy.sh --ssh ubuntu@101.43.23.94`，然后在腾讯云安全组放行 **TCP 18650** 和 **UDP 18651**（后者是 IPv4 打洞用的地址回显，可选）。
 它看不到任何密码或组密钥，也伪造不了地址（所有消息用组密钥签名）；挂了的话，已经在看的人不受影响，只是新的人加入不了。
 
@@ -80,9 +79,8 @@ shared/      平台无关逻辑，同时编进两个 exe 与测试：
                P2p（打洞、HostLink/ViewerLink、分发、信令客户端、P2pHost/ViewerSession）、Gui（两个 app 共用的对话框）
 signal/      信令服务器（Python 标准库）+ systemd 单元 + deploy.sh
 tests/       xunit（net10，在 Linux 上跑，含打洞 / 真 ffmpeg / 真信令服务器的端到端测试）；vectors/ 是协议 golden 向量
-relay/       可选：MediaMTX 中继（旧的中继模式）
-scripts/     Windows 批处理：get-tools / check-tools / send-example / receive-example / dump-check
-docs/        design.md（规格，§8 是点对点协议）、network.md、windows-checklist.md、faq.md、obs-alternative.md
+scripts/     Windows 批处理：get-tools（一键装 ffmpeg / mpv）/ check-tools / dump-check
+docs/        design.md（规格，§8 是点对点协议）、network.md、windows-checklist.md、faq.md
 build.sh     在 Linux 上构建并打包 dist/HdrCast-<版本>/
 ```
 
@@ -91,16 +89,15 @@ build.sh     在 Linux 上构建并打包 dist/HdrCast-<版本>/
 ```bash
 ./build.sh              # dotnet build 两个 exe (Release) → dotnet test → 打包 dist/HdrCast-<版本>/
 ./build.sh --no-test    # 跳过测试
-./build.sh --e2e        # 额外跑 docker 中继回环（只和旧的中继模式有关）
 python3 -m unittest discover -s signal/tests    # 信令服务器自己的测试
 ```
 
-产物 `dist/HdrCast-<版本>/`：两个 exe、`scripts/`、`docs/`、`signal/`、`relay/`（不含密码文件）、README、LICENSE、空的 `tools/`。
+产物 `dist/HdrCast-<版本>/`：两个 exe、`scripts/`、`docs/`、`signal/`、README、LICENSE、空的 `tools/`。
 
 ## 文档
 
 - [docs/design.md](docs/design.md) —— 设计定稿；§8 是点对点协议（邀请码、密钥派生、签名、信令 API、打洞包）。
-- [docs/network.md](docs/network.md) —— 点对点怎么穿过防火墙、谁需要什么、上行带宽、IPv6 自查、旧的中继 / 直连模式。
+- [docs/network.md](docs/network.md) —— 点对点怎么穿过防火墙、谁需要什么、上行带宽、IPv6 自查。
 - [docs/faq.md](docs/faq.md) —— 连不上怎么办（按状态栏提示查）、HDR 与 SDR、码率与带宽。
 - [docs/windows-checklist.md](docs/windows-checklist.md) —— Windows 上逐步验证及预期输出。
 - [signal/README.md](signal/README.md) —— 信令服务器部署。

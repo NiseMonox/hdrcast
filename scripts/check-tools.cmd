@@ -2,7 +2,7 @@
 setlocal EnableExtensions EnableDelayedExpansion
 rem HdrCast - check-tools.cmd
 rem Finds ffmpeg.exe / mpv.exe (next to the HdrCast exe, in tools\, or on PATH), prints their versions and whether the
-rem hardware HEVC/AV1 encoders and the SRT protocol are available. Double-click or run from a terminal.
+rem hardware HEVC encoders and the SRT protocol are available. Double-click or run from a terminal.
 
 set "ROOT=%~dp0.."
 for %%I in ("%ROOT%") do set "ROOT=%%~fI"
@@ -30,11 +30,10 @@ set "VER="
 set /p VER=<"%TMPF%"
 echo version   : !VER!
 "%FFMPEG%" -hide_banner -protocols > "%TMPF%" 2>nul
-findstr /R /C:"^ *srt *$" "%TMPF%" >nul && (echo srt       : yes ^(libsrt^)) || (echo srt       : NO - this ffmpeg build cannot publish to the relay; use the gyan.dev full build)
+findstr /R /C:"^ *srt *$" "%TMPF%" >nul && (echo srt       : yes ^(libsrt^)) || (echo srt       : NO - this ffmpeg build cannot serve viewers; use get-tools.cmd or the gyan.dev full build)
 "%FFMPEG%" -hide_banner -encoders > "%TMPF%" 2>nul
 findstr /C:" libx265 " "%TMPF%" >nul && (echo libx265   : yes ^(CPU fallback^)) || (echo libx265   : no)
 call :enc hevc_nvenc
-call :enc av1_nvenc
 call :enc hevc_amf
 call :enc hevc_qsv
 echo           ^(listed = compiled in; ok = a 1-frame test encode succeeded, i.e. driver and GPU are usable^)

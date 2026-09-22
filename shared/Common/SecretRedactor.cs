@@ -4,7 +4,7 @@ using System.Text;
 namespace HdrCast.Common
 {
     /// <summary>
-    /// Removes the SRT passphrase, the MediaMTX credentials and HdrCast invite codes from anything that goes
+    /// Removes SRT passphrases, stream-id credentials (should one ever appear) and HdrCast invite codes from anything that goes
     /// into a log file. The command line has to carry them, but the log does not: the app invites the user to
     /// open the log folder and send it when something breaks, and mpv echoes the whole URL on a failed connection.
     /// An invite code carries the group key, so it is as secret as a password.

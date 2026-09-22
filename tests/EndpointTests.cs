@@ -1,8 +1,6 @@
 using System;
 using System.IO;
 using HdrCast.Common;
-using HdrCast.Receiver;
-using HdrCast.Sender.Model;
 using Xunit;
 
 namespace HdrCast.Tests
@@ -97,7 +95,7 @@ namespace HdrCast.Tests
     {
         static SrtUrlOptions Caller(string host, int port = 8890) => new SrtUrlOptions
         {
-            Topology = SrtTopology.DirectCaller, Role = SrtRole.Read, Host = host, Port = port, LatencyMs = 1500,
+            Topology = SrtTopology.Caller, Role = SrtRole.Read, Host = host, Port = port, LatencyMs = 1500,
         };
 
         [Theory]
@@ -125,7 +123,7 @@ namespace HdrCast.Tests
         [Fact]
         public void Listener_binds_ipv4_by_default_and_a_concrete_ipv6_address_when_given()
         {
-            var o = new SrtUrlOptions { Topology = SrtTopology.DirectListener, Port = 9000, LatencyMs = 1500 };
+            var o = new SrtUrlOptions { Topology = SrtTopology.Listener, Port = 9000, LatencyMs = 1500 };
             Assert.StartsWith("srt://0.0.0.0:9000?", SrtUrl.Build(o));
             o.ListenAddress = "2001:db8::5";
             Assert.StartsWith("srt://[2001:db8::5]:9000?", SrtUrl.Build(o));
@@ -143,7 +141,7 @@ namespace HdrCast.Tests
             Assert.Contains("::", error);
             Assert.Throws<ArgumentException>(() => SrtUrl.Build(new SrtUrlOptions
             {
-                Topology = SrtTopology.DirectListener, Port = 9000, LatencyMs = 1500, ListenAddress = address,
+                Topology = SrtTopology.Listener, Port = 9000, LatencyMs = 1500, ListenAddress = address,
             }));
         }
 
@@ -161,28 +159,6 @@ namespace HdrCast.Tests
             SrtUrlParts p = SrtUrl.Parse("srt://[2001:db8::1]:8890?mode=caller");
             Assert.Equal("2001:db8::1", p.Host);
             Assert.Equal(8890, p.Port);
-        }
-
-        [Fact]
-        public void Settings_validation_explains_bad_hosts_and_keeps_listen_address_separate()
-        {
-            var r = new ReceiverSettings { Host = "fe80::1", Port = 8890, Mode = ConnectionMode.DirectDial }.Normalize();
-            Assert.Contains(r.Validate(), p => p.Contains("link-local"));
-
-            // Switching to listen mode must not reinterpret the relay host as a bind address.
-            r = new ReceiverSettings { Host = "relay.example.net", Port = 8890, Mode = ConnectionMode.DirectListen }.Normalize();
-            Assert.Empty(r.Validate());
-            Assert.StartsWith("srt://0.0.0.0:8890?", SrtUrl.Build(r.ToSrtOptions()));
-            r.ListenAddress = "::";
-            Assert.Contains(r.Validate(), p => p.Contains("'::'"));
-
-            var s = new SenderSettings { Host = "[2001:db8::1]:8890", Port = 8890, Mode = SendMode.DirectDial }.Normalize();
-            Assert.Empty(s.Validate());
-            Assert.StartsWith("srt://[2001:db8::1]:8890?", SrtUrl.Build(s.ToSrtOptions()));
-            s.Mode = SendMode.DirectListen;
-            s.ListenAddress = "2001:db8::2";
-            Assert.Empty(s.Validate());
-            Assert.StartsWith("srt://[2001:db8::2]:8890?", SrtUrl.Build(s.ToSrtOptions()));
         }
     }
 

@@ -66,8 +66,7 @@ namespace HdrCast.Sender.Gui
         ComboBox _audioCodec = null!;
         NumericUpDown _audioBitrate = null!;
 
-        // target
-        ComboBox _mode = null!;
+        // group
         Label _groupName = null!;
         Button _createGroup = null!;
         Button _pasteInvite = null!;
@@ -75,29 +74,13 @@ namespace HdrCast.Sender.Gui
         NumericUpDown _maxViewers = null!;
         NumericUpDown _uploadMbps = null!;
         Label _uploadNeeded = null!;
-        Label _hostCaption = null!;
-        readonly List<Control> _p2pRows = new List<Control>();
-        readonly List<Control> _manualRows = new List<Control>();
-        TextBox _host = null!;
-        NumericUpDown _port = null!;
-        TextBox _path = null!;
-        TextBox _user = null!;
-        TextBox _password = null!;
-        TextBox _passphrase = null!;
-        CheckBox _showSecrets = null!;
-        ComboBox _region = null!;
-        NumericUpDown _latency = null!;
-        CheckBox _rateControl = null!;
 
         // tools / controls
         TextBox _ffmpegPath = null!;
         Label _ffmpegFound = null!;
-        CheckBox _autoRestart = null!;
         Button _start = null!;
         Button _stop = null!;
-        Button _copy = null!;
         Button _openLogs = null!;
-        Button _viewerUrl = null!;
 
         // status
         Label _stState = null!;
@@ -346,28 +329,10 @@ namespace HdrCast.Sender.Gui
 
         Control BuildTargetGroup()
         {
-            GroupBox g = Group("Where to send");
+            GroupBox g = Group("Share with your group");
             TableLayoutPanel t = Grid(2);
             t.RowCount = 0;
 
-            _mode = new ComboBox { Dock = DockStyle.Fill, DropDownStyle = ComboBoxStyle.DropDownList };
-            _mode.Items.AddRange(new object[]
-            {
-                "Relay (MediaMTX)",
-                "Direct: I listen (needs a UDP port forward here)",
-                "Direct: I dial the viewer",
-                "Group: friends watch straight from this PC (P2P)",
-            });
-            _mode.SelectedIndexChanged += (s, e) =>
-            {
-                if (_suppressEvents) return;
-                _settings.Mode = (SendMode)_mode.SelectedIndex;
-                LoadHostBox();
-                UpdateEnabledState();
-            };
-            AddRow(t, "Mode", _mode);
-
-            // ---- P2P rows
             _groupName = new Label { AutoSize = true, Margin = new Padding(3, 6, 12, 3) };
             _createGroup = new Button { Text = "Create group…", AutoSize = true };
             _createGroup.Click += (s, e) => { GroupConfig? next = InviteUi.CreateGroup(this, _group.Current); if (next != null) { SaveGroup(next); InviteUi.CopyInvite(this, next); } };
@@ -375,102 +340,18 @@ namespace HdrCast.Sender.Gui
             _pasteInvite.Click += (s, e) => { GroupConfig? next = InviteUi.PasteInvite(this, _group.Current); if (next != null) SaveGroup(next); };
             _copyInvite = new Button { Text = "Copy invite", AutoSize = true };
             _copyInvite.Click += (s, e) => InviteUi.CopyInvite(this, _group.Current);
-            _p2pRows.AddRange(AddRow(t, "Group", Flow(_groupName, _createGroup, _pasteInvite, _copyInvite)));
+            AddRow(t, "Group", Flow(_groupName, _createGroup, _pasteInvite, _copyInvite));
 
             _maxViewers = new NumericUpDown { Minimum = 1, Maximum = 16, Width = Font.Height * 4 };
             _maxViewers.ValueChanged += (s, e) => { if (!_suppressEvents) { _settings.MaxViewers = (int)_maxViewers.Value; UpdateUploadHint(); } };
             _uploadMbps = new NumericUpDown { Minimum = 0, Maximum = 100000, Width = Font.Height * 5 };
             _uploadMbps.ValueChanged += (s, e) => { if (!_suppressEvents) { _settings.UploadMbps = (int)_uploadMbps.Value; UpdateUploadHint(); } };
-            _p2pRows.AddRange(AddRow(t, "Max viewers", Flow(_maxViewers, Caption("   my upload (Mbps, 0 = unknown)"), _uploadMbps)));
-            _uploadNeeded = new Label { AutoSize = true, Margin = new Padding(3, 3, 3, 3) };
-            _p2pRows.AddRange(AddRow(t, "", _uploadNeeded));
-
-            // ---- manual rows (relay / direct)
-            _host = new TextBox { Dock = DockStyle.Fill };
-            _host.TextChanged += (s, e) =>
-            {
-                if (_suppressEvents) return;
-                if (_settings.Mode == SendMode.DirectListen) _settings.ListenAddress = _host.Text.Trim();
-                else _settings.Host = _host.Text.Trim();
-            };
-            _host.Leave += (s, e) => SplitPortFromHost();
-            Control[] hostRow = AddRow(t, "Host", _host);
-            _hostCaption = (Label)hostRow[0];
-            _manualRows.AddRange(hostRow);
-
-            _port = new NumericUpDown { Dock = DockStyle.Fill, Minimum = 1, Maximum = 65535 };
-            _port.ValueChanged += (s, e) => { if (!_suppressEvents) _settings.Port = (int)_port.Value; };
-            _manualRows.AddRange(AddRow(t, "Port", _port));
-
-            _path = new TextBox { Dock = DockStyle.Fill };
-            _path.TextChanged += (s, e) => { if (!_suppressEvents) _settings.StreamPath = _path.Text.Trim(); };
-            _manualRows.AddRange(AddRow(t, "Path", _path));
-
-            _user = new TextBox { Dock = DockStyle.Fill };
-            _user.TextChanged += (s, e) => { if (!_suppressEvents) _settings.User = _user.Text.Trim(); };
-            _manualRows.AddRange(AddRow(t, "User", _user));
-
-            _password = new TextBox { Dock = DockStyle.Fill, UseSystemPasswordChar = true };
-            _password.TextChanged += (s, e) => { if (!_suppressEvents) _settings.Password = _password.Text; };
-            _manualRows.AddRange(AddRow(t, "Password", _password));
-
-            _passphrase = new TextBox { Dock = DockStyle.Fill, UseSystemPasswordChar = true };
-            _passphrase.TextChanged += (s, e) => { if (!_suppressEvents) _settings.Passphrase = _passphrase.Text; };
-            _manualRows.AddRange(AddRow(t, "Passphrase", _passphrase));
-
-            _showSecrets = new CheckBox { Text = "Show password and passphrase", AutoSize = true };
-            _showSecrets.CheckedChanged += (s, e) =>
-            {
-                _password.UseSystemPasswordChar = !_showSecrets.Checked;
-                _passphrase.UseSystemPasswordChar = !_showSecrets.Checked;
-            };
-            _manualRows.AddRange(AddRow(t, "", _showSecrets));
-
-            _region = new ComboBox { Dock = DockStyle.Fill, DropDownStyle = ComboBoxStyle.DropDownList };
-            foreach (RegionPreset p in SenderSettings.RegionPresets) _region.Items.Add(p.ToString());
-            _region.Items.Add("Custom");
-            _region.SelectedIndexChanged += (s, e) =>
-            {
-                if (_suppressEvents || _region.SelectedIndex < 0 || _region.SelectedIndex >= SenderSettings.RegionPresets.Length) return;
-                RegionPreset p = SenderSettings.RegionPresets[_region.SelectedIndex];
-                _settings.LatencyMs = p.LatencyMs;
-                _settings.OverheadPercent = p.OverheadPercent;
-                _suppressEvents = true;
-                _latency.Value = p.LatencyMs;
-                _suppressEvents = false;
-            };
-            _manualRows.AddRange(AddRow(t, "Latency preset", _region));
-
-            _latency = new NumericUpDown { Dock = DockStyle.Fill, Minimum = 20, Maximum = 30000, Increment = 100 };
-            _latency.ValueChanged += (s, e) => { if (!_suppressEvents) { _settings.LatencyMs = (int)_latency.Value; SyncRegionCombo(); } };
-            _manualRows.AddRange(AddRow(t, "SRT latency (ms)", _latency));
-
-            _rateControl = new CheckBox { Text = "Pace the sender to the bitrate (maxbw / oheadbw)", AutoSize = true };
-            _rateControl.CheckedChanged += (s, e) => { if (!_suppressEvents) _settings.RateControl = _rateControl.Checked; };
-            _manualRows.AddRange(AddRow(t, "", _rateControl));
+            AddRow(t, "Max viewers", Flow(_maxViewers, Caption("   my upload (Mbps, 0 = unknown)"), _uploadMbps));
+            _uploadNeeded = new Label { AutoSize = true, Margin = new Padding(3, 3, 3, 3), MaximumSize = new Size(Font.Height * 30, 0) };
+            AddRow(t, "", _uploadNeeded);
 
             g.Controls.Add(t);
             return g;
-        }
-
-        /// <summary>The Host box edits the bind address in listen mode and the target otherwise.</summary>
-        void LoadHostBox()
-        {
-            bool listen = _settings.Mode == SendMode.DirectListen;
-            bool saved = _suppressEvents;
-            _suppressEvents = true;
-            _host.Text = listen ? _settings.ListenAddress : _settings.Host;
-            _suppressEvents = saved;
-            _hostCaption.Text = listen ? "Listen on" : "Host";
-        }
-
-        /// <summary>"[2400:…]:9000" typed into Host: keep the host there and move the port into the Port box.</summary>
-        void SplitPortFromHost()
-        {
-            if (_settings.Mode == SendMode.DirectListen) return;
-            if (!Endpoint.TryParse(_host.Text, out HostPort? hp, out _) || !hp!.Port.HasValue) return;
-            _host.Text = hp.Host;
-            _port.Value = hp.Port.Value;
         }
 
         void SaveGroup(GroupConfig config)
@@ -483,14 +364,6 @@ namespace HdrCast.Sender.Gui
             catch (Exception ex)
             {
                 AppendLog("[app] could not save the group: " + ex.Message);
-            }
-            if (config.IsConfigured && _settings.Mode != SendMode.P2p && !_runner.IsRunning)
-            {
-                _settings.Mode = SendMode.P2p;
-                bool saved = _suppressEvents;
-                _suppressEvents = true;
-                _mode.SelectedIndex = (int)SendMode.P2p;
-                _suppressEvents = saved;
             }
             RefreshGroupUi();
         }
@@ -538,26 +411,15 @@ namespace HdrCast.Sender.Gui
             left.Controls.Add(browse, 2, 0);
             left.Controls.Add(_ffmpegFound, 3, 0);
 
-            _autoRestart = new CheckBox { Text = "Restart automatically if the stream stops", AutoSize = true };
-            _autoRestart.CheckedChanged += (s, e) => { if (!_suppressEvents) _settings.AutoRestart = _autoRestart.Checked; };
-            left.Controls.Add(Caption(""), 0, 1);
-            left.Controls.Add(_autoRestart, 1, 1);
-
             var buttons = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight, Margin = new Padding(0) };
             _start = new Button { Text = "Start", AutoSize = true, MinimumSize = new Size(Font.Height * 6, 0) };
             _start.Click += (s, e) => StartStream();
             _stop = new Button { Text = "Stop", AutoSize = true, MinimumSize = new Size(Font.Height * 6, 0), Enabled = false };
             _stop.Click += (s, e) => StopStream();
-            _copy = new Button { Text = "Copy commands", AutoSize = true };
-            _copy.Click += (s, e) => CopyCommands();
-            _viewerUrl = new Button { Text = "Copy viewer URL", AutoSize = true };
-            _viewerUrl.Click += (s, e) => CopyViewerUrl();
             _openLogs = new Button { Text = "Open logs", AutoSize = true };
             _openLogs.Click += (s, e) => OpenLogs();
             buttons.Controls.Add(_start);
             buttons.Controls.Add(_stop);
-            buttons.Controls.Add(_copy);
-            buttons.Controls.Add(_viewerUrl);
             buttons.Controls.Add(_openLogs);
 
             outer.Controls.Add(left, 0, 0);
@@ -646,21 +508,10 @@ namespace HdrCast.Sender.Gui
                 _audioCodec.SelectedIndex = _settings.AudioCodec == AudioCodec.Opus ? 1 : 0;
                 _audioBitrate.Value = Clamp(_settings.AudioBitrateKbps, (int)_audioBitrate.Minimum, (int)_audioBitrate.Maximum);
 
-                _mode.SelectedIndex = (int)_settings.Mode;
-                LoadHostBox();
                 _maxViewers.Value = Clamp(_settings.MaxViewers, 1, 16);
                 _uploadMbps.Value = Clamp(_settings.UploadMbps, 0, 100000);
-                _port.Value = Clamp(_settings.Port, 1, 65535);
-                _path.Text = _settings.StreamPath;
-                _user.Text = _settings.User;
-                _password.Text = _settings.Password;
-                _passphrase.Text = _settings.Passphrase;
-                _latency.Value = Clamp(_settings.LatencyMs, (int)_latency.Minimum, (int)_latency.Maximum);
-                _rateControl.Checked = _settings.RateControl;
-                SyncRegionCombo();
 
                 _ffmpegPath.Text = _settings.FfmpegPath;
-                _autoRestart.Checked = _settings.AutoRestart;
             }
             finally { _suppressEvents = false; }
             UpdateOutputInfo();
@@ -668,17 +519,6 @@ namespace HdrCast.Sender.Gui
         }
 
         static decimal Clamp(int value, int min, int max) => value < min ? min : value > max ? max : value;
-
-        void SyncRegionCombo()
-        {
-            int idx = _region.Items.Count - 1;   // "Custom"
-            for (int i = 0; i < SenderSettings.RegionPresets.Length; i++)
-                if (SenderSettings.RegionPresets[i].LatencyMs == _settings.LatencyMs) { idx = i; break; }
-            bool saved = _suppressEvents;
-            _suppressEvents = true;
-            _region.SelectedIndex = idx;
-            _suppressEvents = saved;
-        }
 
         void SaveSettings()
         {
@@ -820,8 +660,7 @@ namespace HdrCast.Sender.Gui
         SendPlan? BuildPlan(bool quiet)
         {
             List<string> problems = _settings.Validate();
-            bool p2p = _settings.Mode == SendMode.P2p;
-            if (p2p && !_group.Current.IsConfigured)
+            if (!_group.Current.IsConfigured)
                 problems.Add("There is no group yet. Click \"Create group…\" (then send the invite to your friends), " +
                              "or \"Paste invite\" to join a friend's group.");
             OutputInfo? output = SelectedOutput;
@@ -848,11 +687,9 @@ namespace HdrCast.Sender.Gui
             var captureArgv = new List<string> { "capture" };
             captureArgv.AddRange(capture.ToArgv());
 
-            // P2P: the encoder's MPEG-TS goes to stdout, into the fan-out that serves every viewer.
-            string url = p2p ? "pipe:1" : SrtUrl.Build(_settings.ToSrtOptions());
+            // The encoder's MPEG-TS goes to stdout (FfmpegPlan's default), into the fan-out that serves every viewer.
             var plan = new FfmpegPlan
             {
-                ProgressUrl = p2p ? "pipe:2" : "pipe:1",
                 VideoPipeName = videoPipe,
                 AudioPipeName = _settings.Audio ? audioPipe : null,
                 PixelFormat = format,
@@ -862,8 +699,6 @@ namespace HdrCast.Sender.Gui
                 Encoder = _settings.ToEncoderSettings(hdr, (int)Math.Round(output.MaxLuminance)),
                 Audio = _settings.Audio ? _settings.AudioCodec : AudioCodec.None,
                 AudioBitrateKbps = _settings.AudioBitrateKbps,
-                Container = _settings.ResolveContainer(),
-                OutputUrl = url,
             };
 
             List<string> ffmpegArgv;
@@ -886,10 +721,8 @@ namespace HdrCast.Sender.Gui
                 CaptureArgv = captureArgv.ToArray(),
                 FfmpegExe = ffmpeg!,
                 FfmpegArgv = ffmpegArgv.ToArray(),
-                OutputUrl = url,
                 Fps = _settings.Fps,
                 PipeNames = pipeNames.ToArray(),
-                TsOnStdout = p2p,
                 Summary = EncoderProfiles.Info(_settings.Encoder).DisplayName + " " + _settings.BitrateMbps + " Mbps " +
                           w + "x" + h + "@" + _settings.Fps + (hdr ? " HDR10" : " SDR"),
             };
@@ -922,37 +755,30 @@ namespace HdrCast.Sender.Gui
             if (plan == null) return;
             SaveSettings();
             AppendLog("[app] " + plan.Summary);
-            if (plan.TsOnStdout)
+            // Viewers come and go through the group; the encoder keeps running for all of them, and a restarted
+            // encoder is spliced into the same fan-out, so a session always restarts automatically.
+            _ts = new SwitchableStream();
+            _p2p = new P2pHost(new P2pHostOptions
             {
-                // Viewers come and go through the group; the encoder keeps running for all of them, and a restarted
-                // encoder is spliced into the same fan-out, so P2P always restarts automatically.
-                _ts = new SwitchableStream();
-                _p2p = new P2pHost(new P2pHostOptions
-                {
-                    Group = _group.Current,
-                    FfmpegPath = plan.FfmpegExe,
-                    BitrateBps = _settings.BitrateBps,
-                    MaxViewers = _settings.MaxViewers,
-                    Job = _job,
-                }, _ts, OnRunnerLog);
-                try
-                {
-                    _p2p.Start();
-                }
-                catch (Exception ex)
-                {
-                    AppendLog("[app] cannot start the group session: " + ex.Message);
-                    StopP2p(_p2p, _ts);
-                    _p2p = null;
-                    _ts = null;
-                    return;
-                }
-                _runner.Start(plan, autoRestart: true);
-            }
-            else
+                Group = _group.Current,
+                FfmpegPath = plan.FfmpegExe,
+                BitrateBps = _settings.BitrateBps,
+                MaxViewers = _settings.MaxViewers,
+                Job = _job,
+            }, _ts, OnRunnerLog);
+            try
             {
-                _runner.Start(plan, _settings.AutoRestart);
+                _p2p.Start();
             }
+            catch (Exception ex)
+            {
+                AppendLog("[app] cannot start the group session: " + ex.Message);
+                StopP2p(_p2p, _ts);
+                _p2p = null;
+                _ts = null;
+                return;
+            }
+            _runner.Start(plan, autoRestart: true);
             UpdateEnabledState();
         }
 
@@ -960,61 +786,6 @@ namespace HdrCast.Sender.Gui
         {
             try { p2p?.Stop(); } catch (Exception) { }
             try { ts?.Dispose(); } catch (Exception) { }
-        }
-
-        void CopyCommands()
-        {
-            SendPlan? plan = BuildPlan(false);
-            if (plan == null) return;
-            string text =
-                "REM Paste these into two command prompts (in this order).\r\n" +
-                "REM In a .bat/.cmd FILE every % must be doubled (%% ) — at an interactive prompt paste as is.\r\n" +
-                "REM 1) capture engine (creates the named pipes)\r\n" +
-                ArgQuote.Quote(plan.CaptureExe) + " " + ArgQuote.Join(plan.CaptureArgv) + "\r\n\r\n" +
-                "REM 2) ffmpeg (connects to the pipes and sends over SRT)\r\n" +
-                ArgQuote.Quote(plan.FfmpegExe) + " " + ArgQuote.Join(plan.FfmpegArgv) + "\r\n";
-            TrySetClipboard(text, "Commands copied to the clipboard.");
-        }
-
-        void CopyViewerUrl()
-        {
-            if (_settings.Mode != SendMode.Relay)
-            {
-                MessageBox.Show(this,
-                    "A viewer URL can only be generated for relay mode.\n\n" +
-                    "In direct mode the viewer connects to this PC's public address (or you dial the viewer), " +
-                    "with the same passphrase — see docs/network.md.",
-                    "HdrCast", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                return;
-            }
-            var options = _settings.ToSrtOptions();
-            options.Role = SrtRole.Read;
-            options.User = "viewer";
-            options.Password = "<viewer password>";
-            options.Passphrase = "<read passphrase>";
-            options.LatencyMs = 1500;
-            options.RateControl = false;
-            options.IncludeRecvSocketBuffer = true;
-            string url;
-            try { url = SrtUrl.Build(options); }
-            catch (Exception ex) { MessageBox.Show(this, ex.Message, "HdrCast", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
-            TrySetClipboard(url,
-                "Viewer URL copied.\n\nReplace the placeholders with the viewer credentials from relay/setup.sh, " +
-                "use the relay's public address, and set the latency for the viewer's region " +
-                "(Japan 1500 / Australia 2000 / China 3500 ms).");
-        }
-
-        void TrySetClipboard(string text, string message)
-        {
-            try
-            {
-                Clipboard.SetText(text);
-                MessageBox.Show(this, message, "HdrCast", MessageBoxButtons.OK, MessageBoxIcon.Information);
-            }
-            catch (Exception ex)
-            {
-                AppendLog("[app] clipboard failed: " + ex.Message);
-            }
         }
 
         void OpenLogs()
@@ -1142,7 +913,6 @@ namespace HdrCast.Sender.Gui
                     _stViewers.Text = host.Status + "  |  " + list + (viewers.Count > 0 ? "  |  upload ≈ " + Math.Ceiling(host.UploadMbps) + " Mbps" : "");
                 }
             }
-            else if (_settings.Mode != SendMode.P2p) _stViewers.Text = "—";
             else if (!_runner.IsRunning) _stViewers.Text = _group.Current.IsConfigured ? "Offline" : "No group yet";
 
             UpdateEnabledState();
@@ -1169,25 +939,9 @@ namespace HdrCast.Sender.Gui
             _audioDevice.Enabled = !running && _settings.Audio;
             _audioCodec.Enabled = !running && _settings.Audio;
             _audioBitrate.Enabled = !running && _settings.Audio;
-            _mode.Enabled = !running;
-            bool p2p = _settings.Mode == SendMode.P2p;
-            foreach (Control c in _p2pRows) c.Visible = p2p;
-            foreach (Control c in _manualRows) c.Visible = !p2p;
-            _viewerUrl.Visible = !p2p;
-            _autoRestart.Visible = !p2p;
             _createGroup.Enabled = !running;
             _pasteInvite.Enabled = !running;
             _maxViewers.Enabled = !running;
-            _host.Enabled = !running;
-            _port.Enabled = !running;
-            bool relay = _settings.Mode == SendMode.Relay;
-            _path.Enabled = !running && relay;
-            _user.Enabled = !running && relay;
-            _password.Enabled = !running && relay;
-            _passphrase.Enabled = !running;
-            _region.Enabled = !running;
-            _latency.Enabled = !running;
-            _rateControl.Enabled = !running;
             _ffmpegPath.Enabled = !running;
         }
 

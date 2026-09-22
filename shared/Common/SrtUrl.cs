@@ -5,18 +5,19 @@ using System.Text;
 
 namespace HdrCast.Common
 {
-    /// <summary>How the SRT socket reaches its peer.</summary>
+    /// <summary>
+    /// How the SRT socket reaches its peer. In P2P mode both ends are local: each viewer's remux ffmpeg listens on
+    /// 127.0.0.1 and mpv calls 127.0.0.1; HdrCast's own UDP links carry the datagrams in between.
+    /// </summary>
     public enum SrtTopology
     {
-        /// <summary>Caller to a MediaMTX relay; credentials travel in the streamid.</summary>
-        Relay = 0,
         /// <summary>mode=listener on <see cref="SrtUrlOptions.ListenAddress"/> (default 0.0.0.0).</summary>
-        DirectListener = 1,
-        /// <summary>mode=caller straight to the peer's public address.</summary>
-        DirectCaller = 2,
+        Listener = 1,
+        /// <summary>mode=caller to <see cref="SrtUrlOptions.Host"/>.</summary>
+        Caller = 2,
     }
 
-    /// <summary>Whether this side sends (sender app) or receives (receiver app) the stream.</summary>
+    /// <summary>Whether this side sends (a remux child) or receives (mpv) the stream.</summary>
     public enum SrtRole
     {
         Publish = 0,
@@ -26,10 +27,10 @@ namespace HdrCast.Common
     /// <summary>All inputs of <see cref="SrtUrl.Build"/>.</summary>
     public sealed class SrtUrlOptions
     {
-        public SrtTopology Topology { get; set; } = SrtTopology.Relay;
+        public SrtTopology Topology { get; set; } = SrtTopology.Caller;
         public SrtRole Role { get; set; } = SrtRole.Read;
 
-        /// <summary>Relay host or remote peer (name, IPv4 or IPv6, brackets optional); ignored for listeners.</summary>
+        /// <summary>The peer to call (name, IPv4 or IPv6, brackets optional); ignored for listeners.</summary>
         public string Host { get; set; } = "";
         public int Port { get; set; } = 8890;
 
@@ -38,13 +39,6 @@ namespace HdrCast.Common
         /// libsrt refuses the IPv6 wildcard "::" unless SRTO_IPV6ONLY is set, and ffmpeg has no option for it.
         /// </summary>
         public string? ListenAddress { get; set; }
-
-        /// <summary>MediaMTX path (relay only).</summary>
-        public string StreamPath { get; set; } = "screen";
-        /// <summary>MediaMTX user for the streamid (relay only, optional).</summary>
-        public string? User { get; set; }
-        /// <summary>MediaMTX password for the streamid (relay only, optional).</summary>
-        public string? Password { get; set; }
 
         /// <summary>AES passphrase, 10-79 characters; null/empty = unencrypted.</summary>
         public string? Passphrase { get; set; }
@@ -112,7 +106,7 @@ namespace HdrCast.Common
             if (o.OverheadPercent < 5 || o.OverheadPercent > 100)
                 throw new ArgumentException("oheadbw must be 5..100", nameof(o));
 
-            bool listener = o.Topology == SrtTopology.DirectListener;
+            bool listener = o.Topology == SrtTopology.Listener;
             string host = listener ? ListenHostFor(o.ListenAddress) : CallerHostFor(o.Host, o.Port);
 
             var q = new List<KeyValuePair<string, string>>();
@@ -120,11 +114,8 @@ namespace HdrCast.Common
 
             switch (o.Topology)
             {
-                case SrtTopology.DirectListener: Add("mode", "listener"); break;
-                case SrtTopology.DirectCaller: Add("mode", "caller"); break;
-                case SrtTopology.Relay:
-                    Add("streamid", BuildStreamId(o.Role, o.StreamPath, o.User, o.Password));
-                    break;
+                case SrtTopology.Listener: Add("mode", "listener"); break;
+                case SrtTopology.Caller: Add("mode", "caller"); break;
                 default: throw new ArgumentOutOfRangeException(nameof(o), "unknown topology");
             }
 
@@ -235,31 +226,6 @@ namespace HdrCast.Common
             }
             formatted = Endpoint.FormatHost(hp.Host);
             return true;
-        }
-
-        /// <summary>
-        /// MediaMTX custom stream id: publish|read:&lt;path&gt;[:&lt;user&gt;:&lt;pass&gt;]. Components are
-        /// percent-encoded individually (ffmpeg decodes the whole streamid before sending it) and must not
-        /// contain ':' because MediaMTX splits on it after decoding.
-        /// </summary>
-        public static string BuildStreamId(SrtRole role, string path, string? user, string? password)
-        {
-            path = (path ?? "").Trim();
-            if (path.Length == 0) throw new ArgumentException("stream path is required", nameof(path));
-            CheckNoColon(path, "path");
-            var sb = new StringBuilder();
-            sb.Append(role == SrtRole.Publish ? "publish:" : "read:").Append(Encode(path));
-            if (!string.IsNullOrEmpty(user))
-            {
-                CheckNoColon(user!, "user");
-                CheckNoColon(password ?? "", "password");
-                sb.Append(':').Append(Encode(user!)).Append(':').Append(Encode(password ?? ""));
-            }
-            else if (!string.IsNullOrEmpty(password))
-            {
-                throw new ArgumentException("a password needs a user name", nameof(user));
-            }
-            return sb.ToString();
         }
 
         public static void ValidatePassphrase(string? passphrase)
@@ -390,12 +356,6 @@ namespace HdrCast.Common
                 }
             }
             return parts;
-        }
-
-        private static void CheckNoColon(string value, string what)
-        {
-            if (value.IndexOf(':') >= 0)
-                throw new ArgumentException("the " + what + " must not contain ':' (MediaMTX splits the stream id on it)", what);
         }
 
         private static bool IsHex(char c) =>

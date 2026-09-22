@@ -6,15 +6,15 @@ namespace HdrCast.Receiver
     public enum MpvExitReason
     {
         Unknown = 0,
-        /// <summary>MediaMTX rejected the reader because nobody publishes yet ("no stream is available").</summary>
+        /// <summary>The server had nothing to play yet ("no stream is available"; kept for old relay-style servers).</summary>
         NoPublisher = 1,
-        /// <summary>Connection refused / timed out / reset (relay down, port not forwarded, ...).</summary>
+        /// <summary>Connection refused / timed out / reset (the path to the host is not up, or the host stopped).</summary>
         ConnectionFailed = 2,
         /// <summary>Wrong passphrase or credentials.</summary>
         AuthFailed = 3,
         /// <summary>The mpv build cannot open srt:// (no libsrt).</summary>
         ProtocolUnsupported = 4,
-        /// <summary>The stream ended (publisher stopped).</summary>
+        /// <summary>The stream ended (the host stopped).</summary>
         EndOfStream = 5,
         /// <summary>The user closed the mpv window / quit was sent.</summary>
         Quit = 6,
@@ -88,7 +88,7 @@ namespace HdrCast.Receiver
             return best;
         }
 
-        /// <summary>True for lines that mean "nothing to play yet, retry" (relay without publisher or unreachable).</summary>
+        /// <summary>True for lines that mean "nothing to play yet, retry" (nothing published yet, or unreachable).</summary>
         public static bool IsStreamUnavailable(string? line)
         {
             var r = ClassifyLine(line);
@@ -99,8 +99,8 @@ namespace HdrCast.Receiver
         {
             switch (reason)
             {
-                case MpvExitReason.NoPublisher: return "relay has no publisher yet";
-                case MpvExitReason.ConnectionFailed: return "could not connect (relay down, wrong host/port, or no publisher yet)";
+                case MpvExitReason.NoPublisher: return "nothing to play yet";
+                case MpvExitReason.ConnectionFailed: return "could not connect (the path to the host is not up yet, or the host stopped)";
                 case MpvExitReason.AuthFailed: return "rejected: check passphrase / user / password";
                 case MpvExitReason.ProtocolUnsupported: return "this mpv build cannot open srt:// (use the ffmpeg pipe frontend or a shinchiro/zhongfly build)";
                 case MpvExitReason.EndOfStream: return "stream ended";

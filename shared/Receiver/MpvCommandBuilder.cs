@@ -45,17 +45,19 @@ namespace HdrCast.Receiver
 
         public static string PipeName(int pid) => "hdrcast-mpv-" + pid.ToString(CultureInfo.InvariantCulture);
 
-        public static string BuildUrl(ReceiverSettings s) => SrtUrl.Build(s.ToSrtOptions());
+        public static string BuildUrl(ReceiverSettings s, int localPort, string passphrase) =>
+            SrtUrl.Build(s.ToSrtOptions(localPort, passphrase));
 
         /// <summary>
-        /// Builds the launch plan. <paramref name="pid"/> is the GUI process id (unique IPC pipe per instance).
-        /// <paramref name="ffmpegExe"/> is only needed for <see cref="ReceiverFrontend.FfmpegPipe"/>.
+        /// Builds the launch plan for the local end of a P2P session (<paramref name="localPort"/> on 127.0.0.1, the
+        /// group's <paramref name="passphrase"/>). <paramref name="pid"/> is the GUI process id (unique IPC pipe per
+        /// instance); <paramref name="ffmpegExe"/> is only needed for <see cref="ReceiverFrontend.FfmpegPipe"/>.
         /// </summary>
-        public static MpvLaunchPlan Build(ReceiverSettings s, int pid, string mpvExe, string? ffmpegExe = null)
+        public static MpvLaunchPlan Build(ReceiverSettings s, int localPort, string passphrase, int pid, string mpvExe, string? ffmpegExe = null)
         {
             if (s == null) throw new ArgumentNullException(nameof(s));
             if (string.IsNullOrEmpty(mpvExe)) throw new ArgumentException("mpv path required", nameof(mpvExe));
-            string url = BuildUrl(s);
+            string url = BuildUrl(s, localPort, passphrase);
             string pipe = PipeName(pid);
 
             if (s.Frontend == ReceiverFrontend.FfmpegPipe)

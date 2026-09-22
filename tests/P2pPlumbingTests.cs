@@ -101,30 +101,24 @@ namespace HdrCast.Tests
         }
 
         [Fact]
-        public void P2p_settings_skip_the_manual_fields_and_refuse_av1()
+        public void Sender_settings_need_no_connection_fields()
         {
-            var s = new SenderSettings { Mode = SendMode.P2p, Host = "" }.Normalize();
+            var s = new SenderSettings().Normalize();
             Assert.Empty(s.Validate());
-            Assert.Throws<InvalidOperationException>(() => s.ToSrtOptions());
-            s.Encoder = VideoEncoder.Av1Nvenc;
-            Assert.Contains(s.Validate(), p => p.Contains("AV1"));
-            Assert.Equal(4, new SenderSettings().Normalize().MaxViewers);
+            Assert.Equal(4, s.MaxViewers);
             Assert.Equal(16, new SenderSettings { MaxViewers = 99 }.Normalize().MaxViewers);
         }
 
         [Fact]
-        public void P2p_receiver_settings_become_a_local_caller()
+        public void Receiver_settings_become_a_local_caller()
         {
-            var r = new ReceiverSettings { Mode = ConnectionMode.P2p, LatencyMs = 3500 }.Normalize();
+            var r = new ReceiverSettings { LatencyMs = 3500 }.Normalize();
             Assert.Empty(r.Validate());
-            Assert.Throws<InvalidOperationException>(() => r.ToSrtOptions());
-            Assert.Equal(50, r.P2pOverheadPercent);
-            ReceiverSettings local = r.ForP2pLocalPort(40123, "a77MWmBi3_603E3kH2abfOI5O-dIU5dn");
-            string url = HdrCast.Common.SrtUrl.Build(local.ToSrtOptions());
+            Assert.Equal(50, r.OverheadPercent);
+            string url = HdrCast.Common.SrtUrl.Build(r.ToSrtOptions(40123, "a77MWmBi3_603E3kH2abfOI5O-dIU5dn"));
             Assert.StartsWith("srt://127.0.0.1:40123?mode=caller", url);
             Assert.Contains("latency=3500000", url);
             Assert.Contains("pbkeylen=32", url);
-            Assert.Equal(ConnectionMode.P2p, r.Mode);                  // the original is untouched
         }
     }
 

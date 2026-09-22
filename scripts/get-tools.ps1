@@ -159,7 +159,7 @@ function Show-FfmpegReport([string] $Exe) {
     $version = (& $Exe -hide_banner -version 2>&1 | Select-Object -First 1)
     Write-Ok $version
     $encoders = & $Exe -hide_banner -encoders 2>&1 | Out-String
-    foreach ($name in @('hevc_nvenc', 'av1_nvenc', 'hevc_amf', 'av1_amf', 'hevc_qsv', 'libx265')) {
+    foreach ($name in @('hevc_nvenc', 'hevc_amf', 'hevc_qsv', 'libx265')) {
         if ($encoders -match [regex]::Escape($name)) {
             Write-Ok "$name present"
         } else {

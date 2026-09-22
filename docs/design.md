@@ -8,54 +8,12 @@
 - 用户：本人（东京，Windows 11 + RTX 4090 + AW3225QF 4K HDR）和朋友们（中国 / 日本 / 澳大利亚，可能同时观看）。
 - 码率可自定义（10~100 Mbps）；画面不糊、不卡；延迟可以大（1~5 s，"推流式"而非远程桌面式）。
 - HDR10 全链路；带桌面音频。
-- v0.2（2026-09）：**不依赖用户家的 LXC**，做成点对点：谁都能开播，同组朋友直接从主播电脑收流（§1.3、§8）。
+- v0.2（2026-09）：**只有点对点模式**，不依赖用户家的 LXC：谁都能开播，同组朋友直接从主播电脑收流（§1、§8）。
+  v0.1 的 MediaMTX 中继模式和手动直连模式已删除（AV1 只能走直连，所以一起去掉，只剩 HEVC）。
   腾讯云服务器只做信令（几百字节的签名元数据），**不转视频**；连不上时不中转，只提示原因。
 - 很多人没有公网 IPv4，但大多有 IPv6：点对点优先走 IPv6 打洞，IPv4 打洞只是额外尝试。配对用邀请码，不手输地址。
 
 ## 1. 架构
-
-```
-┌──────────────── 发送端 Windows PC ────────────────┐
-│ HdrCastSender.exe (GUI)                            │
-│   ├─ 子进程 A: HdrCastSender.exe capture ...       │   采集引擎（同一个 exe 的命令行模式）
-│   │     DXGI Desktop Duplication (FP16 scRGB / BGRA8)
-│   │     → D3D11 compute shader → P010 (HDR10) 或 NV12 (SDR)
-│   │     → 命名管道 \\.\pipe\hdrcast-video           │
-│   │     WASAPI loopback → f32le 48k 2ch → \\.\pipe\hdrcast-audio
-│   └─ 子进程 B: ffmpeg.exe                          │   只做编码 + 封装 + 发送
-│         -f rawvideo ... -i \\.\pipe\hdrcast-video   │
-│         -f f32le ... -i \\.\pipe\hdrcast-audio      │
-│         -c:v hevc_nvenc (main10) -c:a aac -f mpegts srt://...
-└────────────────────────────────────────────────────┘
-                     │ SRT (AES-256, latency 0.5~1 s, LAN)
-                     ▼
-┌──────── LXC 192.168.1.201 (Docker) ────────┐
-│ MediaMTX 1.21  路径 screen                  │   路由器放行 8890/udp（可选 8888/tcp HLS）
-│ publish 与 read 分别鉴权 + 分别 passphrase   │
-└─────────────────────────────────────────────┘
-                     │ SRT (latency 1.5~4 s，按地区)
-                     ▼
-┌──────────── 观众 Windows PC ────────────┐
-│ HdrCastReceiver.exe (GUI) → mpv.exe      │   gpu-next + d3d11 + target-colorspace-hint
-│   HDR 屏：PQ 直通；SDR 屏：mpv 色调映射   │
-└─────────────────────────────────────────┘
-```
-
-上图是 v0.1 的中继模式（仍保留为可选模式，见 §4）。默认的点对点模式见 §1.3。
-
-### 1.1 为什么采集不用 ffmpeg 的 ddagrab
-
-ddagrab 本身能拿到正确标注的 scRGB FP16 D3D11 帧，但 ffmpeg **没有任何无损桥梁**把打包 FP16 送进 zscale / libplacebo：
-swscale 的 `rgbaf16` 输入路径经 16 位整数中转，把所有 > 1.0（即 > 80 nit）的值裁掉（7.1.5 / 8.0 / 9.0.1 三个版本本机实测：2.5 → 1.0，125 → 1.0）；
-zscale 不收打包浮点；Vulkan / CUDA 不能导入 D3D11 纹理；libplacebo 把 `LINEAR` 当 203 nit SDR。
-因此色彩转换必须在 GPU 上自己做，然后把 P010 喂给 ffmpeg —— 这正是 OBS 的做法。附带好处：音频可以在同一进程用 WASAPI loopback 抓，不用装虚拟声卡。
-
-### 1.2 为什么默认 HEVC 而不是 AV1
-
-ffmpeg（7.1 与 master）的 mpegts 封装器和 MediaMTX 都**不支持 AV1-in-MPEG-TS**（本机实测：写成 private stream，读回是 bin_data）。
-走中继就只能 HEVC Main10。AV1 只在「直连模式」（无中继，`-f matroska -live 1` over SRT）可选。
-
-### 1.3 点对点模式（v0.2 默认）
 
 ```
 主播 PC                                                                     观众 PC
@@ -66,13 +24,28 @@ ffmpeg（7.1 与 master）的 mpegts 封装器和 MediaMTX 都**不支持 AV1-in
         └──── 签名的 live / join / answer ──── 腾讯云 hdrcast-signal ────────┘
 ```
 
+主播端 `HdrCastSender.exe` 的采集部分（子进程 A：同一个 exe 的 `capture` 模式，DXGI 桌面复制 → D3D11 shader → P010/NV12 →
+命名管道；WASAPI loopback → 音频管道）和编码 ffmpeg（子进程 B，只做编码 + 封装）见 §2；观众端 `HdrCastReceiver.exe` 启动 mpv，见 §3。
+
 - 为什么这样分：SRT 本身端到端不变（AES、重传、按观众的 latency），HdrCast 只在两端各加一个透明 UDP 转发器负责打洞；
-  ffmpeg 的 SRT listener 只接受一个连接，所以每位观众一个 remux 子进程，一路编码喂给所有子进程。媒体不经过 MediaMTX，
-  gosrt 的大帧断连问题（mediamtx#6249）在这个模式下不存在。
+  ffmpeg 的 SRT listener 只接受一个连接，所以每位观众一个 remux 子进程，一路编码喂给所有子进程。
 - 编码器 stdout 直接进分发器（`-progress` 改到 stderr，按"key=value"行过滤）：比让 ffmpeg 往 Windows 命名管道写输出更稳
   （后者要 `-y` 且依赖 CreateFile 对管道的处理，无法在 Linux 上验证）。编码器自动重启时新 stdout 接进同一个 SwitchableStream，观众不掉线。
 - 实现：`shared/Group`（邀请码、密钥、签名消息、group.json）、`shared/P2p`（打洞、链路、分发、信令客户端、P2pHost、ViewerSession）、
   `signal/`（信令服务器）。协议与格式见 §8。
+
+### 1.1 为什么采集不用 ffmpeg 的 ddagrab
+
+ddagrab 本身能拿到正确标注的 scRGB FP16 D3D11 帧，但 ffmpeg **没有任何无损桥梁**把打包 FP16 送进 zscale / libplacebo：
+swscale 的 `rgbaf16` 输入路径经 16 位整数中转，把所有 > 1.0（即 > 80 nit）的值裁掉（7.1.5 / 8.0 / 9.0.1 三个版本本机实测：2.5 → 1.0，125 → 1.0）；
+zscale 不收打包浮点；Vulkan / CUDA 不能导入 D3D11 纹理；libplacebo 把 `LINEAR` 当 203 nit SDR。
+因此色彩转换必须在 GPU 上自己做，然后把 P010 喂给 ffmpeg —— 这正是 OBS 的做法。附带好处：音频可以在同一进程用 WASAPI loopback 抓，不用装虚拟声卡。
+
+### 1.2 为什么只有 HEVC、没有 AV1
+
+ffmpeg（7.1 与 master）的 mpegts 封装器**不支持 AV1-in-MPEG-TS**（本机实测：写成 private stream，读回是 bin_data；
+`EncoderArgsIntegrationTests.Av1_really_cannot_be_muxed_into_mpegts` 盯着它）。点对点的分发靠 MPEG-TS（中途加入的观众靠 TS 的重复头恢复），
+所以只能 **HEVC Main10**。v0.1 的直连模式可以用 Matroska 走 AV1，但直连模式已随中继一起删除。
 
 ## 2. 发送端
 
@@ -152,34 +125,35 @@ uint cr10 = (uint)round(512.0 + 896.0 * Cr);
 ### 2.5 ffmpeg 命令模板
 
 ```
-ffmpeg -hide_banner -loglevel warning -stats_period 1 -progress pipe:1 -nostdin
-  -thread_queue_size 1024 -f rawvideo -pix_fmt {p010le|nv12} -video_size WxH -framerate FPS -i \\.\pipe\hdrcast-video
-  -thread_queue_size 1024 -f f32le -ar 48000 -ac 2 -i \\.\pipe\hdrcast-audio          ← 音频关闭时省略
+ffmpeg -hide_banner -loglevel warning -nostdin -stats_period 1 -progress pipe:2
+  -thread_queue_size 1024 -f rawvideo -pix_fmt {p010le|nv12} -video_size WxH -framerate FPS -i \\.\pipe\hdrcast-video-<pid>
+  -thread_queue_size 1024 -f f32le -ar 48000 -ac 2 -i \\.\pipe\hdrcast-audio-<pid>    ← 音频关闭时省略
   {编码器参数：见 EncoderProfiles，来自 docs/research/encoder-settings}
   {HDR: -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc -color_range tv}
   {SDR: -color_primaries bt709  -color_trc bt709    -colorspace bt709    -color_range tv}
   -c:a aac -b:a 192k -ac 2                                                             ← 可选 libopus 128k
-  -muxdelay 0 -muxpreload 0 -f mpegts -mpegts_flags +resend_headers
-  "srt://HOST:PORT?{SRT 参数}"
+  -muxdelay 0 -muxpreload 0 -f mpegts -mpegts_flags +resend_headers pipe:1
 ```
 
-- `-progress pipe:1` 输出 `key=value` 行（fps、bitrate、speed、frame、drop_frames、dup_frames、out_time_us），GUI 解析显示。
-- 默认编码器：`hevc_nvenc`，`-profile:v main10`（HDR）/ `main`（SDR）。备选按探测结果：`hevc_amf`、`hevc_qsv`、`libx265`。AV1（`av1_nvenc`）**只在直连模式**可选，此时封装用 `-f matroska -live 1`（MediaMTX 不支持）。
-- 输出像素格式按编码器显式指定：硬件编码器吃 `p010le` / `nv12`（即采集引擎的原生输出），CPU 编码器只收平面格式，必须写 `yuv420p10le` / `yuv420p`，否则 ffmpeg 可能协商成 8 bit，HDR 精度悄悄丢失。
+- stdout（`pipe:1`）是 MPEG-TS 本身，进 P2P 分发（§8.8）；`-progress pipe:2` 的 `key=value` 行（fps、bitrate、speed、frame、drop_frames、
+  dup_frames、out_time_us）和日志共用 stderr，按行的形状区分后给 GUI 显示。
+- 默认编码器：`hevc_nvenc`，`-profile:v main10`（HDR）/ `main`（SDR）。备选按探测结果：`hevc_amf`、`hevc_qsv`、`libx265`。
+- 输出像素格式按编码器显式指定：硬件编码器吃 `p010le` / `nv12`（即采集引擎的原生输出），libx265 只收平面格式，必须写 `yuv420p10le` / `yuv420p`，否则 ffmpeg 可能协商成 8 bit，HDR 精度悄悄丢失。
 - **libx265 的坑（本机实测 7.1.5）**：ffmpeg 的 libx265 封装只把 `-colorspace` 和 `-color_range` 传给 x265，`-color_primaries` 与 `-color_trc` **不会**进 VUI（ffprobe 读回是 `unknown`）。必须在 `-x265-params` 里写 `colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:range=limited`，否则观众端拿到的是无标记流，会按 SDR 显示。
-- **libsvtav1 的坑（本机实测）**：`-maxrate` 只在 CRF 模式可用（否则报 "Max Bitrate only supported with CRF mode"），`rc=2`（CBR）要求低延迟预测结构（否则报 "CBR Rate control is currently not supported for SVT_AV1_PRED_RANDOM_ACCESS"）。所以这条路走 VBR（`rc=1`），码率由 SRT 侧兜。
 - 编码器探测：启动时运行 `ffmpeg -hide_banner -encoders`，再对候选编码器做 1 帧 `-f lavfi -i nullsrc ... -f null -` 试编码判断可用。
 
 ### 2.6 SRT 参数（单位：`latency` 等是**微秒**）
 
-| 场景 | 发送端 URL 参数 |
-|---|---|
-| 中继推流（默认） | `streamid=publish:screen:sender:<pw>&passphrase=<PUB_KEY>&pbkeylen=32&pkt_size=1316&transtype=live&latency=800000&maxbw=0&inputbw=<bitrate/8>&oheadbw=25&sndbuf=64000000&ffs=64000&connect_timeout=5000` |
-| 直连·本机监听 | `mode=listener&passphrase=<KEY>&pbkeylen=32&latency=<按地区>&pkt_size=1316&listen_timeout=-1&maxbw=0&inputbw=..&oheadbw=..&sndbuf=..&ffs=..`（本机需路由器转发该 UDP 端口） |
-| 直连·拨号到朋友 | `mode=caller&passphrase=<KEY>&pbkeylen=32&latency=<按地区>&pkt_size=1316&...`（朋友侧监听） |
+两个 SRT 端点都在本机回环上，中间的 WAN 段由 HdrCast 自己的 UDP 链路搬运（§8.6）：
 
-- 缓冲大小公式：`packets = latency_s × bitrate_bps / (1316×8)`；`ffs ≥ packets`，`sndbuf/rcvbuf ≥ packets × 1472`。GUI 按码率 × 延迟自动算。
-- **禁用 rendezvous**（ffmpeg 会 bind 到远端地址，无法用）。
+| 端点 | URL |
+|---|---|
+| 主播端：每位观众的 remux 子进程 | `srt://127.0.0.1:<Y>?mode=listener&passphrase=<组派生>&pbkeylen=32&pkt_size=1316&transtype=live&latency=<观众要求>&maxbw=0&inputbw=<bitrate/8>&oheadbw=<观众要求>&sndbuf=..&ffs=..&listen_timeout=-1` |
+| 观众端：mpv | `srt://127.0.0.1:<L>?mode=caller&passphrase=<组派生>&pbkeylen=32&pkt_size=1316&transtype=live&latency=<地区预设>&rcvbuf=..&ffs=..&recv_buffer_size=8000000&connect_timeout=5000` |
+
+- 缓冲大小公式：`packets = latency_s × bitrate_bps / (1316×8)`；`ffs ≥ packets`，`sndbuf/rcvbuf ≥ packets × 1472`（`SrtBufferSizing`）。
+- listener 只能绑具体地址：libsrt 绑 `[::]` 必须显式设 SRTO_IPV6ONLY，而 ffmpeg 没有这个选项（实测 "Operation not supported"）。这里只绑 127.0.0.1，不受影响。
+- 不用 ffmpeg 的 `mode=rendezvous`（它会 bind 到远端地址）；打洞由 HdrCast 自己做。
 
 ### 2.7 GUI（WinForms，代码生成 UI，不用设计器 resx）
 
@@ -187,15 +161,15 @@ ffmpeg -hide_banner -loglevel warning -stats_period 1 -progress pipe:1 -nostdin
 1. 显示器：下拉列表（来自 `list-outputs`），显示 HDR 状态；刷新按钮。模式：自动 / 强制 SDR。
 2. 画质：编码器（探测结果）、码率 Mbps（数字框 + 预设 20/40/80）、帧率（30/60/120）、输出分辨率（原生 / 2560×1440 / 1920×1080）、质量档（速度优先 / 均衡 / 画质优先 → 映射到各编码器 preset）、GOP 秒（默认 2）、B 帧开关、lookahead 开关。
 3. 音频：开关、设备、编码（AAC 192k / Opus 128k）。
-4. 目标：模式（中继 / 直连监听 / 直连拨号）、主机、端口、路径/streamid 用户密码、passphrase、延迟 ms（地区预设：日本 1500 / 澳洲 2000 / 中国 3500）。
-5. 控制：开始 / 停止、复制 ffmpeg 命令、打开日志目录；状态栏：采集 fps / 重复帧 / 编码 fps / 码率 / speed / 丢帧 / 已运行时间。
+4. 组（Share with your group）：组名、Create group… / Paste invite / Copy invite、Max viewers、本机上行（用于"需要多少上行"的提示）。
+5. 控制：Start / Stop、Open logs；状态栏：采集 fps / 重复帧 / 编码 fps / 码率 / speed / 丢帧 / 已运行时间 / 观众（名字、IPv6/IPv4、RTT、所需上行）。
 6. ffmpeg 路径：自动查找（exe 同目录 `ffmpeg.exe`、`tools\ffmpeg.exe`、PATH），可浏览；缺失时提示下载 gyan.dev **full** 版。
 - 配置文件：`%APPDATA%\HdrCast\sender.json`（`DataContractJsonSerializer`）。
-- 崩溃保护：ffmpeg 或采集进程意外退出 → 停止另一方，显示原因，可选「自动重连」（间隔 3 s 重启）。
+- 崩溃保护：ffmpeg 或采集进程意外退出 → 停止另一方，3 s 后自动重启；新编码器的 stdout 接进同一个分发器，观众不用重新加入。
 - 进程树：两个 GUI 都创建 **Job Object（KILL_ON_JOB_CLOSE）** 并把每个子进程加入，任务管理器强杀 GUI 或 GUI 崩溃时子进程一起死。采集引擎另有 `--parent-pid`（用一个 `OpenProcess(SYNCHRONIZE)` 句柄轮询，不是每帧扫全系统进程表）。
 - **启动顺序**：采集引擎必须先把**两个**管道都建好，GUI 轮询到管道出现后才启动 ffmpeg（固定 sleep 不够：引擎要先建 D3D11 设备并编译 shader）。音频管道必须在等待视频管道客户端**之前**创建，否则两边互等。
 - 音频端点打不开时**不终止会话**：管道照建，写静音，日志说明原因（ffmpeg 已经被告知有音频输入，缺管道会直接退出）。
-- 日志与界面里的命令行一律经 `SecretRedactor` 脱敏（passphrase 与 streamid 里的密码），因为 README 会让用户把日志发出来排障。
+- 日志与界面里的命令行一律经 `SecretRedactor` 脱敏（passphrase 与邀请码），因为 README 会让用户把日志发出来排障。
 
 ## 3. 接收端
 
@@ -210,26 +184,23 @@ mpv --vo=gpu-next --gpu-api=d3d11 --hwdec=d3d11va
     --demuxer-lavf-probesize=5000000 --demuxer-lavf-analyzeduration=2
     --input-ipc-server=\\.\pipe\hdrcast-mpv --keep-open=no --force-window=yes --title="HdrCast"
     [--fs --fs-screen=N]
-    "srt://HOST:8890?streamid=read:screen:viewer:<pw>&passphrase=<READ_KEY>&latency=<µs>&rcvbuf=<bytes>&ffs=<n>&recv_buffer_size=8000000"
+    "srt://127.0.0.1:<L>?mode=caller&passphrase=<组派生>&pbkeylen=32&latency=<µs>&rcvbuf=<bytes>&ffs=<n>&recv_buffer_size=8000000"
 ```
 
 - SRT 选项一律放 URL 查询串（`--demuxer-lavf-o` 到不了协议层）。
 - `rcvbuf/ffs` **必须**按 码率 × 延迟 计算（否则 > 40 Mbps + 2 s 时 libsrt 会 "No room to store incoming packet" 断线）。码率由用户在 GUI 填（或默认按 100 Mbps × 延迟上限算，宁大勿小）。
-- MediaMTX 在推流未开始时会直接拒绝读者 → GUI 循环重试（3 s 间隔，显示"等待推流…"）。
+- mpv 只在打洞路径建好后启动；之后路径断了由 ViewerSession 在同一个本地端口上重新加入，mpv 每 3 s 自己重连。
 - HDR 直通只在 `--wid` 嵌入或独立窗口下都以「窗口化 HDR」工作，静态元数据只在全屏时下发 → 提供全屏按钮（`--fs`，不用 `--d3d11-exclusive-fs`）。
 - **不嵌入 libmpv**，独立启动 mpv.exe；用 JSON IPC 命名管道读 `demuxer-cache-duration`、`frame-drop-count`、`video-params`、`video-target-params`、`hwdec-current`、`estimated-vf-fps`、`paused-for-cache` 显示状态。
-- 兜底：「用 ffmpeg 拉流」模式 = `ffmpeg -i srt://... -c copy -f mpegts - | mpv -`（万一 mpv 构建没带 libsrt）。
+- 兜底：「用 ffmpeg 拉流」模式 = `ffmpeg -i srt://127.0.0.1:<L>?... -c copy -f mpegts - | mpv -`（万一 mpv 构建没带 libsrt）。
 - mpv 路径：同目录 `mpv.exe` / `tools\mpv.exe` / PATH；缺失时提示下载 shinchiro 或 zhongfly 构建（均带 libsrt）。
-- 直连模式：接收端也可做 `mode=listener`（朋友转发端口）或 `mode=caller`。
 - 配置：`%APPDATA%\HdrCast\receiver.json`。
 
-## 4. 中继（relay/，可选）
+## 4. 信令服务器（signal/）
 
-> v0.2 起默认用点对点模式（§1.3），中继是给有公网入口、愿意自己跑 MediaMTX 的人的可选模式。
-
-- `docker-compose.yml` + `mediamtx.yml`：见调研交付（已 `--validate-conf` 并跑通 50/100 Mbps HEVC10）。要点：`writeQueueSize: 2048`、`udpReadBufferSize: 4000000`（宿主 `sysctl -w net.core.rmem_max=16777216`）、`authInternalUsers` 分 sender / viewer、路径 `screen` 分 `srtPublishPassphrase` / `srtReadPassphrase`、`hls: yes`（浏览器兜底，SDR 观感由浏览器决定）。
-- `relay/setup.sh`：生成随机密码与 passphrase 写入 `mediamtx.yml` 与 `relay/.env`，打印给发送端 / 接收端填的 URL；`relay/selftest.sh`：用本机 ffmpeg 生成合成 HDR10 HEVC 源推到中继，再用 ffprobe 读回校验 `smpte2084 / bt2020 / yuv420p10le`。
-- 端口：8890/udp（必转发）、8888/tcp（可选）、9997 仅本机。
+- `signal/hdrcast_signal.py`：只用 Python 标准库（≥ 3.6），实现 §8.5 的 HTTP API 和 §8.7 的 UDP 回显；只把组注册表写盘。
+- `signal/hdrcast-signal.service`：systemd 加固运行（DynamicUser、ProtectSystem=strict、MemoryMax=64M）；`signal/deploy.sh` 经 ssh 安装 / 升级 / 卸载。
+- 部署在腾讯云 `101.43.23.94`：TCP 18650（API）、UDP 18651（IPv4 回显，可选），安全组放行。它只转几百字节的签名元数据，从不转视频。
 
 ## 5. 网络与地区预设
 
@@ -239,19 +210,20 @@ mpv --vo=gpu-next --gpu-api=d3d11 --hwdec=d3d11va
 | 澳大利亚 | 120~160 ms | 2000 ms | 25 |
 | 中国（跨境丢包） | 60~120 ms + 丢包 | 3500 ms | 50 |
 
-发送端 → 中继在 LAN 内：800 ms 足够。总延迟 ≈ 发送 SRT + 接收 SRT + mpv `cache-pause-wait` + 编码 lookahead（~0.1 s）。
-点对点模式没有"发送端 → 中继"那一跳：观众的地区预设随加入请求发给主播，主播给他的 remux 子进程就用这个 latency / oheadbw。
+观众的地区预设随加入请求发给主播，主播给他的 remux 子进程就用这个 latency / oheadbw。
+总延迟 ≈ 观众的 SRT latency + mpv `cache-pause-wait`（1.5 s）+ 编码（~0.4 s）。
 
 ## 6. 工程与构建
 
 - `sender/`、`receiver/`：net48 WinForms，`Microsoft.NETFramework.ReferenceAssemblies`，`ILRepack.Lib.MSBuild.Task` 把 SharpDX(.DXGI/.Direct3D11/.D3DCompiler 4.2.0)、NAudio.Core/NAudio.Wasapi 2.2.1 合并成单 exe；合并失败则退回「exe + DLL 目录」。
 - `shared/`：平台无关逻辑（命令行构造、SRT URL / 缓冲计算、`-progress` 与 mpv IPC 解析、设置模型、编码器档位表），以源码链接方式编进两个 exe 与 `tests/`（net10 + xunit，本机运行）。
-- `build.sh`：`dotnet build -c Release` 两个工程 → `dist/HdrCast-<ver>/`（exe、`relay/`、`scripts/`、`docs/`、README）。
+- `build.sh`：`dotnet build -c Release` 两个工程 → `dotnet test` + 信令服务器的 Python 测试 → `dist/HdrCast-<ver>/`（exe、`signal/`、`scripts/`、`docs/`、README）。
 - 配置存 `%APPDATA%\HdrCast\`；日志存 `%APPDATA%\HdrCast\logs\`。
 
 ## 7. 验证计划
 
-Linux 本机：`dotnet build` 0 警告；`dotnet test` 覆盖命令行构造 / URL / 缓冲计算 / 解析器；`relay/selftest.sh` 跑通合成 HDR10 → MediaMTX → ffprobe。
+Linux 本机：`dotnet build` 0 警告；`dotnet test` 覆盖命令行构造 / URL / 缓冲计算 / 解析器 / 邀请码与签名（golden 向量）/ 打洞（模拟有状态防火墙）/
+全栈端到端（真 Python 信令服务器 + 真 libx265 HDR10 编码 + P2pHost + 两个 ViewerSession + ffprobe）；`python3 -m unittest discover -s signal/tests`。
 Windows（只能由用户做）：`list-outputs` 正确识别 HDR；`capture` 单独跑 10 s 落盘为 `.p010` 用 ffmpeg 转 PNG 检查亮度；完整推流；朋友端 mpv HDR 直通 / SDR 色调映射；4K60 下采集 fps 与 GPU 占用。
 
 ## 8. 点对点模式协议（v1）

@@ -14,13 +14,6 @@ namespace HdrCast.Sender.Model
         Opus,
     }
 
-    /// <summary>Container ffmpeg muxes into. AV1 has no MPEG-TS mapping, so it must use Matroska (direct mode only).</summary>
-    public enum Container
-    {
-        MpegTs,
-        Matroska,
-    }
-
     /// <summary>Everything the ffmpeg child process needs (design.md §2.5).</summary>
     public sealed class FfmpegPlan
     {
@@ -33,13 +26,12 @@ namespace HdrCast.Sender.Model
         public EncoderSettings Encoder { get; set; } = new EncoderSettings();
         public AudioCodec Audio { get; set; } = AudioCodec.Aac;
         public int AudioBitrateKbps { get; set; } = 192;
-        public Container Container { get; set; } = Container.MpegTs;
-        /// <summary>Complete srt:// URL from <see cref="SrtUrl.Build"/>.</summary>
-        public string OutputUrl { get; set; } = "";
-        /// <summary>Emit -progress pipe:1 so the GUI can read encoder statistics.</summary>
+        /// <summary>Where the MPEG-TS goes: stdout, into the P2P fan-out (design.md §8.8).</summary>
+        public string OutputUrl { get; set; } = "pipe:1";
+        /// <summary>Emit -progress so the GUI can read encoder statistics.</summary>
         public bool Progress { get; set; } = true;
-        /// <summary>Where -progress writes: stdout normally; stderr (pipe:2) when stdout carries the stream (P2P mode).</summary>
-        public string ProgressUrl { get; set; } = "pipe:1";
+        /// <summary>Where -progress writes: stderr, because stdout carries the stream (lines are told apart by shape).</summary>
+        public string ProgressUrl { get; set; } = "pipe:2";
         public string LogLevel { get; set; } = "warning";
     }
 
@@ -59,8 +51,6 @@ namespace HdrCast.Sender.Model
             if (p.PixelFormat == CaptureFormat.Auto) throw new ArgumentException("pixel format must be resolved", nameof(p));
 
             EncoderInfo info = EncoderProfiles.Info(p.Encoder.Encoder);
-            if (p.Container == Container.MpegTs && !info.MpegTsCompatible)
-                throw new ArgumentException(info.DisplayName + " cannot be muxed into MPEG-TS; use direct mode with Matroska", nameof(p));
             if (p.Encoder.Hdr && !info.Supports10Bit)
                 throw new ArgumentException(info.DisplayName + " has no 10-bit mode", nameof(p));
             if (p.Encoder.Hdr != (p.PixelFormat == CaptureFormat.P010))
@@ -105,16 +95,9 @@ namespace HdrCast.Sender.Model
 
             a.Add("-muxdelay"); a.Add("0");
             a.Add("-muxpreload"); a.Add("0");
-            if (p.Container == Container.MpegTs)
-            {
-                a.Add("-f"); a.Add("mpegts");
-                a.Add("-mpegts_flags"); a.Add("+resend_headers");
-            }
-            else
-            {
-                a.Add("-f"); a.Add("matroska");
-                a.Add("-live"); a.Add("1");
-            }
+            // +resend_headers: a viewer who joins mid-stream gets PAT/PMT again right away
+            a.Add("-f"); a.Add("mpegts");
+            a.Add("-mpegts_flags"); a.Add("+resend_headers");
             a.Add(p.OutputUrl);
             return a;
         }

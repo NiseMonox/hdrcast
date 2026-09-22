@@ -57,7 +57,7 @@ namespace HdrCast.P2p
         public static string BuildListenerUrl(int port, string passphrase, int latencyMs, int overheadPercent, long bitrateBps) =>
             HdrCast.Common.SrtUrl.Build(new SrtUrlOptions
             {
-                Topology = SrtTopology.DirectListener,
+                Topology = SrtTopology.Listener,
                 ListenAddress = "127.0.0.1",
                 Port = port,
                 Role = SrtRole.Publish,

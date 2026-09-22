@@ -7,18 +7,6 @@ using HdrCast.Common;
 
 namespace HdrCast.Sender.Model
 {
-    public enum SendMode
-    {
-        /// <summary>Publish to the MediaMTX relay (streamid=publish:path:user:pass).</summary>
-        Relay = 0,
-        /// <summary>Direct: this PC listens (mode=listener); the viewer dials in. Needs a UDP port forward here.</summary>
-        DirectListen = 1,
-        /// <summary>Direct: this PC dials the viewer (mode=caller). The viewer needs the port forward.</summary>
-        DirectDial = 2,
-        /// <summary>Group (P2P): friends in the invite's group connect straight to this PC through punched paths.</summary>
-        P2p = 3,
-    }
-
     /// <summary>How the output resolution is chosen.</summary>
     public enum ScaleMode
     {
@@ -35,34 +23,11 @@ namespace HdrCast.Sender.Model
         ForceSdr = 1,
     }
 
-    public sealed class RegionPreset
-    {
-        public string Name { get; }
-        public int LatencyMs { get; }
-        public int OverheadPercent { get; }
-        public RegionPreset(string name, int latencyMs, int overheadPercent)
-        {
-            Name = name; LatencyMs = latencyMs; OverheadPercent = overheadPercent;
-        }
-        public override string ToString() => Name + " (" + LatencyMs + " ms)";
-    }
-
     /// <summary>Persisted to %APPDATA%\HdrCast\sender.json via DataContractJsonSerializer.</summary>
     [DataContract]
     public sealed class SenderSettings
     {
         public const string FileName = "sender.json";
-
-        /// <summary>Relay hop is on the LAN, so it only needs enough latency to absorb scheduling jitter.</summary>
-        public const int RelayPublishLatencyMs = 800;
-
-        public static readonly RegionPreset[] RegionPresets =
-        {
-            new RegionPreset("LAN / relay", 800, 25),
-            new RegionPreset("Japan", 1500, 25),
-            new RegionPreset("Australia", 2000, 25),
-            new RegionPreset("China", 3500, 50),
-        };
 
         public SenderSettings() { SetDefaults(); }
 
@@ -92,27 +57,16 @@ namespace HdrCast.Sender.Model
         [DataMember(Name = "audioCodec", Order = 22)] public AudioCodec AudioCodec { get; set; }
         [DataMember(Name = "audioBitrateKbps", Order = 23)] public int AudioBitrateKbps { get; set; }
 
-        // ---- target ----
-        [DataMember(Name = "mode", Order = 30)] public SendMode Mode { get; set; }
-        [DataMember(Name = "host", Order = 31)] public string Host { get; set; } = "";
-        [DataMember(Name = "port", Order = 32)] public int Port { get; set; }
-        [DataMember(Name = "path", Order = 33)] public string StreamPath { get; set; } = "";
-        [DataMember(Name = "user", Order = 34)] public string User { get; set; } = "";
-        [DataMember(Name = "password", Order = 35)] public string Password { get; set; } = "";
-        [DataMember(Name = "passphrase", Order = 36)] public string Passphrase { get; set; } = "";
-        [DataMember(Name = "latencyMs", Order = 37)] public int LatencyMs { get; set; }
-        [DataMember(Name = "overheadPercent", Order = 38)] public int OverheadPercent { get; set; }
-        [DataMember(Name = "rateControl", Order = 39)] public bool RateControl { get; set; }
-        /// <summary>Listen mode only: the address to bind (empty = IPv4 0.0.0.0; IPv6 needs this PC's own address).</summary>
-        [DataMember(Name = "listenAddress", Order = 40)] public string ListenAddress { get; set; } = "";
-        /// <summary>P2P mode: how many friends may watch at once (each one costs a full stream of upload).</summary>
+        // ---- group ----
+        // The SRT settings of each viewer (latency, overhead, passphrase) come from the group key and that viewer's
+        // join request; the old relay/direct fields (mode, host, port, …) are simply ignored in existing files.
+        /// <summary>How many friends may watch at once (each one costs a full stream of upload).</summary>
         [DataMember(Name = "maxViewers", Order = 41)] public int MaxViewers { get; set; }
-        /// <summary>P2P mode: this line's upload in Mbps, for the "upload needed" warning (0 = unknown).</summary>
+        /// <summary>This line's upload in Mbps, for the "upload needed" warning (0 = unknown).</summary>
         [DataMember(Name = "uploadMbps", Order = 42)] public int UploadMbps { get; set; }
 
-        // ---- tools / behaviour ----
+        // ---- tools ----
         [DataMember(Name = "ffmpegPath", Order = 50)] public string FfmpegPath { get; set; } = "";
-        [DataMember(Name = "autoRestart", Order = 51)] public bool AutoRestart { get; set; }
 
         void SetDefaults()
         {
@@ -136,22 +90,10 @@ namespace HdrCast.Sender.Model
             AudioCodec = AudioCodec.Aac;
             AudioBitrateKbps = 192;
 
-            Mode = SendMode.Relay;
-            Host = "";
-            Port = 8890;
-            StreamPath = "screen";
-            User = "sender";
-            Password = "";
-            Passphrase = "";
-            LatencyMs = RelayPublishLatencyMs;
-            OverheadPercent = 25;
-            RateControl = true;
-            ListenAddress = "";
             MaxViewers = 4;
             UploadMbps = 0;
 
             FfmpegPath = "";
-            AutoRestart = false;
         }
 
         [OnDeserializing]
@@ -171,19 +113,9 @@ namespace HdrCast.Sender.Model
             if (BufferSeconds > 10) BufferSeconds = 10;
             if (AudioBitrateKbps < 32) AudioBitrateKbps = 32;
             if (AudioBitrateKbps > 512) AudioBitrateKbps = 512;
-            if (Port < 1 || Port > 65535) Port = 8890;
-            if (LatencyMs < 20) LatencyMs = 20;
-            if (LatencyMs > 30000) LatencyMs = 30000;
-            if (OverheadPercent < 5) OverheadPercent = 5;
-            if (OverheadPercent > 100) OverheadPercent = 100;
-            if (string.IsNullOrWhiteSpace(StreamPath)) StreamPath = "screen";
             if (string.IsNullOrWhiteSpace(AudioDevice)) AudioDevice = "default";
-            Host = (Host ?? "").Trim();
-            ListenAddress = (ListenAddress ?? "").Trim();
-            User ??= "";
-            Password ??= "";
-            Passphrase ??= "";
-            if (!Enum.IsDefined(typeof(SendMode), Mode)) Mode = SendMode.Relay;
+            // 1, 3 and 6 were the AV1 encoders in older files
+            if (!Enum.IsDefined(typeof(VideoEncoder), Encoder)) Encoder = VideoEncoder.HevcNvenc;
             if (MaxViewers < 1) MaxViewers = 1;
             if (MaxViewers > 16) MaxViewers = 16;
             if (UploadMbps < 0) UploadMbps = 0;
@@ -231,69 +163,10 @@ namespace HdrCast.Sender.Model
         public List<string> Validate()
         {
             var problems = new List<string>();
-            if (Mode == SendMode.P2p)
-            {
-                // The group and the per-viewer SRT settings come from the invite and each viewer's join request.
-                if (BitrateMbps < 1 || BitrateMbps > 500) problems.Add("Bitrate must be 1..500 Mbps.");
-                if (Fps < 1 || Fps > 480) problems.Add("Frame rate must be 1..480.");
-                EncoderInfo p2pInfo = EncoderProfiles.Info(Encoder);
-                if (!p2pInfo.MpegTsCompatible)
-                    problems.Add(p2pInfo.DisplayName + " cannot be shared with the group (AV1 has no MPEG-TS mapping). Use HEVC.");
-                return problems;
-            }
-            if (Port < 1 || Port > 65535) problems.Add("Port must be 1..65535.");
-            else if (Mode == SendMode.DirectListen)
-            {
-                if (!SrtUrl.TryListenHost(ListenAddress, out _, out string listenError)) problems.Add(listenError);
-            }
-            else if (!SrtUrl.TryCallerHost(Host, Port, out _, out string hostError)) problems.Add(hostError);
-            if (Mode == SendMode.Relay)
-            {
-                if (string.IsNullOrWhiteSpace(StreamPath)) problems.Add("Path is required in relay mode.");
-                else if (StreamPath.IndexOf(':') >= 0) problems.Add("Path must not contain ':'.");
-                if (User.IndexOf(':') >= 0) problems.Add("User must not contain ':'.");
-                if (Password.IndexOf(':') >= 0) problems.Add("Password must not contain ':'.");
-                if (string.IsNullOrEmpty(User) && !string.IsNullOrEmpty(Password)) problems.Add("A password needs a user name.");
-            }
-            if (!SrtUrl.IsValidPassphrase(Passphrase))
-                problems.Add("Passphrase must be 10-79 characters (or empty for no encryption).");
             if (BitrateMbps < 1 || BitrateMbps > 500) problems.Add("Bitrate must be 1..500 Mbps.");
             if (Fps < 1 || Fps > 480) problems.Add("Frame rate must be 1..480.");
-            if (LatencyMs < 20) problems.Add("Latency must be at least 20 ms.");
-
-            EncoderInfo info = EncoderProfiles.Info(Encoder);
-            if (Mode == SendMode.Relay && !info.MpegTsCompatible)
-                problems.Add(info.DisplayName + " cannot go through the relay (AV1 has no MPEG-TS mapping). Use HEVC, or a direct connection.");
+            if (!Enum.IsDefined(typeof(VideoEncoder), Encoder)) problems.Add("Pick an encoder.");
             return problems;
-        }
-
-        public Container ResolveContainer()
-            => EncoderProfiles.Info(Encoder).MpegTsCompatible ? Container.MpegTs : Container.Matroska;
-
-        public SrtUrlOptions ToSrtOptions()
-        {
-            if (Mode == SendMode.P2p) throw new InvalidOperationException("P2P mode has no single SRT URL (one per viewer)");
-            return new SrtUrlOptions
-            {
-                Topology = Mode == SendMode.Relay ? SrtTopology.Relay
-                         : Mode == SendMode.DirectListen ? SrtTopology.DirectListener
-                         : SrtTopology.DirectCaller,
-                Role = SrtRole.Publish,
-                Host = Host,
-                Port = Port,
-                ListenAddress = Mode == SendMode.DirectListen ? ListenAddress : null,
-                StreamPath = StreamPath,
-                User = string.IsNullOrEmpty(User) ? null : User,
-                Password = string.IsNullOrEmpty(Password) ? null : Password,
-                Passphrase = string.IsNullOrEmpty(Passphrase) ? null : Passphrase,
-                PbKeyLen = 32,
-                LatencyMs = LatencyMs,
-                BitrateBps = BitrateBps,
-                RateControl = RateControl,
-                OverheadPercent = OverheadPercent,
-                ConnectTimeoutMs = 5000,
-                IncludeRecvSocketBuffer = false,
-            };
         }
 
         public EncoderSettings ToEncoderSettings(bool hdr, int masteringMaxNits)
@@ -345,7 +218,7 @@ namespace HdrCast.Sender.Model
         public void Save(string path) => Json.SaveFile(path, this);
 
         public override string ToString()
-            => string.Format(CultureInfo.InvariantCulture, "{0} {1} Mbps {2}fps -> {3}:{4}",
-                             EncoderProfiles.Info(Encoder).FfmpegName, BitrateMbps, Fps, Host, Port);
+            => string.Format(CultureInfo.InvariantCulture, "{0} {1} Mbps {2}fps, up to {3} viewers",
+                             EncoderProfiles.Info(Encoder).FfmpegName, BitrateMbps, Fps, MaxViewers);
     }
 }

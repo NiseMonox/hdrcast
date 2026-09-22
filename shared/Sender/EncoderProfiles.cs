@@ -4,16 +4,16 @@ using System.Globalization;
 
 namespace HdrCast.Sender.Model
 {
-    /// <summary>Video encoders the sender can drive (design.md §2.5).</summary>
+    /// <summary>
+    /// Video encoders the sender can drive (design.md §2.5). HEVC only: the P2P fan-out carries MPEG-TS, which has
+    /// no AV1 mapping in ffmpeg. The numbers are what sender.json stores; 1, 3 and 6 were the AV1 encoders.
+    /// </summary>
     public enum VideoEncoder
     {
-        HevcNvenc,
-        Av1Nvenc,
-        HevcAmf,
-        Av1Amf,
-        HevcQsv,
-        LibX265,
-        LibSvtAv1,
+        HevcNvenc = 0,
+        HevcAmf = 2,
+        HevcQsv = 4,
+        LibX265 = 5,
     }
 
     /// <summary>
@@ -36,41 +36,32 @@ namespace HdrCast.Sender.Model
         public string DisplayName { get; }
         public string Vendor { get; }
         public bool IsHardware { get; }
-        /// <summary>AV1 cannot be muxed into MPEG-TS (verified: ffmpeg writes stream_type 0x06 and MediaMTX rejects it).</summary>
-        public bool MpegTsCompatible { get; }
         public bool Supports10Bit { get; }
 
-        public EncoderInfo(VideoEncoder id, string ffmpegName, string displayName, string vendor,
-                           bool isHardware, bool mpegTsCompatible, bool supports10Bit)
+        public EncoderInfo(VideoEncoder id, string ffmpegName, string displayName, string vendor, bool isHardware, bool supports10Bit)
         {
             Id = id;
             FfmpegName = ffmpegName;
             DisplayName = displayName;
             Vendor = vendor;
             IsHardware = isHardware;
-            MpegTsCompatible = mpegTsCompatible;
             Supports10Bit = supports10Bit;
         }
-
-        public bool IsAv1 => Id == VideoEncoder.Av1Nvenc || Id == VideoEncoder.Av1Amf || Id == VideoEncoder.LibSvtAv1;
     }
 
     /// <summary>
     /// Encoder catalogue and the option strings the sender passes to ffmpeg.
     /// Every option name was checked against the ffmpeg 7.1 source option tables
-    /// (libavcodec/nvenc_hevc.c, nvenc_av1.c, amfenc_hevc.c, qsvenc_hevc.c, qsvenc.h, libx265.c, libsvtav1.c).
+    /// (libavcodec/nvenc_hevc.c, amfenc_hevc.c, qsvenc_hevc.c, qsvenc.h, libx265.c).
     /// </summary>
     public static class EncoderProfiles
     {
         public static readonly EncoderInfo[] All =
         {
-            new EncoderInfo(VideoEncoder.HevcNvenc, "hevc_nvenc", "HEVC (NVIDIA NVENC)", "NVIDIA", true,  true,  true),
-            new EncoderInfo(VideoEncoder.Av1Nvenc,  "av1_nvenc",  "AV1 (NVIDIA NVENC)",  "NVIDIA", true,  false, true),
-            new EncoderInfo(VideoEncoder.HevcAmf,   "hevc_amf",   "HEVC (AMD AMF)",      "AMD",    true,  true,  true),
-            new EncoderInfo(VideoEncoder.Av1Amf,    "av1_amf",    "AV1 (AMD AMF)",       "AMD",    true,  false, true),
-            new EncoderInfo(VideoEncoder.HevcQsv,   "hevc_qsv",   "HEVC (Intel QSV)",    "Intel",  true,  true,  true),
-            new EncoderInfo(VideoEncoder.LibX265,   "libx265",    "HEVC (CPU, x265)",    "CPU",    false, true,  true),
-            new EncoderInfo(VideoEncoder.LibSvtAv1, "libsvtav1",  "AV1 (CPU, SVT-AV1)",  "CPU",    false, false, true),
+            new EncoderInfo(VideoEncoder.HevcNvenc, "hevc_nvenc", "HEVC (NVIDIA NVENC)", "NVIDIA", true,  true),
+            new EncoderInfo(VideoEncoder.HevcAmf,   "hevc_amf",   "HEVC (AMD AMF)",      "AMD",    true,  true),
+            new EncoderInfo(VideoEncoder.HevcQsv,   "hevc_qsv",   "HEVC (Intel QSV)",    "Intel",  true,  true),
+            new EncoderInfo(VideoEncoder.LibX265,   "libx265",    "HEVC (CPU, x265)",    "CPU",    false, true),
         };
 
         public static EncoderInfo Info(VideoEncoder e)
@@ -88,8 +79,7 @@ namespace HdrCast.Sender.Model
             switch (e)
             {
                 case VideoEncoder.LibX265:
-                case VideoEncoder.LibSvtAv1:
-                    return hdr ? "yuv420p10le" : "yuv420p";      // neither accepts p010/nv12
+                    return hdr ? "yuv420p10le" : "yuv420p";      // x265 does not accept p010/nv12
                 default:
                     return hdr ? "p010le" : "nv12";              // NVENC / AMF / QSV take the capture format as is
             }
@@ -136,7 +126,6 @@ namespace HdrCast.Sender.Model
             switch (s.Encoder)
             {
                 case VideoEncoder.HevcNvenc:
-                case VideoEncoder.Av1Nvenc:
                 {
                     a.Add("-preset"); a.Add(NvencPreset(s.Preset));
                     a.Add("-tune"); a.Add("hq");
@@ -148,11 +137,8 @@ namespace HdrCast.Sender.Model
                     a.Add("-spatial-aq"); a.Add("1");
                     a.Add("-aq-strength"); a.Add("8");
                     if (lookahead > 0) { a.Add("-temporal-aq"); a.Add(s.Preset == QualityPreset.Quality ? "1" : "0"); }
-                    if (s.Encoder == VideoEncoder.HevcNvenc)
-                    {
-                        a.Add("-profile:v"); a.Add(s.Hdr ? "main10" : "main");
-                        a.Add("-tier"); a.Add("high");
-                    }
+                    a.Add("-profile:v"); a.Add(s.Hdr ? "main10" : "main");
+                    a.Add("-tier"); a.Add("high");
                     a.Add("-b:v"); a.Add(kbps);
                     a.Add("-maxrate"); a.Add(kbps);
                     a.Add("-bufsize"); a.Add(bufsize);
@@ -162,7 +148,6 @@ namespace HdrCast.Sender.Model
                     break;
                 }
                 case VideoEncoder.HevcAmf:
-                case VideoEncoder.Av1Amf:
                 {
                     a.Add("-quality"); a.Add(AmfQuality(s.Preset));
                     a.Add("-rc"); a.Add("cbr");
@@ -176,11 +161,8 @@ namespace HdrCast.Sender.Model
                         a.Add("-preanalysis"); a.Add("1");
                         a.Add("-pa_lookahead_buffer_depth"); a.Add(Math.Min(40, Math.Max(1, lookahead)).ToString(CultureInfo.InvariantCulture));
                     }
-                    if (s.Encoder == VideoEncoder.HevcAmf)
-                    {
-                        a.Add("-vbaq"); a.Add("1");
-                        if (s.Hdr) { a.Add("-profile:v"); a.Add("main10"); }
-                    }
+                    a.Add("-vbaq"); a.Add("1");
+                    if (s.Hdr) { a.Add("-profile:v"); a.Add("main10"); }
                     break;
                 }
                 case VideoEncoder.HevcQsv:
@@ -205,20 +187,6 @@ namespace HdrCast.Sender.Model
                     a.Add("-preset"); a.Add(X265Preset(s.Preset));
                     a.Add("-b:v"); a.Add(kbps);
                     a.Add("-x265-params"); a.Add(X265Params(s, gop, bFrames, lookahead));
-                    break;
-                }
-                case VideoEncoder.LibSvtAv1:
-                {
-                    // SVT-AV1 is fussy about rate control (both verified against libsvtav1 on this box):
-                    //   -maxrate  -> "Max Bitrate only supported with CRF mode"
-                    //   rc=2 (CBR) -> "CBR Rate control is currently not supported for SVT_AV1_PRED_RANDOM_ACCESS"
-                    // so this path uses VBR around the target bitrate and leaves the VBV to the SRT sender.
-                    a.Add("-preset"); a.Add(SvtPreset(s.Preset));
-                    a.Add("-b:v"); a.Add(kbps);
-                    a.Add("-g"); a.Add(gop.ToString(CultureInfo.InvariantCulture));
-                    a.Add("-svtav1-params");
-                    a.Add("rc=1:keyint=" + gop.ToString(CultureInfo.InvariantCulture) +
-                          ":lookahead=" + Math.Max(0, lookahead).ToString(CultureInfo.InvariantCulture));
                     break;
                 }
                 default:
@@ -249,11 +217,9 @@ namespace HdrCast.Sender.Model
         static string AmfQuality(QualityPreset p) => p == QualityPreset.Speed ? "speed" : p == QualityPreset.Balanced ? "balanced" : "quality";
         static string QsvPreset(QualityPreset p) => p == QualityPreset.Speed ? "faster" : p == QualityPreset.Balanced ? "slow" : "veryslow";
         static string X265Preset(QualityPreset p) => p == QualityPreset.Speed ? "veryfast" : p == QualityPreset.Balanced ? "fast" : "medium";
-        static string SvtPreset(QualityPreset p) => p == QualityPreset.Speed ? "10" : p == QualityPreset.Balanced ? "8" : "6";
 
         static int BFrameCount(VideoEncoder e, QualityPreset p)
         {
-            if (e == VideoEncoder.LibSvtAv1) return 0;                  // SVT-AV1 manages its own pyramid
             switch (p)
             {
                 case QualityPreset.Speed: return 0;

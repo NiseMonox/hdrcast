@@ -37,8 +37,6 @@ namespace HdrCast.Receiver.Gui
 
         // group (P2P)
         private readonly SharedGroupFile _group = new SharedGroupFile(GroupConfig.DefaultPath);
-        private readonly List<Control> _p2pRows = new List<Control>();
-        private readonly List<Control> _manualRows = new List<Control>();
         private List<LiveEntry> _liveHosts = new List<LiveEntry>();
         private ViewerSession? _session;
         private bool _mpvStartedForSession;
@@ -51,14 +49,6 @@ namespace HdrCast.Receiver.Gui
         private Label _p2pStatus = null!;
 
         // connection
-        private ComboBox _mode = null!;
-        private TextBox _host = null!;
-        private NumericUpDown _port = null!;
-        private TextBox _path = null!;
-        private TextBox _user = null!;
-        private TextBox _password = null!;
-        private TextBox _passphrase = null!;
-        private CheckBox _showSecrets = null!;
         private ComboBox _latencyPreset = null!;
         private NumericUpDown _latency = null!;
         private NumericUpDown _bitrate = null!;
@@ -82,7 +72,6 @@ namespace HdrCast.Receiver.Gui
         private Button _play = null!;
         private Button _stop = null!;
         private Button _fsToggle = null!;
-        private Button _copy = null!;
         private Button _openLogs = null!;
 
         // status
@@ -254,53 +243,19 @@ namespace HdrCast.Receiver.Gui
             var group = new GroupBox { Text = "Connection", Dock = DockStyle.Fill, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(8) };
             var grid = NewGrid();
 
-            _mode = NewCombo(22, "Relay (MediaMTX)", "Direct: I listen (port forward needed)", "Direct: I dial the sender",
-                             "Group: watch a friend straight from their PC (P2P)");
-            _mode.SelectedIndexChanged += (s, e) =>
-            {
-                if (_suppressEvents) return;
-                LoadHostBox((ConnectionMode)Math.Max(0, _mode.SelectedIndex));
-                UpdateEnabledState();
-                RestartLivePolling();
-            };
-            AddRow(grid, "Mode", _mode);
-
             _groupName = new Label { AutoSize = true, Margin = new Padding(3, 6, 12, 3) };
             _pasteInvite = new Button { Text = "Paste invite", AutoSize = true };
             _pasteInvite.Click += (s, e) => { GroupConfig? next = InviteUi.PasteInvite(this, _group.Current); if (next != null) SaveGroup(next); };
             _copyInvite = new Button { Text = "Copy invite", AutoSize = true };
             _copyInvite.Click += (s, e) => InviteUi.CopyInvite(this, _group.Current);
-            _p2pRows.AddRange(AddRow(grid, "Group", Row(_groupName, _pasteInvite, _copyInvite)));
+            AddRow(grid, "Group", Row(_groupName, _pasteInvite, _copyInvite));
 
             _live = NewCombo(24);
             _refreshLive = new Button { Text = "Refresh", AutoSize = true };
             _refreshLive.Click += (s, e) => RestartLivePolling();
-            _p2pRows.AddRange(AddRow(grid, "Watch", Row(_live, _refreshLive)));
+            AddRow(grid, "Watch", Row(_live, _refreshLive));
             _p2pStatus = new Label { AutoSize = true, Margin = new Padding(3, 3, 3, 3), MaximumSize = new Size(Font.Height * 34, 0) };
-            _p2pRows.AddRange(AddRow(grid, "", _p2pStatus));
-
-            _host = NewText(16);
-            _port = NewNumber(6, 1, 65535, 8890);
-            _host.Leave += (s, e) => SplitPortFromHost();
-            _manualRows.AddRange(AddRow(grid, "Host", Row(_host, Small("Port"), _port)));
-
-            _path = NewText(10);
-            _manualRows.AddRange(AddRow(grid, "Path", _path));
-
-            _user = NewText(10);
-            _password = NewText(12);
-            _password.UseSystemPasswordChar = true;
-            _manualRows.AddRange(AddRow(grid, "User", Row(_user, Small("Password"), _password)));
-
-            _passphrase = NewText(22);
-            _passphrase.UseSystemPasswordChar = true;
-            _showSecrets = new CheckBox { Text = "Show", AutoSize = true, Margin = new Padding(6, 4, 3, 3) };
-            _showSecrets.CheckedChanged += (s, e) =>
-            {
-                _password.UseSystemPasswordChar = !_showSecrets.Checked;
-                _passphrase.UseSystemPasswordChar = !_showSecrets.Checked;
-            };
-            _manualRows.AddRange(AddRow(grid, "Passphrase", Row(_passphrase, _showSecrets)));
+            AddRow(grid, "", _p2pStatus);
 
             var presetNames = new List<string>();
             foreach (var p in ReceiverSettings.LatencyPresets) presetNames.Add(p.ToString());
@@ -398,11 +353,9 @@ namespace HdrCast.Receiver.Gui
             _stop.Click += (s, e) => StopAsync();
             _fsToggle = new Button { Text = "Toggle fullscreen", AutoSize = true };
             _fsToggle.Click += (s, e) => _runner.ToggleFullscreen();
-            _copy = new Button { Text = "Copy command", AutoSize = true };
-            _copy.Click += (s, e) => CopyCommand();
             _openLogs = new Button { Text = "Open logs", AutoSize = true };
             _openLogs.Click += (s, e) => OpenLogs();
-            p.Controls.AddRange(new Control[] { _play, _stop, _fsToggle, _copy, _openLogs });
+            p.Controls.AddRange(new Control[] { _play, _stop, _fsToggle, _openLogs });
             return p;
         }
 
@@ -491,13 +444,6 @@ namespace HdrCast.Receiver.Gui
             try
             {
                 var s = _settings;
-                _mode.SelectedIndex = (int)s.Mode;
-                _host.Text = s.Mode == ConnectionMode.DirectListen ? s.ListenAddress : s.Host;
-                _port.Value = Clamp(s.Port, _port);
-                _path.Text = s.StreamPath;
-                _user.Text = s.User;
-                _password.Text = s.Password;
-                _passphrase.Text = s.Passphrase;
                 _latency.Value = Clamp(s.LatencyMs, _latency);
                 SyncLatencyPreset();
                 _bitrate.Value = Clamp(s.ExpectedBitrateMbps, _bitrate);
@@ -523,15 +469,7 @@ namespace HdrCast.Receiver.Gui
         private ReceiverSettings ReadUiIntoSettings()
         {
             var s = _settings;
-            s.Mode = (ConnectionMode)Math.Max(0, _mode.SelectedIndex);
-            if (s.Mode == ConnectionMode.DirectListen) s.ListenAddress = _host.Text.Trim();
-            else if (s.Mode != ConnectionMode.P2p) s.Host = _host.Text.Trim();
             if (_live.SelectedIndex >= 0 && _live.SelectedIndex < _liveHosts.Count) s.LastHost = _liveHosts[_live.SelectedIndex].Record.HostId;
-            s.Port = (int)_port.Value;
-            s.StreamPath = _path.Text.Trim();
-            s.User = _user.Text.Trim();
-            s.Password = _password.Text;
-            s.Passphrase = _passphrase.Text;
             s.LatencyMs = (int)_latency.Value;
             s.ExpectedBitrateMbps = (int)_bitrate.Value;
             s.DisplayMode = (DisplayMode)Math.Max(0, _displayMode.SelectedIndex);
@@ -579,25 +517,15 @@ namespace HdrCast.Receiver.Gui
         private void UpdateEnabledState()
         {
             bool running = _runner.IsRunning || _session != null;
-            var mode = (ConnectionMode)Math.Max(0, _mode.SelectedIndex);
-            bool relay = mode == ConnectionMode.Relay;
-            bool p2p = mode == ConnectionMode.P2p;
-            foreach (Control c in _p2pRows) c.Visible = p2p;
-            foreach (Control c in _manualRows) c.Visible = !p2p;
             _pasteInvite.Enabled = !running;
             _live.Enabled = !running;
             _refreshLive.Enabled = !running;
-            _copy.Enabled = !p2p;
-            _path.Enabled = !running && relay;
-            _user.Enabled = !running && relay;
-            _password.Enabled = !running && relay;
             _toneMapping.Enabled = !running && _displayMode.SelectedIndex == (int)DisplayMode.SdrToneMap;
             bool pipe = _frontend.SelectedIndex == (int)ReceiverFrontend.FfmpegPipe;
             _ffmpegPath.Enabled = pipe;
 
-            foreach (Control c in new Control[] { _mode, _port, _passphrase, _latencyPreset, _latency, _bitrate, _displayMode, _targetPeak, _hwdec, _buffer, _fullscreen, _screen, _frontend, _mpvPath })
-                c.Enabled = !running && (c != _host);
-            _host.Enabled = !running;
+            foreach (Control c in new Control[] { _latencyPreset, _latency, _bitrate, _displayMode, _targetPeak, _hwdec, _buffer, _fullscreen, _screen, _frontend, _mpvPath })
+                c.Enabled = !running;
 
             _play.Enabled = !running;
             _stop.Enabled = running;
@@ -629,9 +557,8 @@ namespace HdrCast.Receiver.Gui
 
         // ---- actions ----------------------------------------------------------------------
 
-        private MpvLaunchPlan? BuildPlan(bool interactive) => BuildPlan(ReadUiIntoSettings(), interactive);
-
-        private MpvLaunchPlan? BuildPlan(ReceiverSettings s, bool interactive)
+        /// <summary>mpv (or ffmpeg | mpv) for the local end of <paramref name="session"/>.</summary>
+        private MpvLaunchPlan? BuildPlan(ReceiverSettings s, ViewerSession session, bool interactive)
         {
             var problems = s.Validate();
             if (problems.Count > 0)
@@ -643,8 +570,7 @@ namespace HdrCast.Receiver.Gui
             if (mpv == null)
             {
                 if (interactive) MessageBox.Show(this, MpvDownloadHint, "mpv not found", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                mpv = MpvExeName; // still lets "Copy command" produce something useful
-                if (interactive) return null;
+                return null;
             }
             string? ffmpeg = null;
             if (s.Frontend == ReceiverFrontend.FfmpegPipe)
@@ -663,7 +589,7 @@ namespace HdrCast.Receiver.Gui
             }
             try
             {
-                return MpvCommandBuilder.Build(s, Process.GetCurrentProcess().Id, mpv, ffmpeg);
+                return MpvCommandBuilder.Build(s, session.LocalPort, session.SrtPassphrase, Process.GetCurrentProcess().Id, mpv, ffmpeg);
             }
             catch (Exception ex)
             {
@@ -675,25 +601,7 @@ namespace HdrCast.Receiver.Gui
         private void Play()
         {
             if (_runner.IsRunning || _session != null) return;
-            if ((ConnectionMode)Math.Max(0, _mode.SelectedIndex) == ConnectionMode.P2p)
-            {
-                StartP2p();
-                return;
-            }
-            var plan = BuildPlan(interactive: true);
-            if (plan == null) return;
-            SaveSettings();
-            var plan2 = SrtBufferSizing.Compute(_settings.LatencyMs, (long)_settings.ExpectedBitrateMbps * 1_000_000L);
-            AppendLog("[app] SRT buffer: " + plan2.Packets + " packets in flight -> ffs=" + plan2.FlowWindow + " rcvbuf=" + plan2.BufferBytes + " bytes");
-            try
-            {
-                _runner.Start(_settings, plan);
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show(this, ex.Message, "Could not start", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-            UpdateEnabledState();
+            StartP2p();
         }
 
         private void StopAsync()
@@ -722,23 +630,6 @@ namespace HdrCast.Receiver.Gui
 
         // ---- group (P2P) ----------------------------------------------------------------------
 
-        private void LoadHostBox(ConnectionMode mode)
-        {
-            bool prev = _suppressEvents;
-            _suppressEvents = true;
-            _host.Text = mode == ConnectionMode.DirectListen ? _settings.ListenAddress : _settings.Host;
-            _suppressEvents = prev;
-        }
-
-        /// <summary>"[2400:…]:8890" typed into Host: keep the host and move the port into the Port box.</summary>
-        private void SplitPortFromHost()
-        {
-            if ((ConnectionMode)Math.Max(0, _mode.SelectedIndex) == ConnectionMode.DirectListen) return;
-            if (!Endpoint.TryParse(_host.Text, out HostPort? hp, out _) || !hp!.Port.HasValue) return;
-            _host.Text = hp.Host;
-            _port.Value = Clamp(hp.Port.Value, _port);
-        }
-
         private void SaveGroup(GroupConfig config)
         {
             try
@@ -749,13 +640,6 @@ namespace HdrCast.Receiver.Gui
             catch (Exception ex)
             {
                 AppendLog("[app] could not save the group: " + ex.Message);
-            }
-            if (config.IsConfigured && !_runner.IsRunning && _session == null)
-            {
-                bool prev = _suppressEvents;
-                _suppressEvents = true;
-                _mode.SelectedIndex = (int)ConnectionMode.P2p;
-                _suppressEvents = prev;
             }
             RefreshGroupUi();
             RestartLivePolling();
@@ -775,7 +659,7 @@ namespace HdrCast.Receiver.Gui
             _pollCts?.Cancel();
             _pollCts = null;
             GroupConfig g = _group.Current;
-            if ((ConnectionMode)Math.Max(0, _mode.SelectedIndex) != ConnectionMode.P2p || !g.IsConfigured) return;
+            if (!g.IsConfigured) return;
             var cts = new CancellationTokenSource();
             _pollCts = cts;
             var thread = new Thread(() =>
@@ -866,7 +750,7 @@ namespace HdrCast.Receiver.Gui
                 Group = g,
                 HostId = host.HostId,
                 LatencyMs = s.LatencyMs,
-                OverheadPercent = s.P2pOverheadPercent,
+                OverheadPercent = s.OverheadPercent,
             }, OnRunnerLog);
             session.Changed += () => SafeInvoke(() => OnSessionChanged(session));
             _session = session;
@@ -893,13 +777,14 @@ namespace HdrCast.Receiver.Gui
                                  : session.State == ViewerSessionState.Waiting ? Color.DarkOrange : SystemColors.ControlText;
             if (session.State == ViewerSessionState.Connected && !_mpvStartedForSession && !_runner.IsRunning)
             {
-                ReceiverSettings local = _settings.ForP2pLocalPort(session.LocalPort, session.SrtPassphrase);
-                MpvLaunchPlan? plan = BuildPlan(local, interactive: true);
+                MpvLaunchPlan? plan = BuildPlan(_settings, session, interactive: true);
                 if (plan == null) return;
                 _mpvStartedForSession = true;
+                var sizing = SrtBufferSizing.Compute(_settings.LatencyMs, (long)_settings.ExpectedBitrateMbps * 1_000_000L);
+                AppendLog("[app] SRT buffer: " + sizing.Packets + " packets in flight -> ffs=" + sizing.FlowWindow + " rcvbuf=" + sizing.BufferBytes + " bytes");
                 try
                 {
-                    _runner.Start(local, plan);
+                    _runner.Start(_settings, plan);
                 }
                 catch (Exception ex)
                 {
@@ -907,34 +792,6 @@ namespace HdrCast.Receiver.Gui
                 }
             }
             UpdateEnabledState();
-        }
-
-        private void CopyCommand()
-        {
-            if ((ConnectionMode)Math.Max(0, _mode.SelectedIndex) == ConnectionMode.P2p)
-            {
-                MessageBox.Show(this, "In group mode the connection runs through HdrCast itself (it opens the path to your friend), " +
-                                      "so there is no command to copy.", "Copy command", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                return;
-            }
-            var plan = BuildPlan(interactive: false);
-            if (plan == null)
-            {
-                MessageBox.Show(this, "The settings are incomplete; fix them first (see Play).", "Copy command", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                return;
-            }
-            SaveSettings();
-            string cmd = plan.ToCommandLine();
-            try
-            {
-                Clipboard.SetText(cmd);
-                AppendLog("[app] command copied to clipboard (contains the passphrase - share with care)");
-            }
-            catch (Exception ex)
-            {
-                AppendLog("[app] clipboard failed: " + ex.Message);
-            }
-            AppendLog("[cmd] " + cmd);
         }
 
         private void OpenLogs()

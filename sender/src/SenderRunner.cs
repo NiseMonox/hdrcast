@@ -26,18 +26,16 @@ namespace HdrCast.Sender
         public string[] CaptureArgv { get; set; } = new string[0];
         public string FfmpegExe { get; set; } = "";
         public string[] FfmpegArgv { get; set; } = new string[0];
-        public string OutputUrl { get; set; } = "";
         public int Fps { get; set; } = 60;
         public string Summary { get; set; } = "";
         /// <summary>Named pipes the capture engine creates and ffmpeg opens; ffmpeg waits until they exist.</summary>
         public string[] PipeNames { get; set; } = new string[0];
-        /// <summary>P2P mode: ffmpeg writes MPEG-TS to stdout (for the fan-out) and -progress to stderr.</summary>
-        public bool TsOnStdout { get; set; }
     }
 
     /// <summary>
     /// Owns the capture engine and the ffmpeg child processes for one session (design.md §2.5).
-    /// The capture engine is started first (it is the pipe server); ffmpeg connects to the pipes.
+    /// The capture engine is started first (it is the pipe server); ffmpeg connects to the pipes and writes the
+    /// MPEG-TS to stdout, which <see cref="TsStreamStarted"/> hands to the P2P fan-out.
     /// If either process exits the other is stopped, and the session is optionally restarted.
     /// </summary>
     public sealed class SenderRunner
@@ -64,7 +62,7 @@ namespace HdrCast.Sender
 
         public event Action<string>? LogLine;
         public event Action<RunnerState, string>? StateChanged;
-        /// <summary>P2P mode: a (re)started ffmpeg's stdout, carrying the MPEG-TS for the fan-out.</summary>
+        /// <summary>A (re)started ffmpeg's stdout, carrying the MPEG-TS for the fan-out.</summary>
         public event Action<Stream>? TsStreamStarted;
 
         /// <summary>Job object the children are assigned to, so they die with the GUI (set by the form).</summary>
@@ -128,8 +126,8 @@ namespace HdrCast.Sender
             }
             SetState(RunnerState.Stopping, "Stopping…");
             // ffmpeg first, so the engine's next pipe write fails and it shuts down on its own. Note this is a
-            // hard kill (taskkill /F), so the muxer is not flushed and MediaMTX sees the publisher drop; that is
-            // fine for a live stream and keeps Stop bounded in time.
+            // hard kill (taskkill /F), so the muxer is not flushed; that is fine for a live stream and keeps Stop
+            // bounded in time.
             try { ffmpeg?.Stop(); } catch (Exception) { }
             try { capture?.Stop(); } catch (Exception) { }
             try { ffmpeg?.Dispose(); } catch (Exception) { }
@@ -159,21 +157,13 @@ namespace HdrCast.Sender
                 capture.StderrLine += line => Emit("[capture] " + line);
                 capture.Exited += code => OnCaptureExited(gen, code);
 
-                ffmpeg = new LineProcess(plan.FfmpegExe, ArgQuote.Join(plan.FfmpegArgv)) { Job = Job, ReadStdoutLines = !plan.TsOnStdout };
-                if (plan.TsOnStdout)
+                ffmpeg = new LineProcess(plan.FfmpegExe, ArgQuote.Join(plan.FfmpegArgv)) { Job = Job, ReadStdoutLines = false };
+                // stdout is the stream itself; -progress shares stderr with ffmpeg's log messages
+                ffmpeg.StderrLine += line =>
                 {
-                    // stdout is the stream itself; -progress shares stderr with ffmpeg's log messages
-                    ffmpeg.StderrLine += line =>
-                    {
-                        if (FfmpegProgressParser.IsProgressLine(line)) OnFfmpegProgress(gen, line);
-                        else Emit("[ffmpeg] " + line);
-                    };
-                }
-                else
-                {
-                    ffmpeg.StdoutLine += line => OnFfmpegProgress(gen, line);
-                    ffmpeg.StderrLine += line => Emit("[ffmpeg] " + line);
-                }
+                    if (FfmpegProgressParser.IsProgressLine(line)) OnFfmpegProgress(gen, line);
+                    else Emit("[ffmpeg] " + line);
+                };
                 ffmpeg.Exited += code => OnFfmpegExited(gen, code);
 
                 // SafeCommandLine masks passphrase= and the stream-id credentials: the log folder is meant
@@ -211,7 +201,7 @@ namespace HdrCast.Sender
                 }
                 lock (_gate) { if (gen != _generation || _userStopped) return; }
                 ffmpeg.Start();
-                if (plan.TsOnStdout && ffmpeg.StdoutStream != null) TsStreamStarted?.Invoke(ffmpeg.StdoutStream);
+                if (ffmpeg.StdoutStream != null) TsStreamStarted?.Invoke(ffmpeg.StdoutStream);
                 SetState(RunnerState.Streaming, "Streaming");
             }
             catch (Exception ex)

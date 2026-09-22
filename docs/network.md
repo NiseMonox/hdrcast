@@ -1,8 +1,8 @@
 # HdrCast 网络说明
 
 默认是**点对点（Group / P2P）模式**：主播的电脑直接给每位观众发流，腾讯云上的信令服务器只负责牵线。
-本文说明它怎么穿过路由器和防火墙、谁需要什么、IPv6 怎么自查、各地区的 SRT 延迟预设、缓冲公式、上行带宽，
-以及旧的中继 / 直连模式（§8，可选）。协议细节见 `docs/design.md` §8。
+本文说明它怎么穿过路由器和防火墙、谁需要什么、IPv6 怎么自查、各地区的 SRT 延迟预设、缓冲公式和上行带宽。
+协议细节见 `docs/design.md` §8。
 
 ## 1. 点对点模式怎么连上
 
@@ -72,22 +72,21 @@
 | 日本国内 | 10~30 ms | ≈0 | **1500 ms** | 25 % |
 | 澳大利亚 | 120~160 ms | 少量 | **2000 ms** | 25 % |
 | 中国大陆（跨境） | 60~120 ms，但抖动和突发丢包多 | 1~5 % 常见 | **3500 ms** | 50 % |
-| 发送端 → 中继（LAN，仅中继模式） | < 1 ms | 0 | **800 ms** | 25 % |
 
 理由：
 
 1. **Haivision 的 4×RTT 规则**：SRT latency = RTT 乘数 × RTT；在 0.1~0.2 % 丢包、无突发的"还不错"的网络上乘数约为 4。乘数低于 3 基本没意义，高于 20 说明线路已严重拥塞。
 2. **官方保守表**（丢包率 → 乘数 / 带宽开销）：≤1 % → 3 / 1 %；≤3 % → 4 / 4 %；≤7 % → 6 / 9 %；≤10 % → 8 / 15 %；≤12 % → 8 / 20 %；≤21 % → 10 / 38 %；≤25 % → 13 / 46 %；≤30 % → 14 / 61 %；≤40 % → 30 / 97 %。
 3. 按 4×RTT 算，澳洲只要 ~640 ms，中国只要 ~480 ms；但我们的目标是"推流式"而非远程桌面：多留几倍余量能扛住跨境线路的突发丢包（重传要在 latency 内完成），代价只是延迟大一点。中国线路按丢包 3~7 % 取乘数 6~8 并留余量，得到 3500 ms；`oheadbw` 也提高到 50 %，给重传留带宽。
-4. latency 由两端协商取**最大值**（发送端的 `peerlatency` 与接收端的 `rcvlatency`）。点对点模式两端都用观众的值；中继模式下 MediaMTX 自己不设 latency（gosrt 默认 120 ms），所以客户端 URL 里的值就是生效值（实测：API 里 `msReceiveTsbPdDelay` / `msSendTsbPdDelay` 正好等于 URL 里的值）。
-5. 端到端总延迟（点对点）≈ 接收 SRT (1.5~3.5 s) + mpv `cache-pause-wait` (1.5 s) + 编码 (~0.4 s)，即日本约 3.5 s、中国约 5.5 s；
-   比中继模式少了"发送端 → 中继"那 0.8 s。中继模式（§8.1）再加 0.8 s。
+4. latency 由两端协商取**最大值**（发送端的 `peerlatency` 与接收端的 `rcvlatency`）。两端都用观众的值，所以观众选的就是生效值（实测：API 里 `msReceiveTsbPdDelay` / `msSendTsbPdDelay` 正好等于 URL 里的值）。
+5. 端到端总延迟 ≈ 接收 SRT (1.5~3.5 s) + mpv `cache-pause-wait` (1.5 s) + 编码 (~0.4 s)，即日本约 3.5 s、中国约 5.5 s。
 
 > 观众可以自己调：卡顿（mpv 反复缓冲）就把 latency 加 500 ms 重新 Play；线路好就往下减。
 
 ## 4. 缓冲大小公式（必须做，否则高码率会断线）
 
-从 MediaMTX 拉流时 gosrt **不理会接收端的空闲窗口**，libsrt 默认接收缓冲只有 8192 个包；当 latency × 码率 超过它，libsrt 会刷屏 "No room to store incoming packet"，随后 "SEQUENCE DISCREPANCY. BREAKING CONNECTION" 断线（本机 48 Mbps × 2 s 即复现）。所以两个 GUI 都按下面的公式把参数写进 URL（实现在 `shared/Common/SrtBufferSizing.cs`）：
+libsrt 默认的接收缓冲只有 8192 个包（约 10.8 MB）；latency × 码率超过它时，重传窗口里放不下的包会被丢掉，画面花屏甚至断线
+（本机 48 Mbps × 2 s 即复现）。所以两边都按下面的公式把参数写进 URL（实现在 `shared/Common/SrtBufferSizing.cs`）：
 
 ```
 packets = ceil( latency_s × bitrate_bps / (1316 × 8) )      # 每个 SRT 包 1316 字节载荷
@@ -106,33 +105,12 @@ recv_buffer_size = 8000000                                    # UDP socket 缓�
 | 100 Mbps × 2 s | 19 000 | 32 768 | 48 234 496 |
 | 100 Mbps × 3.5 s | 33 244 | 65 536 | 96 468 992 |
 
-接收端不知道发送端会用多大码率时，按 100 Mbps 算（宁大勿小，只是内存）。`relay/setup.sh` 打印的示例 URL 用的是 `rcvbuf=64000000&ffs=64000`，覆盖到 100 Mbps × 6 s。
-
-中继本身：`udpReadBufferSize: 4000000` 要求宿主 `net.core.rmem_max ≥ 4000000`，否则 MediaMTX 起不来 SRT 监听（"unable to set UDP read buffer size"）。生产环境建议：
-
-```
-sudo sysctl -w net.core.rmem_max=16777216
-echo 'net.core.rmem_max=16777216' | sudo tee /etc/sysctl.d/99-hdrcast.conf
-```
-
-（容器里的 `sysctls:` 改不了它，这个内核参数不是命名空间化的。）
+接收端不知道主播会用多大码率时，按界面上的 Expected bitrate 算（默认 100 Mbps，宁大勿小，只是内存）。
 
 ## 5. 防火墙要开什么
 
-**点对点模式：什么都不用开。** 打洞靠的就是防火墙对"自己先发出去的流"的放行。
-
-旧模式（§8）才需要规则：
-
-| 角色 | 模式 | 需要的规则 |
-|---|---|---|
-| 发送端 | 中继 / 直连拨号 | **无**（只有出站 UDP） |
-| 发送端 | 直连·本机监听 | 入站 UDP 该端口 → `ffmpeg.exe`；路由器再转发同一端口 |
-| 接收端 | 中继 / 直连拨号 | **无** |
-| 接收端 | 直连·监听 | 入站 UDP 该端口 → `mpv.exe`；路由器转发 |
-
-```
-netsh advfirewall firewall add rule name="HdrCast SRT in" dir=in action=allow protocol=UDP localport=9000
-```
+**什么都不用开。** 打洞靠的就是路由器和 Windows 防火墙对"自己先发出去的流"的放行：主播和观众都只发起出站 UDP。
+第一次开播或观看时 Windows 可能弹"允许访问网络"，点允许即可。
 
 ## 6. 腾讯云上的信令服务器做什么
 
@@ -155,49 +133,3 @@ netsh advfirewall firewall add rule name="HdrCast SRT in" dir=in action=allow pr
 例：40 Mbps，日本 1 人 + 澳洲 1 人 + 中国 1 人 ≈ 40 × (1.25 + 1.25 + 1.5) = 160 Mbps 上行。
 日本的光纤上行一般够；国内家宽上行常见 30~100 Mbps、澳洲 NBN 常见 20~50 Mbps，朋友开播时要降码率或限人数。
 发送端界面会按 Max viewers 估算，填了 *my upload* 就会在超过 80 % 时标红提醒。
-
-## 8. 旧模式：中继 / 直连 / Tailscale（可选）
-
-下拉框里还保留着这几种模式，适合有公网 IPv4、或者愿意自己跑 MediaMTX 的人。点对点模式不需要它们。
-
-### 8.1 中继模式：MediaMTX（需要一台有公网入口的机器）
-
-```
-发送端 Windows PC ──SRT (LAN, 800 ms)──▶ LXC 192.168.1.201:8890/udp (MediaMTX) ──SRT (1.5~3.5 s)──▶ 朋友 A
-                                                                                 ├──SRT──▶ 朋友 B
-                                                                                 └──HLS 8888/tcp（浏览器兜底）
-```
-
-- 路由器把 **UDP 8890** 转发到 `192.168.1.201`（HLS 兜底再加 TCP 8888，可选）。API 端口 9997 只绑定在 LXC 的 127.0.0.1，不要转发。
-- 发送端在同一局域网内，用 LAN IP `192.168.1.201` 推流；朋友用你的公网 IP / DDNS 域名拉流。
-- 推流与拉流分别鉴权：`sender` 用户只能 publish，`viewer` 用户只能 read；两条腿各自有独立的 SRT passphrase（AES-256）。凭据由 `relay/setup.sh` 生成。
-- **每个观众是一条独立的 SRT 连接**，MediaMTX 逐个复制，所以家里的上行带宽 = 码率 × 观众数 × 1.25（见 §6）。
-- 观众在推流开始前连接会被 MediaMTX 直接拒绝（"no stream is available on path"），接收端 GUI 每 3 s 自动重试。
-- 相同网段的第二台 PC 也可以用 LAN IP 直接拉流做本地测试。
-
-### 8.2 直连模式·本机监听（发送端 `mode=listener`）
-
-```
-发送端 PC (ffmpeg srt://0.0.0.0:9000?mode=listener)  ◀──UDP 9000 端口转发──  朋友 (mpv mode=caller)
-```
-
-- 路由器把选定的 UDP 端口转发到**发送 PC**，Windows 防火墙放行该端口入站；朋友那边什么都不用开。
-- 只有 passphrase 做访问控制（ffmpeg 的 listener 不检查 streamid），所以必须设 passphrase。
-- ffmpeg 的 listener 只接受一个 caller，且对方断开后 ffmpeg 会退出（"Error writing trailer"）—— 适合一对一，GUI 会自动重启。
-- 这是唯一能用 **AV1** 的模式（封装换成 `-f matroska -live 1`，MediaMTX 和 mpegts 都不支持 AV1）。
-
-### 8.3 直连模式·拨号到朋友（朋友 `mode=listener`）
-
-角色对调：朋友的路由器转发一个 UDP 端口到他的 PC，接收端 mpv 用 `mode=listener`，发送端用 `mode=caller` 拨过去。谁转发端口谁当 listener，另一方不需要任何设置。
-
-**不要用 `mode=rendezvous`**：ffmpeg 7.1 会把本地 socket 绑到远端地址（"Cannot assign requested address"），两边都在 NAT 后时只能走中继或 VPN。
-
-### 8.4 Tailscale（无需端口转发，未在真实跨境线路上实测）
-
-LXC 已经在 tailnet 里（`tailscale0` = 100.82.8.39）。朋友装 Tailscale 加入同一个 tailnet 后：
-
-- 中继模式：朋友直接连 `100.82.8.39:8890`，不用路由器转发，也不暴露公网端口。
-- 直连模式：两台 PC 都在 tailnet 里时，caller / listener 任意一方都不需要端口转发。
-
-注意 Tailscale 的 MTU 是 1280 字节，而默认 SRT 包是 1316 字节载荷 + 16 SRT + 8 UDP + 20 IP = 1360 字节，会被 IP 分片，一旦丢一片整包作废。建议改成 6 个 TS 包一组：发送端 / 接收端 URL 用 `pkt_size=1128`，中继的 `mediamtx.yml` 把 `udpMaxPayloadSize` 改成 `1200`（MediaMTX 会算出 (1200−16)/188×188 = 1128）。这一条没有实测。
-

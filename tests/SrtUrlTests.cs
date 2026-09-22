@@ -7,55 +7,74 @@ namespace HdrCast.Tests
 {
     public class SrtUrlTests
     {
-        static SrtUrlOptions Relay(SrtRole role) => new SrtUrlOptions
+        /// <summary>The two URLs P2P mode builds: a viewer's remux child (listener) and mpv (caller), both on loopback.</summary>
+        static SrtUrlOptions Child() => new SrtUrlOptions
         {
-            Topology = SrtTopology.Relay,
-            Role = role,
-            Host = "relay.example.net",
-            Port = 8890,
-            StreamPath = "screen",
-            User = "sender",
-            Password = "pw",
+            Topology = SrtTopology.Listener,
+            Role = SrtRole.Publish,
+            ListenAddress = "127.0.0.1",
+            Port = 40000,
+            Passphrase = "0123456789abcdef",
+            LatencyMs = 1500,
+            BitrateBps = 40_000_000,
+        };
+
+        static SrtUrlOptions Mpv() => new SrtUrlOptions
+        {
+            Topology = SrtTopology.Caller,
+            Role = SrtRole.Read,
+            Host = "127.0.0.1",
+            Port = 40123,
             Passphrase = "0123456789abcdef",
             LatencyMs = 1500,
             BitrateBps = 40_000_000,
         };
 
         [Fact]
-        public void Relay_publish_has_streamid_and_sndbuf()
+        public void The_remux_child_listens_on_loopback_with_a_send_buffer()
         {
-            string url = SrtUrl.Build(Relay(SrtRole.Publish));
-            SrtUrlParts p = SrtUrl.Parse(url);
-            Assert.Equal("relay.example.net", p.Host);
-            Assert.Equal(8890, p.Port);
-            Assert.Equal("publish:screen:sender:pw", SrtUrl.Decode(p.Get("streamid")!));
+            SrtUrlParts p = SrtUrl.Parse(SrtUrl.Build(Child()));
+            Assert.Equal("127.0.0.1", p.Host);
+            Assert.Equal(40000, p.Port);
+            Assert.Equal("listener", p.Get("mode"));
+            Assert.Equal("-1", p.Get("listen_timeout"));
             Assert.True(p.Has("sndbuf"));
             Assert.False(p.Has("rcvbuf"));
             Assert.False(p.Has("recv_buffer_size"));
+            Assert.False(p.Has("connect_timeout"));
+            Assert.False(p.Has("streamid"));
         }
 
         [Fact]
-        public void Relay_read_has_rcvbuf_and_recv_buffer_size()
+        public void Mpv_calls_loopback_with_a_receive_buffer()
         {
-            string url = SrtUrl.Build(Relay(SrtRole.Read));
-            SrtUrlParts p = SrtUrl.Parse(url);
-            Assert.Equal("read:screen:sender:pw", SrtUrl.Decode(p.Get("streamid")!));
+            SrtUrlParts p = SrtUrl.Parse(SrtUrl.Build(Mpv()));
+            Assert.Equal("caller", p.Get("mode"));
+            Assert.Equal("127.0.0.1", p.Host);
+            Assert.Equal("5000", p.Get("connect_timeout"));
             Assert.True(p.Has("rcvbuf"));
             Assert.Equal(SrtBufferSizing.RecvSocketBufferBytes.ToString(), p.Get("recv_buffer_size"));
+        }
+
+        [Fact]
+        public void A_listener_without_an_address_binds_ipv4_everywhere()
+        {
+            SrtUrlOptions o = Child();
+            o.ListenAddress = null;
+            Assert.Equal(SrtUrl.ListenerHost, SrtUrl.Parse(SrtUrl.Build(o)).Host);
         }
 
         [Fact]
         public void Latency_is_expressed_in_microseconds()
         {
             // ffmpeg's srt protocol takes latency in microseconds (libsrt.c divides by 1000 before SRTO_LATENCY).
-            string url = SrtUrl.Build(Relay(SrtRole.Publish));
-            Assert.Equal("1500000", SrtUrl.Parse(url).Get("latency"));
+            Assert.Equal("1500000", SrtUrl.Parse(SrtUrl.Build(Child())).Get("latency"));
         }
 
         [Fact]
         public void Passphrase_adds_pbkeylen()
         {
-            SrtUrlParts p = SrtUrl.Parse(SrtUrl.Build(Relay(SrtRole.Publish)));
+            SrtUrlParts p = SrtUrl.Parse(SrtUrl.Build(Mpv()));
             Assert.Equal("0123456789abcdef", SrtUrl.Decode(p.Get("passphrase")!));
             Assert.Equal("32", p.Get("pbkeylen"));
         }
@@ -63,7 +82,7 @@ namespace HdrCast.Tests
         [Fact]
         public void No_passphrase_means_no_encryption_parameters()
         {
-            SrtUrlOptions o = Relay(SrtRole.Publish);
+            SrtUrlOptions o = Mpv();
             o.Passphrase = null;
             SrtUrlParts p = SrtUrl.Parse(SrtUrl.Build(o));
             Assert.False(p.Has("passphrase"));
@@ -75,7 +94,7 @@ namespace HdrCast.Tests
         [InlineData("")]
         public void Invalid_passphrase_is_rejected(string passphrase)
         {
-            SrtUrlOptions o = Relay(SrtRole.Publish);
+            SrtUrlOptions o = Mpv();
             o.Passphrase = passphrase;
             if (passphrase.Length == 0)
             {
@@ -89,33 +108,9 @@ namespace HdrCast.Tests
         }
 
         [Fact]
-        public void Listener_uses_wildcard_host_and_infinite_listen_timeout()
-        {
-            SrtUrlOptions o = Relay(SrtRole.Publish);
-            o.Topology = SrtTopology.DirectListener;
-            SrtUrlParts p = SrtUrl.Parse(SrtUrl.Build(o));
-            Assert.Equal(SrtUrl.ListenerHost, p.Host);
-            Assert.Equal("listener", p.Get("mode"));
-            Assert.Equal("-1", p.Get("listen_timeout"));
-            Assert.False(p.Has("streamid"));     // direct mode has no MediaMTX stream id
-            Assert.False(p.Has("connect_timeout"));
-        }
-
-        [Fact]
-        public void Caller_mode_keeps_host_and_connect_timeout()
-        {
-            SrtUrlOptions o = Relay(SrtRole.Publish);
-            o.Topology = SrtTopology.DirectCaller;
-            SrtUrlParts p = SrtUrl.Parse(SrtUrl.Build(o));
-            Assert.Equal("caller", p.Get("mode"));
-            Assert.Equal("relay.example.net", p.Host);
-            Assert.Equal("5000", p.Get("connect_timeout"));
-        }
-
-        [Fact]
         public void Rate_control_emits_maxbw_inputbw_oheadbw()
         {
-            SrtUrlOptions o = Relay(SrtRole.Publish);
+            SrtUrlOptions o = Child();
             o.RateControl = true;
             o.OverheadPercent = 50;
             SrtUrlParts p = SrtUrl.Parse(SrtUrl.Build(o));
@@ -125,44 +120,27 @@ namespace HdrCast.Tests
         }
 
         [Fact]
-        public void Special_characters_in_credentials_are_percent_encoded()
+        public void Special_characters_in_the_passphrase_are_percent_encoded()
         {
-            SrtUrlOptions o = Relay(SrtRole.Publish);
-            o.Password = "a&b c#d%e";
+            SrtUrlOptions o = Mpv();
             o.Passphrase = "pass&phrase=with#specials";
             string url = SrtUrl.Build(o);
-            Assert.DoesNotContain("a&b", url);
             Assert.DoesNotContain("#", url);
-            SrtUrlParts p = SrtUrl.Parse(url);
-            Assert.Equal("publish:screen:sender:a&b c#d%e", SrtUrl.Decode(p.Get("streamid")!));
-            Assert.Equal("pass&phrase=with#specials", SrtUrl.Decode(p.Get("passphrase")!));
-        }
-
-        [Fact]
-        public void Stream_id_components_must_not_contain_colon()
-        {
-            Assert.Throws<ArgumentException>(() => SrtUrl.BuildStreamId(SrtRole.Publish, "scr:een", null, null));
-            Assert.Throws<ArgumentException>(() => SrtUrl.BuildStreamId(SrtRole.Read, "screen", "us:er", "pw"));
-        }
-
-        [Fact]
-        public void Stream_id_without_credentials_is_two_parts()
-        {
-            Assert.Equal("read:screen", SrtUrl.BuildStreamId(SrtRole.Read, "screen", null, null));
+            Assert.Equal("pass&phrase=with#specials", SrtUrl.Decode(SrtUrl.Parse(url).Get("passphrase")!));
         }
 
         [Fact]
         public void Ipv6_host_is_bracketed()
         {
-            SrtUrlOptions o = Relay(SrtRole.Read);
+            SrtUrlOptions o = Mpv();
             o.Host = "2001:db8::1";
-            Assert.StartsWith("srt://[2001:db8::1]:8890?", SrtUrl.Build(o));
+            Assert.StartsWith("srt://[2001:db8::1]:40123?", SrtUrl.Build(o));
         }
 
         [Fact]
         public void Pkt_size_is_1316_so_srt_payload_is_seven_ts_packets()
         {
-            Assert.Equal("1316", SrtUrl.Parse(SrtUrl.Build(Relay(SrtRole.Publish))).Get("pkt_size"));
+            Assert.Equal("1316", SrtUrl.Parse(SrtUrl.Build(Child())).Get("pkt_size"));
             Assert.Equal(0, SrtBufferSizing.PayloadBytes % 188);
         }
     }

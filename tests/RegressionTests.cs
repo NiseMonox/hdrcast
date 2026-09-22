@@ -138,9 +138,9 @@ namespace HdrCast.Tests
         {
             var s = new ReceiverSettings
             {
-                Host = "h", DisplayMode = DisplayMode.SdrToneMap, TargetPeakNits = 5,
+                DisplayMode = DisplayMode.SdrToneMap, TargetPeakNits = 5,
             }.Normalize();
-            MpvLaunchPlan plan = MpvCommandBuilder.Build(s, 1, "mpv");
+            MpvLaunchPlan plan = MpvCommandBuilder.Build(s, 40123, "0123456789abcdef", 1, "mpv");
             foreach (string a in plan.MpvArgs)
                 Assert.False(a.StartsWith("--target-peak=", StringComparison.Ordinal) && a != "--target-peak=auto",
                              "unexpected " + a);

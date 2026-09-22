@@ -64,13 +64,6 @@ namespace HdrCast.Tests
                     {
                         var s = new ReceiverSettings
                         {
-                            Mode = ConnectionMode.Relay,
-                            Host = "relay.example.net",
-                            Port = 8890,
-                            StreamPath = "screen",
-                            User = "viewer",
-                            Password = "pw",
-                            Passphrase = "0123456789abcdef",
                             LatencyMs = 1500,
                             ExpectedBitrateMbps = 60,
                             DisplayMode = display,
@@ -96,7 +89,7 @@ namespace HdrCast.Tests
             var unknown = new SortedSet<string>(StringComparer.Ordinal);
             foreach (ReceiverSettings s in Variants())
             {
-                MpvLaunchPlan plan = MpvCommandBuilder.Build(s, 1234, "mpv", "ffmpeg");
+                MpvLaunchPlan plan = MpvCommandBuilder.Build(s, 40123, "0123456789abcdef", 1234, "mpv", "ffmpeg");
                 foreach (string arg in plan.MpvArgs)
                 {
                     if (!arg.StartsWith("--", StringComparison.Ordinal)) continue;
@@ -120,11 +113,9 @@ namespace HdrCast.Tests
             // bad value is reported, while the missing file is an expected, harmless failure.
             var s = new ReceiverSettings
             {
-                Mode = ConnectionMode.Relay, Host = "127.0.0.1", Port = 8890, StreamPath = "screen",
-                User = "viewer", Password = "pw", Passphrase = "0123456789abcdef",
                 LatencyMs = 1500, ExpectedBitrateMbps = 60, DisplayMode = DisplayMode.HdrPassthrough,
             }.Normalize();
-            MpvLaunchPlan plan = MpvCommandBuilder.Build(s, 4321, mpv);
+            MpvLaunchPlan plan = MpvCommandBuilder.Build(s, 40123, "0123456789abcdef", 4321, mpv);
 
             var args = new List<string>();
             foreach (string a in plan.MpvArgs)

@@ -22,7 +22,7 @@ Anyone in the group can also stream to the others.
 1. Unzip the HdrCast folder anywhere. Run `scripts\get-tools.cmd viewer`.
 2. **Copy the whole invite message** from the chat, then start `HdrCastReceiver.exe`. It asks "Join this group?": say yes and
    type the name your friends will see. If it does not ask, click **Paste invite**.
-3. Mode switches to **Group**. The **Watch** list shows who is live right now (refreshed every 10 s). Pick your region in
+3. The **Watch** list shows who is live right now (refreshed every 10 s). Pick your region in
    **Latency**: Japan 1500 ms, Australia 2000 ms, China 3500 ms. Click **Play**.
 4. On an **HDR monitor**, switch Windows HDR on first: `Win + Alt + B` (or Settings > System > Display > Use HDR). On an SDR
    monitor choose "SDR tone-map" under Display.
@@ -32,7 +32,7 @@ The delay is 3-6 seconds by design: it is a broadcast, not a remote desktop.
 ## Streaming to the group
 
 1. Run `scripts\get-tools.cmd sender` (downloads ffmpeg), start `HdrCastSender.exe`.
-2. Mode **Group: friends watch straight from this PC (P2P)**. If you already joined with the receiver, the group is there;
+2. The **Share with your group** box shows the group. If you already joined with the receiver, it is there;
    otherwise **Paste invite**.
 3. Pick the monitor and bitrate, set **Max viewers**, click **Start**. Every viewer costs one full stream of *your upload*:
    three viewers at 20 Mbps need about 75 Mbps up. The app estimates it; enter your upload next to "my upload" to get a warning.

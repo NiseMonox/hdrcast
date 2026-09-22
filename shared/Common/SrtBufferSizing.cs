@@ -22,7 +22,7 @@ namespace HdrCast.Common
 
     /// <summary>
     /// Sizes libsrt's flow-control window and socket buffers for a given latency x bitrate product.
-    /// Reading from MediaMTX at >~40 Mbps with >=2 s latency overflows the default 8192-packet
+    /// At >~40 Mbps with >=2 s latency the stream in flight overflows libsrt's default 8192-packet
     /// receive buffer ("No room to store incoming packet" then "SEQUENCE DISCREPANCY"), so both
     /// apps put these values in the srt:// URL (docs/research/srt-mediamtx.research.json).
     /// </summary>

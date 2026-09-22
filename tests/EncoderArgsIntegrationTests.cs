@@ -71,8 +71,6 @@ namespace HdrCast.Tests
         [Theory]
         [InlineData(VideoEncoder.LibX265, false)]
         [InlineData(VideoEncoder.LibX265, true)]
-        [InlineData(VideoEncoder.LibSvtAv1, false)]
-        [InlineData(VideoEncoder.LibSvtAv1, true)]
         public void Ffmpeg_accepts_the_generated_options(VideoEncoder encoder, bool hdr)
         {
             string? ffmpeg = FindFfmpeg();
@@ -151,7 +149,7 @@ namespace HdrCast.Tests
         [Fact]
         public void Av1_really_cannot_be_muxed_into_mpegts()
         {
-            // This is why the relay path is HEVC-only (EncoderInfo.MpegTsCompatible). If a future ffmpeg gains
+            // This is why HdrCast is HEVC-only: the P2P fan-out carries MPEG-TS. If a future ffmpeg gains
             // AV1-in-MPEG-TS this test starts failing, which is the signal to revisit that restriction.
             string? ffmpeg = FindFfmpeg();
             if (ffmpeg == null || !HasEncoder(ffmpeg, "libsvtav1")) return;

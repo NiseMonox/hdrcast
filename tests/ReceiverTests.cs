@@ -8,23 +8,22 @@ namespace HdrCast.Tests
 {
     public class MpvCommandTests
     {
+        const int LocalPort = 40123;                              // the ViewerLink end on 127.0.0.1
+        const string Passphrase = "0123456789abcdef";
+
         static ReceiverSettings Settings(DisplayMode display = DisplayMode.Auto)
         {
             var s = new ReceiverSettings
             {
-                Mode = ConnectionMode.Relay,
-                Host = "relay.example.net",
-                Port = 8890,
-                StreamPath = "screen",
-                User = "viewer",
-                Password = "pw",
-                Passphrase = "0123456789abcdef",
                 LatencyMs = 1500,
                 ExpectedBitrateMbps = 60,
                 DisplayMode = display,
             };
             return s.Normalize();
         }
+
+        static MpvLaunchPlan Build(ReceiverSettings s, int pid, string mpv, string? ffmpeg = null) =>
+            MpvCommandBuilder.Build(s, LocalPort, Passphrase, pid, mpv, ffmpeg);
 
         static string Flag(IReadOnlyList<string> args, string name)
         {
@@ -44,7 +43,7 @@ namespace HdrCast.Tests
         [Fact]
         public void Hdr_passthrough_needs_gpu_next_and_the_colorspace_hint()
         {
-            MpvLaunchPlan plan = MpvCommandBuilder.Build(Settings(DisplayMode.HdrPassthrough), 1234, @"C:\mpv\mpv.exe");
+            MpvLaunchPlan plan = Build(Settings(DisplayMode.HdrPassthrough), 1234, @"C:\mpv\mpv.exe");
             Assert.Equal("gpu-next", Flag(plan.MpvArgs, "vo"));
             Assert.Equal("d3d11", Flag(plan.MpvArgs, "gpu-api"));
             Assert.Equal("yes", Flag(plan.MpvArgs, "target-colorspace-hint"));
@@ -54,7 +53,7 @@ namespace HdrCast.Tests
         public void Sdr_mode_turns_the_hint_off_and_tone_maps()
         {
             ReceiverSettings s = Settings(DisplayMode.SdrToneMap);
-            MpvLaunchPlan plan = MpvCommandBuilder.Build(s, 1234, "mpv");
+            MpvLaunchPlan plan = Build(s, 1234, "mpv");
             Assert.Equal("no", Flag(plan.MpvArgs, "target-colorspace-hint"));
             Assert.Equal(ReceiverSettings.DefaultToneMapping, Flag(plan.MpvArgs, "tone-mapping"));
         }
@@ -62,18 +61,20 @@ namespace HdrCast.Tests
         [Fact]
         public void Auto_mode_lets_mpv_decide()
         {
-            MpvLaunchPlan plan = MpvCommandBuilder.Build(Settings(DisplayMode.Auto), 1234, "mpv");
+            MpvLaunchPlan plan = Build(Settings(DisplayMode.Auto), 1234, "mpv");
             Assert.Equal("auto", Flag(plan.MpvArgs, "target-colorspace-hint"));
         }
 
         [Fact]
-        public void Url_is_the_last_argument_and_carries_the_srt_options()
+        public void Url_is_the_last_argument_and_calls_the_local_end_of_the_path()
         {
-            MpvLaunchPlan plan = MpvCommandBuilder.Build(Settings(), 1234, "mpv");
+            MpvLaunchPlan plan = Build(Settings(), 1234, "mpv");
             string url = plan.MpvArgs[plan.MpvArgs.Count - 1];
-            Assert.StartsWith("srt://relay.example.net:8890?", url);
+            Assert.StartsWith("srt://127.0.0.1:" + LocalPort + "?mode=caller", url);
             SrtUrlParts p = SrtUrl.Parse(url);
-            Assert.Equal("read:screen:viewer:pw", SrtUrl.Decode(p.Get("streamid")!));
+            Assert.Null(p.Get("streamid"));
+            Assert.Equal(Passphrase, p.Get("passphrase"));
+            Assert.Equal("32", p.Get("pbkeylen"));
             Assert.Equal("1500000", p.Get("latency"));
             // Reading a 60 Mbps stream with 1.5 s of latency needs a bigger receive buffer than libsrt's default.
             Assert.True(p.Has("rcvbuf"));
@@ -84,7 +85,7 @@ namespace HdrCast.Tests
         [Fact]
         public void Ipc_pipe_is_per_process()
         {
-            MpvLaunchPlan plan = MpvCommandBuilder.Build(Settings(), 4321, "mpv");
+            MpvLaunchPlan plan = Build(Settings(), 4321, "mpv");
             Assert.Equal("hdrcast-mpv-4321", plan.PipeName);
             Assert.Contains(MpvCommandBuilder.PipePrefix + "hdrcast-mpv-4321", plan.MpvArgs[FindIpc(plan.MpvArgs)]);
         }
@@ -101,7 +102,7 @@ namespace HdrCast.Tests
         {
             ReceiverSettings s = Settings();
             s.BufferSeconds = 2.5;
-            MpvLaunchPlan plan = MpvCommandBuilder.Build(s, 1, "mpv");
+            MpvLaunchPlan plan = Build(s, 1, "mpv");
             Assert.True(Has(plan.MpvArgs, "cache"));
             Assert.True(Has(plan.MpvArgs, "cache-pause-initial"));
             Assert.Contains("2.5", Flag(plan.MpvArgs, "cache-pause-wait"));
@@ -113,7 +114,7 @@ namespace HdrCast.Tests
             ReceiverSettings s = Settings();
             s.Fullscreen = true;
             s.FullscreenScreen = 2;
-            MpvLaunchPlan plan = MpvCommandBuilder.Build(s, 1, "mpv");
+            MpvLaunchPlan plan = Build(s, 1, "mpv");
             Assert.True(Has(plan.MpvArgs, "fs"));
             Assert.Equal("2", Flag(plan.MpvArgs, "fs-screen"));
         }
@@ -122,7 +123,7 @@ namespace HdrCast.Tests
         public void Exclusive_fullscreen_is_never_used()
         {
             // --d3d11-exclusive-fs breaks HDR passthrough on some drivers; borderless --fs is the supported path.
-            MpvLaunchPlan plan = MpvCommandBuilder.Build(Settings(DisplayMode.HdrPassthrough), 1, "mpv");
+            MpvLaunchPlan plan = Build(Settings(DisplayMode.HdrPassthrough), 1, "mpv");
             Assert.False(Has(plan.MpvArgs, "d3d11-exclusive-fs"));
         }
 
@@ -131,23 +132,12 @@ namespace HdrCast.Tests
         {
             ReceiverSettings s = Settings();
             s.Frontend = ReceiverFrontend.FfmpegPipe;
-            MpvLaunchPlan plan = MpvCommandBuilder.Build(s, 1, "mpv", @"C:\ff\ffmpeg.exe");
+            MpvLaunchPlan plan = Build(s, 1, "mpv", @"C:\ff\ffmpeg.exe");
             Assert.True(plan.UsesFfmpegPipe);
             Assert.Contains("-c", plan.FfmpegArgs!);
             Assert.Contains("copy", plan.FfmpegArgs!);
             Assert.Contains("-", plan.MpvArgs);                   // mpv reads stdin
             Assert.Contains("|", plan.ToCommandLine());
-        }
-
-        [Fact]
-        public void Direct_listen_mode_builds_a_listener_url()
-        {
-            ReceiverSettings s = Settings();
-            s.Mode = ConnectionMode.DirectListen;
-            MpvLaunchPlan plan = MpvCommandBuilder.Build(s, 1, "mpv");
-            SrtUrlParts p = SrtUrl.Parse(plan.Url);
-            Assert.Equal(SrtUrl.ListenerHost, p.Host);
-            Assert.Equal("listener", p.Get("mode"));
         }
     }
 
@@ -279,31 +269,44 @@ namespace HdrCast.Tests
     public class ReceiverSettingsTests
     {
         [Fact]
-        public void Defaults_point_at_a_relay_on_8890()
+        public void Defaults_are_the_japan_preset()
         {
             var s = new ReceiverSettings();
-            Assert.Equal(ConnectionMode.Relay, s.Mode);
-            Assert.Equal(8890, s.Port);
-            Assert.Equal("screen", s.StreamPath);
+            Assert.Equal(1500, s.LatencyMs);
+            Assert.Equal(25, s.OverheadPercent);
+            Assert.Empty(s.Validate());
         }
 
         [Fact]
         public void Validation_reports_the_usual_mistakes()
         {
-            var s = new ReceiverSettings { Host = "", Passphrase = "abc", LatencyMs = 5, ExpectedBitrateMbps = 0 };
+            var s = new ReceiverSettings { LatencyMs = 5, ExpectedBitrateMbps = 0 };
             List<string> problems = s.Validate();
-            Assert.Contains(problems, p => p.Contains("Host"));
-            Assert.Contains(problems, p => p.Contains("Passphrase"));
             Assert.Contains(problems, p => p.Contains("Latency"));
+            Assert.Contains(problems, p => p.Contains("bitrate"));
         }
 
         [Fact]
         public void Read_role_options_include_the_receive_buffer()
         {
-            var s = new ReceiverSettings { Host = "h" };
-            SrtUrlOptions o = s.ToSrtOptions();
+            SrtUrlOptions o = new ReceiverSettings().ToSrtOptions(40000, "0123456789abcdef");
             Assert.Equal(SrtRole.Read, o.Role);
+            Assert.Equal(SrtTopology.Caller, o.Topology);
+            Assert.Equal("127.0.0.1", o.Host);
             Assert.True(o.IncludeRecvSocketBuffer);
+        }
+
+        [Fact]
+        public void An_old_settings_file_with_relay_fields_still_loads()
+        {
+            const string json = "{\"mode\":0,\"host\":\"relay.example.net\",\"port\":8890,\"path\":\"screen\",\"user\":\"viewer\"," +
+                                "\"password\":\"pw\",\"passphrase\":\"0123456789abcdef\",\"latencyMs\":3500,\"expectedBitrateMbps\":80}";
+            ReceiverSettings? s = Json.Deserialize<ReceiverSettings>(json);
+            Assert.NotNull(s);
+            s!.Normalize();
+            Assert.Equal(3500, s.LatencyMs);
+            Assert.Equal(80, s.ExpectedBitrateMbps);
+            Assert.Equal(50, s.OverheadPercent);
         }
 
         [Fact]

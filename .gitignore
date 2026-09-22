@@ -14,8 +14,6 @@ tools/
 # logs / local config
 logs/
 *.log
-relay/recordings/
-relay/.env
 
 # OS
 Thumbs.db

@@ -23,11 +23,12 @@
 只看到"谁在播"（主播名字、候选地址、码率、观众数）和加入 / 应答消息，全部用组密钥签名；
 看不到组密钥、SRT passphrase，也碰不到视频。服务器被人控制的最坏结果是让人连不上，没法把观众引到别处。详见 `docs/network.md` §6。
 
-## 为什么 AV1 只能直连，不能走中继 / 点对点？
+## 为什么没有 AV1？
 
-ffmpeg（7.1 与 master）的 MPEG-TS 封装器不支持 AV1：会写成 private stream (0x06)，读回来变成 `bin_data`；MediaMTX 的 SRT/MPEG-TS 也只认 H264 / H265 / MPEG 视频和 Opus / AAC / MP3 / AC-3 音频。
-点对点模式的分发也是按 MPEG-TS 做的（中途加入的观众靠 TS 的重复头恢复）。所以中继和点对点都只能 **HEVC Main10**。
-AV1（`av1_nvenc`，RTX 40 系）只在「直连模式」可选：封装改成 `-f matroska -live 1`（或 NUT）直接 SRT 到对方。代价：Matroska 没有 TS 那样的包级重同步，丢包严重时恢复更慢；观众的 GPU 也要能硬解 AV1 10-bit（RTX 30+/RX 6000+/Intel Arc/12 代+ 核显），软解 dav1d 4K60 很吃 CPU。
+ffmpeg（7.1 与 master）的 MPEG-TS 封装器不支持 AV1：会写成 private stream (0x06)，读回来变成 `bin_data`。
+点对点的分发是按 MPEG-TS 做的（中途加入的观众靠 TS 的重复头恢复），所以只能 **HEVC Main10**。
+v0.1 的"直连模式"可以用 Matroska 走 AV1，但它要求一方做端口转发，已经随中继模式一起删除。
+哪天 ffmpeg 支持 AV1-in-MPEG-TS 了，测试 `Av1_really_cannot_be_muxed_into_mpegts` 会开始失败，那就是重新考虑的信号。
 
 ## 观众的 mpv 为什么要先在 Windows 里打开 HDR？
 
@@ -38,11 +39,10 @@ mpv 的 HDR 直通 (`--vo=gpu-next --gpu-api=d3d11 --target-colorspace-hint=yes`
 
 ## 观众是 SDR 显示器怎么办？
 
-三个选择：
+两个选择：
 
 1. **mpv 色调映射（推荐）**：接收端选 "SDR 色调映射"（`--target-colorspace-hint=no --tone-mapping=bt.2390`，可选 `--hdr-compute-peak=yes`），mpv 在 GPU 上把 PQ 映射到 SDR，观感接近发送端的 SDR 桌面，高光被压缩。
-2. **浏览器 HLS 兜底**：`http://viewer:密码@主机:8888/screen`，MediaMTX 原样输出 HEVC 10-bit fMP4，观感取决于浏览器是否会做 HDR→SDR（Edge/Chrome 带硬解 HEVC 时一般可以），延迟 3~6 s，没有实测。
-3. 发送端切「强制 SDR」：桌面按 SDR 采集（nv12 / BT.709），所有人看 SDR，但发送端自己的 HDR 桌面在 SDR 采集下亮度会被裁切——只在观众全是 SDR 时用。
+2. 发送端切「强制 SDR」：桌面按 SDR 采集（nv12 / BT.709），所有人看 SDR，但发送端自己的 HDR 桌面在 SDR 采集下亮度会被裁切——只在观众全是 SDR 时用。
 
 ## 码率怎么选？
 
@@ -61,7 +61,7 @@ HEVC 10-bit、60 fps、桌面/游戏混合内容的经验值：
 
 ## 上传带宽怎么估？
 
-点对点模式由主播的电脑给每个观众各发一份（中继模式由中继发，道理一样），所以：
+主播的电脑给每个观众各发一份，所以：
 
 ```
 上行需求 ≈ 码率 × 观众数 × 1.25（SRT 开销 oheadbw=25 %；中国观众 oheadbw=50 % 时按 ×1.5）
@@ -79,15 +79,6 @@ HEVC 10-bit、60 fps、桌面/游戏混合内容的经验值：
    主播的上行不够时所有观众一起卡：看状态栏 **Viewers** 里的 upload 估算。
 3. 发送端状态栏 `speed` 持续 < 1.0× 或 `drop_frames` 增长 → 编码器跟不上：降分辨率 / 帧率，或质量档改成"速度优先"。
 4. 采集统计 `dropped` 增长而 `captured` 正常 → 管道写入被 ffmpeg 阻塞，一般是上一条的编码器问题。
-5. （中继模式）中继日志 `reader is too slow` → 已经把 `writeQueueSize` 调到 2048，再出现说明观众线路太差，只能降码率。
-
-## 中继 / 直连模式的观众连不上？
-
-- 显示"等待推流…"：发送端还没开始，MediaMTX 不会让读者排队，接收端每 3 s 重试是正常的。
-- 立即断开、日志 `invalid passphrase` / `passphrase not provided` → read passphrase 填错了（注意 publish 与 read 是两把不同的 passphrase）。
-- `authentication failed` → viewer 密码错。
-- 连接超时 → 路由器没转发 UDP 8890，或公网 IP 变了（用 DDNS）；可以先在同一局域网内用 `192.168.1.201` 测。
-- mpv 说不认识 `srt://` → 这个 mpv 构建没带 libsrt，换 shinchiro / zhongfly 的构建，或在接收端 GUI 里选「用 ffmpeg 拉流」兜底。
 
 ## 音频怎么来的？需要虚拟声卡吗？
 
@@ -99,19 +90,10 @@ ddagrab 能拿到正确的 scRGB FP16 帧，但 ffmpeg 内部没有任何无损�
 
 ## 安全性如何？
 
-点对点模式：
-
 - 邀请码里的 32 字节组密钥是一切的根：派生出信令鉴权 key、消息签名 key、SRT passphrase（AES-256，`pbkeylen=32`）和每个会话的打洞 key。
   **有邀请码就能进组看**，只发给信得过的人；要踢人就新建一个组、把新邀请码发给其余的人。
 - 视频从主播的 remux 子进程到观众的 mpv 端到端 AES-256；打洞包带 HMAC，未通过验证的来源发来的数据一律丢弃，碰不到主播本机的 ffmpeg。
 - 信令服务器只见签名的元数据（见上面"腾讯云服务器会看到什么"）。
-
-中继模式：
-
-- 两条 SRT 腿都是 AES-256（passphrase 24 位随机，`pbkeylen=32`），载荷加密。
-- SRT 握手本身不加密，streamid 里的用户名/密码是明文——它们只是"低价值令牌"，真正的保密靠 passphrase；不要在别处复用这些密码。
-- MediaMTX 的 API 只绑定 LXC 的 127.0.0.1；HLS 端口有 basic auth；其余协议（RTSP/RTMP/WebRTC）全部关闭。
-- 想更保险就走 Tailscale（`docs/network.md` §8.4），完全不开公网端口。
 
 ## 延迟能再低一点吗？
 

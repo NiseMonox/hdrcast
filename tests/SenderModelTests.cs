@@ -124,12 +124,12 @@ namespace HdrCast.Tests
         }
 
         [Fact]
-        public void Av1_is_marked_as_incompatible_with_mpegts()
+        public void Only_hevc_encoders_are_offered()
         {
-            Assert.False(EncoderProfiles.Info(VideoEncoder.Av1Nvenc).MpegTsCompatible);
-            Assert.False(EncoderProfiles.Info(VideoEncoder.Av1Amf).MpegTsCompatible);
-            Assert.False(EncoderProfiles.Info(VideoEncoder.LibSvtAv1).MpegTsCompatible);
-            Assert.True(EncoderProfiles.Info(VideoEncoder.HevcNvenc).MpegTsCompatible);
+            // The P2P fan-out carries MPEG-TS, which has no AV1 mapping in ffmpeg (EncoderArgsIntegrationTests
+            // proves it), so every encoder in the catalogue must be HEVC.
+            foreach (EncoderInfo info in EncoderProfiles.All) Assert.StartsWith("HEVC", info.DisplayName);
+            Assert.Equal(4, EncoderProfiles.All.Length);
         }
 
         [Fact]
@@ -175,8 +175,6 @@ namespace HdrCast.Tests
             Fps = 60,
             Encoder = new EncoderSettings { Encoder = VideoEncoder.HevcNvenc, Hdr = hdr, BitrateKbps = 40000, Fps = 60 },
             Audio = audio ? AudioCodec.Aac : AudioCodec.None,
-            Container = Container.MpegTs,
-            OutputUrl = "srt://relay:8890?streamid=publish:screen",
         };
 
         static string Value(List<string> args, string key)
@@ -231,35 +229,14 @@ namespace HdrCast.Tests
             Assert.Equal("0", Value(a, "-muxdelay"));
             Assert.Equal("0", Value(a, "-muxpreload"));
             Assert.Equal("mpegts", LastValue(a, "-f"));
-            Assert.Equal("srt://relay:8890?streamid=publish:screen", a[a.Count - 1]);
+            Assert.Equal("pipe:1", a[a.Count - 1]);                   // stdout, into the P2P fan-out
         }
 
         [Fact]
-        public void Progress_is_reported_on_stdout()
+        public void Progress_is_reported_on_stderr_because_stdout_carries_the_stream()
         {
             List<string> a = FfmpegCommandBuilder.Build(Plan());
-            Assert.Equal("pipe:1", Value(a, "-progress"));
-        }
-
-        [Fact]
-        public void Av1_into_mpegts_is_refused()
-        {
-            FfmpegPlan p = Plan();
-            p.Encoder.Encoder = VideoEncoder.Av1Nvenc;
-            ArgumentException ex = Assert.Throws<ArgumentException>(() => FfmpegCommandBuilder.Build(p));
-            Assert.Contains("MPEG-TS", ex.Message);
-        }
-
-        [Fact]
-        public void Av1_into_matroska_is_allowed_for_direct_mode()
-        {
-            FfmpegPlan p = Plan();
-            p.Encoder.Encoder = VideoEncoder.Av1Nvenc;
-            p.Container = Container.Matroska;
-            List<string> a = FfmpegCommandBuilder.Build(p);
-            Assert.Equal("av1_nvenc", Value(a, "-c:v"));
-            Assert.Contains("matroska", a);
-            Assert.Equal("1", Value(a, "-live"));
+            Assert.Equal("pipe:2", Value(a, "-progress"));
         }
 
         [Fact]
@@ -292,12 +269,12 @@ namespace HdrCast.Tests
         [Fact]
         public void Cpu_encoders_get_a_planar_pixel_format()
         {
-            // The capture engine only produces p010/nv12; libx265 and SVT-AV1 accept neither, so the profile
-            // must name the planar format or ffmpeg may negotiate 8-bit and silently drop HDR precision.
+            // The capture engine only produces p010/nv12; libx265 accepts neither, so the profile must name the
+            // planar format or ffmpeg may negotiate 8-bit and silently drop HDR precision.
             Assert.Equal("p010le", EncoderProfiles.PixelFormat(VideoEncoder.HevcNvenc, true));
             Assert.Equal("nv12", EncoderProfiles.PixelFormat(VideoEncoder.HevcNvenc, false));
             Assert.Equal("yuv420p10le", EncoderProfiles.PixelFormat(VideoEncoder.LibX265, true));
-            Assert.Equal("yuv420p", EncoderProfiles.PixelFormat(VideoEncoder.LibSvtAv1, false));
+            Assert.Equal("yuv420p", EncoderProfiles.PixelFormat(VideoEncoder.LibX265, false));
         }
 
         [Fact]
@@ -315,18 +292,6 @@ namespace HdrCast.Tests
             p = Value(EncoderProfiles.BuildVideoArgs(s), "-x265-params");
             Assert.Contains("colorprim=bt709", p);
             Assert.Contains("transfer=bt709", p);
-        }
-
-        [Fact]
-        public void Svtav1_uses_vbr_without_maxrate()
-        {
-            // Verified against libsvtav1: -maxrate is "only supported with CRF mode" and rc=2 (CBR) needs a
-            // low-delay prediction structure, so this encoder runs VBR.
-            var s = new EncoderSettings { Encoder = VideoEncoder.LibSvtAv1, Hdr = true, BitrateKbps = 20000, Fps = 60 };
-            List<string> a = EncoderProfiles.BuildVideoArgs(s);
-            Assert.DoesNotContain("-maxrate", a);
-            Assert.DoesNotContain("-bufsize", a);
-            Assert.Contains("rc=1", Value(a, "-svtav1-params"));
         }
 
         [Fact]
@@ -396,15 +361,27 @@ namespace HdrCast.Tests
     public class SenderSettingsTests
     {
         [Fact]
-        public void Defaults_are_a_working_relay_configuration()
+        public void Defaults_are_a_working_group_configuration()
         {
             var s = new SenderSettings();
-            Assert.Equal(SendMode.Relay, s.Mode);
-            Assert.Equal(8890, s.Port);
-            Assert.Equal("screen", s.StreamPath);
             Assert.Equal(VideoEncoder.HevcNvenc, s.Encoder);
             Assert.True(s.Audio);
-            Assert.Equal(SenderSettings.RelayPublishLatencyMs, s.LatencyMs);
+            Assert.Equal(4, s.MaxViewers);
+            Assert.Empty(s.Validate());
+        }
+
+        [Fact]
+        public void An_old_settings_file_with_relay_fields_and_an_av1_encoder_still_loads()
+        {
+            // "encoder":1 was av1_nvenc; "mode"/"host"/... belonged to the removed relay and direct modes.
+            const string json = "{\"encoder\":1,\"bitrateMbps\":50,\"mode\":0,\"host\":\"192.168.1.201\",\"port\":8890," +
+                                "\"path\":\"screen\",\"user\":\"sender\",\"password\":\"pw\",\"autoRestart\":true}";
+            SenderSettings? s = Json.Deserialize<SenderSettings>(json);
+            Assert.NotNull(s);
+            s!.Normalize();
+            Assert.Equal(VideoEncoder.HevcNvenc, s.Encoder);
+            Assert.Equal(50, s.BitrateMbps);
+            Assert.Empty(s.Validate());
         }
 
         [Fact]
@@ -446,57 +423,14 @@ namespace HdrCast.Tests
         }
 
         [Fact]
-        public void Validation_rejects_av1_through_the_relay()
-        {
-            var s = new SenderSettings { Host = "relay", Encoder = VideoEncoder.Av1Nvenc, Mode = SendMode.Relay };
-            List<string> problems = s.Validate();
-            Assert.Contains(problems, p => p.Contains("AV1"));
-        }
-
-        [Fact]
-        public void Validation_accepts_av1_in_direct_mode()
-        {
-            var s = new SenderSettings { Host = "friend.example", Encoder = VideoEncoder.Av1Nvenc, Mode = SendMode.DirectDial };
-            Assert.DoesNotContain(s.Validate(), p => p.Contains("AV1"));
-            Assert.Equal(Container.Matroska, s.ResolveContainer());
-        }
-
-        [Fact]
-        public void Validation_catches_missing_host_and_bad_passphrase()
-        {
-            var s = new SenderSettings { Host = "", Passphrase = "short" };
-            List<string> problems = s.Validate();
-            Assert.Contains(problems, p => p.Contains("Host"));
-            Assert.Contains(problems, p => p.Contains("Passphrase"));
-        }
-
-        [Fact]
-        public void Listen_mode_does_not_need_a_host()
-        {
-            var s = new SenderSettings { Mode = SendMode.DirectListen, Host = "" };
-            Assert.DoesNotContain(s.Validate(), p => p.Contains("Host"));
-        }
-
-        [Fact]
         public void Normalize_clamps_hand_edited_values()
         {
-            var s = new SenderSettings { BitrateMbps = 9999, Fps = 0, GopSeconds = 99, LatencyMs = 1, Port = 0 };
+            var s = new SenderSettings { BitrateMbps = 9999, Fps = 0, GopSeconds = 99, MaxViewers = 99 };
             s.Normalize();
             Assert.InRange(s.BitrateMbps, 1, 500);
             Assert.Equal(60, s.Fps);
             Assert.InRange(s.GopSeconds, 0.25, 10);
-            Assert.True(s.LatencyMs >= 20);
-            Assert.Equal(8890, s.Port);
-        }
-
-        [Fact]
-        public void Srt_options_are_publish_role_with_the_configured_bitrate()
-        {
-            var s = new SenderSettings { Host = "relay", BitrateMbps = 60 };
-            SrtUrlOptions o = s.ToSrtOptions();
-            Assert.Equal(SrtRole.Publish, o.Role);
-            Assert.Equal(60_000_000L, o.BitrateBps);
-            Assert.False(o.IncludeRecvSocketBuffer);
+            Assert.Equal(16, s.MaxViewers);
         }
 
         [Fact]

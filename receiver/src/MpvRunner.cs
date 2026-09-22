@@ -17,7 +17,7 @@ namespace HdrCast.Receiver
 
     /// <summary>
     /// Owns the mpv (and optional ffmpeg) child processes: launches them from an <see cref="MpvLaunchPlan"/>,
-    /// attaches the IPC client, retries every 3 s while the relay has nothing to offer, and kills the tree
+    /// attaches the IPC client, retries every 3 s while the path to the host is not up yet, and kills the tree
     /// on Stop()/Dispose(). All events fire on worker threads; the form marshals to the UI thread.
     /// </summary>
     internal sealed class MpvRunner : IDisposable
