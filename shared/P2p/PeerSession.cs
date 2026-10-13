@@ -31,7 +31,8 @@ namespace HdrCast.P2p
     /// The hole-punching state machine for one session (docs/design.md §8.6), independent of sockets so it can be
     /// driven by a fake clock in tests. Both sides PUNCH every candidate every 100 ms until they get a PUNCH_ACK;
     /// each PUNCH is answered with a PUNCH_ACK to its source, so both firewalls see outbound traffic for the
-    /// 5-tuple and open it. Thread-safe.
+    /// 5-tuple and open it. An authentic PUNCH from an address the other side never advertised (its router gave the
+    /// packets a new port) makes that address a candidate too. Thread-safe.
     /// </summary>
     public sealed class PeerSession
     {
@@ -41,10 +42,13 @@ namespace HdrCast.P2p
         public const long SilenceTimeoutUs = 15_000_000;
         /// <summary>After an IPv4 path answers, wait this long for IPv6 to answer too (IPv6 wins).</summary>
         public const long Ipv6GraceUs = 200_000;
+        /// <summary>Advertised plus learned addresses punched at most (learned ones need an authentic packet).</summary>
+        public const int MaxRemoteCandidates = 16;
 
         readonly object _lock = new object();
         readonly byte[] _punchKey;
         readonly List<IPEndPoint> _remote = new List<IPEndPoint>();
+        readonly HashSet<IPEndPoint> _advertised = new HashSet<IPEndPoint>();
         readonly HashSet<IPEndPoint> _confirmed = new HashSet<IPEndPoint>();
         IPEndPoint? _ackedV4;
         long _ackedV4Us;
@@ -86,7 +90,8 @@ namespace HdrCast.P2p
                 {
                     if (!Endpoint.TryParse(c, out HostPort? hp, out _) || !hp!.IsLiteral || !hp.Port.HasValue) continue;
                     IPEndPoint ep = hp.ToIPEndPoint(0);
-                    if (!_remote.Contains(ep)) _remote.Add(ep);
+                    _advertised.Add(ep);
+                    if (!_remote.Contains(ep) && _remote.Count < MaxRemoteCandidates) _remote.Add(ep);
                 }
             }
         }
@@ -94,6 +99,12 @@ namespace HdrCast.P2p
         public IList<IPEndPoint> RemoteCandidates
         {
             get { lock (_lock) return _remote.ToArray(); }
+        }
+
+        /// <summary>False for an address learned from the other side's packets rather than its candidate list.</summary>
+        public bool IsAdvertised(IPEndPoint ep)
+        {
+            lock (_lock) return _advertised.Contains(ep);
         }
 
         public bool IsConfirmed(IPEndPoint from)
@@ -130,6 +141,12 @@ namespace HdrCast.P2p
 
                 _lastRecvUs = nowUs;
                 _confirmed.Add(from);
+                // A symmetric NAT gives the other side's packets a new port for every destination, so they arrive from
+                // an address it never advertised, and our PUNCHes to the advertised one are dropped by that NAT. Punch the
+                // address the packets really come from: its NAT made that mapping for us and lets our packets in.
+                if ((type == ControlType.Punch || type == ControlType.PunchAck) && !_remote.Contains(from) &&
+                    _remote.Count < MaxRemoteCandidates)
+                    _remote.Add(from);
 
                 switch (type)
                 {

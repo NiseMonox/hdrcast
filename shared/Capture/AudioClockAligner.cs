@@ -19,11 +19,19 @@ namespace HdrCast.Capture
     /// </summary>
     public sealed class AudioClockAligner
     {
+        /// <summary>
+        /// Must stay well above how bursty WASAPI loopback is (NAudio polls it, so audio arrives tens of ms at a time,
+        /// a little late). With 20 ms the pipe writer padded silence between two bursts and the next burst lost its
+        /// head to the "ahead" check, dozens of times a second: viewers heard a low buzz instead of the desktop audio.
+        /// The tolerance only bounds slow clock drift and real stalls, so a larger value costs nothing audible.
+        /// </summary>
+        public const int DefaultToleranceMs = 150;
+
         readonly int _sampleRate;
         readonly int _toleranceFrames;
         long _writtenFrames;
 
-        public AudioClockAligner(int sampleRate = 48000, int toleranceMs = 20)
+        public AudioClockAligner(int sampleRate = 48000, int toleranceMs = DefaultToleranceMs)
         {
             if (sampleRate <= 0) throw new ArgumentOutOfRangeException(nameof(sampleRate));
             if (toleranceMs < 0) throw new ArgumentOutOfRangeException(nameof(toleranceMs));

@@ -47,6 +47,7 @@ namespace HdrCast.Receiver.Gui
         private ComboBox _live = null!;
         private Button _refreshLive = null!;
         private Label _p2pStatus = null!;
+        private FirewallRow _firewall = null!;
 
         // connection
         private ComboBox _latencyPreset = null!;
@@ -119,7 +120,7 @@ namespace HdrCast.Receiver.Gui
             Activated += (s, e) => { if (_group.RefreshIfChanged()) RefreshGroupUi(); };
             if (!string.IsNullOrEmpty(startupInvite))
                 Shown += (s, e) => { GroupConfig? next = InviteUi.Import(this, _group.Current, startupInvite!); if (next != null) SaveGroup(next); };
-            Shown += (s, e) => { RefreshGroupUi(); RestartLivePolling(); };
+            Shown += (s, e) => { RefreshGroupUi(); RestartLivePolling(); _firewall.Refresh(); };
 
             FormClosing += OnFormClosing;
             AppendLog("[app] settings: " + _settingsPath);
@@ -256,6 +257,8 @@ namespace HdrCast.Receiver.Gui
             AddRow(grid, "Watch", Row(_live, _refreshLive));
             _p2pStatus = new Label { AutoSize = true, Margin = new Padding(3, 3, 3, 3), MaximumSize = new Size(Font.Height * 34, 0) };
             AddRow(grid, "", _p2pStatus);
+            _firewall = new FirewallRow(this, "HdrCast Receiver", OnRunnerLog);
+            AddRow(grid, "Firewall", _firewall.Panel);
 
             var presetNames = new List<string>();
             foreach (var p in ReceiverSettings.LatencyPresets) presetNames.Add(p.ToString());
@@ -775,6 +778,8 @@ namespace HdrCast.Receiver.Gui
             _p2pStatus.Text = session.Status;
             _p2pStatus.ForeColor = session.State == ViewerSessionState.Connected ? Color.ForestGreen
                                  : session.State == ViewerSessionState.Waiting ? Color.DarkOrange : SystemColors.ControlText;
+            if (session.State == ViewerSessionState.Waiting && session.ThisSideCouldHelp)
+                _firewall.OfferOnce("a host whose router changes ports cannot reach you over IPv4.");
             if (session.State == ViewerSessionState.Connected && !_mpvStartedForSession && !_runner.IsRunning)
             {
                 MpvLaunchPlan? plan = BuildPlan(_settings, session, interactive: true);

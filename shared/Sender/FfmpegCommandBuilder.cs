@@ -70,6 +70,12 @@ namespace HdrCast.Sender.Model
             a.Add("-pix_fmt"); a.Add(p.PixelFormat == CaptureFormat.P010 ? "p010le" : "nv12");
             a.Add("-video_size"); a.Add(p.Width.ToString(CultureInfo.InvariantCulture) + "x" + p.Height.ToString(CultureInfo.InvariantCulture));
             a.Add("-framerate"); a.Add(p.Fps.ToString(CultureInfo.InvariantCulture));
+            // Tag the raw frames themselves. ffmpeg 7.1+ negotiates colour spaces in the filter graph and gives the
+            // encoder the frames' colour properties, so tags on the output alone went wrong twice (v0.2.1, ffmpeg 9):
+            // untagged input counted as BT.601 and was re-matrixed to BT.2020 (saturated colours shifted by up to
+            // 23 code values), and hardware encoders wrote transfer / primaries "unknown", so every player showed
+            // the PQ signal as plain SDR: wrong colours on HDR and SDR screens alike.
+            a.AddRange(EncoderProfiles.ColorTags(p.Encoder.Hdr));
             a.Add("-i"); a.Add(PipePath(p.VideoPipeName));
 
             bool hasAudio = p.Audio != AudioCodec.None && !string.IsNullOrEmpty(p.AudioPipeName);

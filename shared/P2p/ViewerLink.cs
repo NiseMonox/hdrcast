@@ -36,6 +36,17 @@ namespace HdrCast.P2p
         public LinkState State { get { lock (Sync) return _session?.State ?? LinkState.Closed; } }
         public string Reason { get { lock (Sync) return _session?.Reason ?? ""; } }
         public IPEndPoint? Path { get { lock (Sync) return _session?.Selected; } }
+        /// <summary>The path is an address the host never advertised: its router picked a new port for this PC.</summary>
+        public bool PathLearned
+        {
+            get
+            {
+                PeerSession? s;
+                lock (Sync) s = _session;
+                IPEndPoint? p = s?.Selected;
+                return p != null && !s!.IsAdvertised(p);
+            }
+        }
         public double RttMs { get { lock (Sync) return _session?.RttMs ?? -1; } }
         public long BytesFromHost => System.Threading.Interlocked.Read(ref _bytesFromHost);
 
@@ -137,14 +148,14 @@ namespace HdrCast.P2p
             if (changed) StateChanged?.Invoke(this);
         }
 
-        /// <summary>"IPv6 [2400:…]:51234, 38 ms" for the status line.</summary>
+        /// <summary>"IPv6 [2400:…]:51234, ping 38 ms" for the status line (the round trip, not the picture's delay).</summary>
         public string DescribePath()
         {
             IPEndPoint? p = Path;
             if (p == null) return "";
             string family = p.AddressFamily == AddressFamily.InterNetworkV6 ? "IPv6" : "IPv4";
             double rtt = RttMs;
-            return family + " " + Endpoint.Format(p) + (rtt >= 0 ? ", " + Math.Round(rtt) + " ms" : "");
+            return family + " " + Endpoint.Format(p) + (rtt >= 0 ? ", ping " + Math.Round(rtt) + " ms" : "");
         }
     }
 }

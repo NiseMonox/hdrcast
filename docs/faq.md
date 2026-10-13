@@ -7,6 +7,9 @@
 - **"This PC has no IPv6…" / "The host's PC has no IPv6…"**：哪一方没 IPv6 就去哪一方的路由器打开 IPv6（`docs/network.md` §2），
   <https://test-ipv6.com> 可以自查。手机热点通常自带 IPv6，可以先用热点试一下。
 - **"Both sides have IPv6 but the path is blocked"**：关掉 VPN / 加速器；路由器里有"IPv6 防火墙：阻止所有入站"之类的严格选项就改回默认。
+- **"…the host's PC only takes IPv4 from routers that keep ports…"**：观众的路由器每个目的地换端口，主播那边没打开：主播在
+  Firewall 一栏点 **Allow…**，并确认路由器开着 UPnP（主播状态栏会写缺什么）。**"…although the host takes IPv4 from any port…"**：
+  观众这边的 VPN / 代理 / 加速器截走了 UDP。
 - **"Not live right now"**：主播还没开播，列表每 10 s 刷新。**"… is full"**：主播的 Max viewers 满了。
 - **"The signaling server cannot be reached"**：本机断网或信令服务器挂了；已经在看的人不受影响。
 - 能连上但**画面一直不出来**：mpv 在等第一个关键帧（最多一个 GOP，默认 2 s）；超过 10 s 看日志里 `[remux …]` 的报错（在主播那边）。
@@ -14,9 +17,10 @@
 ## IPv6 是必须的吗？
 
 点对点靠 IPv6 打洞：IPv6 没有 NAT，双方同时发包就能穿过两边的有状态防火墙，不用任何设置。
-没有 IPv6 时 app 也会试 IPv4（经信令服务器的 UDP 回显拿到公网映射再打洞），但国内家宽、日本 v6プラス / DS-Lite、
-澳洲部分 ISP 的 IPv4 都在运营商级 NAT 后面，基本打不通。你选了"不走腾讯云中转"，所以这种情况会明确提示，不会偷偷绕路。
-同一局域网里的人不需要 IPv6（走局域网 IPv4）。
+没有 IPv6 时 app 走 IPv4（经信令服务器的 UDP 回显拿到公网映射再打洞）。只要**一方**的路由器有公网 IPv4 并且"开着"
+（程序自动做的 UPnP 转发 + Firewall 一栏的 Allow…），另一方就算是国内常见的对称型 NAT 也能连（2026-09-25 实测：江苏电信的朋友
+连日本的主播）。双方都在运营商级 NAT 后面（国内部分家宽、日本 v6プラス / DS-Lite、澳洲部分 ISP 的 IPv4）就打不通，要开 IPv6。
+你选了"不走腾讯云中转"，所以这种情况会明确提示，不会偷偷绕路。同一局域网里的人不需要 IPv6（走局域网 IPv4）。
 
 ## 腾讯云服务器会看到什么？
 
@@ -84,6 +88,11 @@ HEVC 10-bit、60 fps、桌面/游戏混合内容的经验值：
 
 不需要。采集引擎用 WASAPI loopback 抓默认播放设备的混音（同时播放一路静音防止渲染引擎休眠），重采样成 48 kHz 立体声 f32，与视频用同一个 QPC 时钟对齐后通过命名管道给 ffmpeg，编码为 AAC 192k（或 Opus 128k）。在 GUI 里可以选别的输出设备，或关掉音频。
 
+## 大家在同一个语音里，观众会听到自己的回声？
+
+在主播端 *Desktop audio → Leave out* 里选语音软件（例如 `Discord.exe`，下拉列表列出正在出声的程序，也可以手打），它和它启动的子进程的声音就不会进流，
+和 Parsec 的 Echo Cancelling 是同一个 Windows 接口（Windows 10 21H1 或更新）。一次只能排除一个程序。
+
 ## 为什么采集不用 ffmpeg 自带的 ddagrab？
 
 ddagrab 能拿到正确的 scRGB FP16 帧，但 ffmpeg 内部没有任何无损路径把打包 FP16 交给 zscale / libplacebo：swscale 会把 > 1.0（> 80 nit）的值全部裁掉（三个版本实测），所以 HDR 会被压成 SDR。HdrCast 用自己的 D3D11 compute shader 在 GPU 上做 scRGB → PQ/BT.2020 → P010，再把 P010 喂给 ffmpeg 只做编码，这也是 OBS 的做法。详见 `docs/design.md` §1.1。
@@ -94,6 +103,12 @@ ddagrab 能拿到正确的 scRGB FP16 帧，但 ffmpeg 内部没有任何无损�
   **有邀请码就能进组看**，只发给信得过的人；要踢人就新建一个组、把新邀请码发给其余的人。
 - 视频从主播的 remux 子进程到观众的 mpv 端到端 AES-256；打洞包带 HMAC，未通过验证的来源发来的数据一律丢弃，碰不到主播本机的 ffmpeg。
 - 信令服务器只见签名的元数据（见上面"腾讯云服务器会看到什么"）。
+
+## 界面上的 "ping 38 ms" 是延迟吗？
+
+不是。那是打洞路径的往返时间（网络 ping）。画面的延迟 ≈ 观众的 SRT latency + 播放器缓冲（1.5 s）+ 编解码（约 0.5 s）：
+日本预设实测 3.6 s（2026-09-24，本机回环，`docs/network.md` §3），中国预设约 5.6 s。latency 是重传的时间窗口，决定抗丢包能力，**不决定画质**；
+画质只看码率和编码预设。线路好的时候大 latency 和小 latency 看起来一样，只是晚几秒。
 
 ## 延迟能再低一点吗？
 

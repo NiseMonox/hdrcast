@@ -23,6 +23,15 @@ namespace HdrCast.P2p
         public bool DiscoverPublicIpv4 { get; set; } = true;
         public int EchoPort { get; set; } = EchoProtocol.DefaultPort;
         public int HeartbeatMs { get; set; } = 10_000;
+        /// <summary>Forward the IPv4 port on the router (UPnP) while live, so viewers whose routers change ports get in.</summary>
+        public bool MapRouterPort { get; set; } = true;
+        /// <summary>Null = the real router (tests point it at a stand-in).</summary>
+        public PortMappingOptions? RouterMapping { get; set; }
+        /// <summary>
+        /// Whether the firewall lets unsolicited UDP reach this program: true (a rule, or no firewall), false, or null
+        /// (unknown). Supplied by the GUI, which owns the Windows Firewall check.
+        /// </summary>
+        public Func<bool?>? InboundAllowed { get; set; }
     }
 
     public enum ViewerState
@@ -55,8 +64,9 @@ namespace HdrCast.P2p
 
         sealed class Viewer
         {
-            public Viewer(ViewerInfo info) { Info = info; }
+            public Viewer(ViewerInfo info, IList<string> candidates) { Info = info; Candidates = candidates; }
             public ViewerInfo Info;
+            public readonly IList<string> Candidates;
             public RemuxChild? Child;
             public int ChildPort;
             public bool Ended;
@@ -73,12 +83,14 @@ namespace HdrCast.P2p
         GroupKeys? _keys;
         SignalingClient? _signal;
         HostLink? _link;
+        RouterPortMapping? _router;
         TsFanOut? _fan;
         Thread? _heartbeat;
         Thread? _joins;
         long _sinceMs;
         string _status = "Starting";
         volatile bool _stopped;
+        volatile bool _announced;
 
         public P2pHost(P2pHostOptions options, Stream tsInput, Action<string> log)
         {
@@ -95,6 +107,26 @@ namespace HdrCast.P2p
         public string Status { get { lock (_lock) return _status; } }
         public IList<string> Candidates => _link?.Candidates ?? new string[0];
         public bool HasIpv6 => _link?.HasIpv6 ?? false;
+        /// <summary>The router forward of the IPv4 port (null when not asked for).</summary>
+        public RouterPortMapping? RouterMapping => _router;
+
+        /// <summary>
+        /// Viewers can reach the IPv4 port from any address and port: the router forwards it (or there is no router)
+        /// and the firewall lets it in. Null while that is still being found out. Advertised as "open4".
+        /// </summary>
+        public bool? Ipv4Open
+        {
+            get
+            {
+                RouterPortMapping? r = _router;
+                if (r == null) return null;
+                PortMappingState s = r.State;
+                if (s == PortMappingState.Off || s == PortMappingState.Working) return null;
+                bool? firewall = _o.InboundAllowed?.Invoke();
+                if (!r.Open || firewall == false) return false;
+                return firewall;
+            }
+        }
 
         public List<ViewerInfo> Viewers
         {
@@ -127,6 +159,19 @@ namespace HdrCast.P2p
             _link.SessionChanged += OnSessionChanged;
             _sinceMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             _log("[p2p] candidates: " + string.Join(", ", _link.Candidates) + (_link.HasIpv6 ? "" : "  (no IPv6 on this PC)"));
+            if (_o.MapRouterPort && _link.Ipv4Port.HasValue)
+            {
+                HostLink link = _link;
+                var router = new RouterPortMapping(link.Ipv4Port.Value, _o.RouterMapping, _log);
+                router.Changed += () =>
+                {
+                    IPEndPoint? ext = router.External;
+                    link.SetCandidate(LinkBase.SourceRouter, router.Open && ext != null ? Endpoint.Format(ext) : null);
+                    if (_announced && !_stopped) SetStatus(DescribeLive());
+                };
+                _router = router;
+                router.Start();
+            }
 
             _fan = new TsFanOut(_ts);
             _fan.SinkFailed += OnSinkFailed;
@@ -142,16 +187,19 @@ namespace HdrCast.P2p
         void HeartbeatLoop()
         {
             CancellationToken ct = _cts.Token;
-            bool registered = false, echoed = !_o.DiscoverPublicIpv4;
+            bool registered = false, needEcho = _o.DiscoverPublicIpv4, echoTried = false;
+            DateTime nextEchoUtc = DateTime.MinValue;
             int failures = 0;
             while (!ct.IsCancellationRequested)
             {
                 try
                 {
-                    if (!echoed)
+                    if (needEcho && DateTime.UtcNow >= nextEchoUtc)
                     {
-                        echoed = true;
-                        DiscoverPublicIpv4();
+                        // until the echo answers, ask again every minute (the port may be opened while live)
+                        needEcho = !DiscoverPublicIpv4(logFailure: !echoTried);
+                        echoTried = true;
+                        nextEchoUtc = DateTime.UtcNow.AddMinutes(1);
                     }
                     if (!registered)
                     {
@@ -161,6 +209,7 @@ namespace HdrCast.P2p
                     _signal!.PutLive(_o.Group.PeerId, SealLive(), ct);
                     if (failures > 0) _log("[p2p] signaling server reachable again");
                     failures = 0;
+                    _announced = true;
                     SetStatus(DescribeLive());
                     ct.WaitHandle.WaitOne(_o.HeartbeatMs);
                 }
@@ -187,21 +236,35 @@ namespace HdrCast.P2p
             }
         }
 
-        void DiscoverPublicIpv4()
+        /// <summary>
+        /// This PC's public IPv4 mapping, the only IPv4 candidate a viewer outside this network can use. False = no
+        /// answer yet (worth retrying).
+        /// </summary>
+        bool DiscoverPublicIpv4(bool logFailure)
         {
             try
             {
                 IPAddress? server = ResolveIpv4(_signal!.Host);
-                if (server == null) return;
-                IPEndPoint? mapped = _link!.DiscoverPublicIpv4(new IPEndPoint(server, _o.EchoPort), 1500);
-                if (mapped == null) return;
+                if (server == null) return true;                   // IPv6-only signaling server: nothing to ask
+                var echo = new IPEndPoint(server, _o.EchoPort);
+                IPEndPoint? mapped = _link!.DiscoverPublicIpv4(echo, 1500);
+                if (mapped == null)
+                {
+                    if (logFailure)
+                        _log("[p2p] public IPv4 check: no answer from the signaling server's UDP echo at " + Endpoint.Format(echo) +
+                             ", so this PC advertises no public IPv4 and viewers without IPv6 cannot reach it from outside this network. " +
+                             "Is UDP " + _o.EchoPort + " open in the server's firewall / cloud security group? Retrying every minute.");
+                    return false;
+                }
                 string candidate = Endpoint.Format(mapped);
-                _link.AddCandidate(candidate);
+                _link.SetCandidate(LinkBase.SourceEcho, candidate);
                 _log("[p2p] public IPv4 mapping: " + candidate);
+                return true;
             }
             catch (Exception ex)
             {
-                _log("[p2p] public IPv4 check skipped: " + ex.Message);
+                if (logFailure) _log("[p2p] public IPv4 check skipped: " + ex.Message);
+                return false;
             }
         }
 
@@ -273,7 +336,7 @@ namespace HdrCast.P2p
             {
                 Sid = join.SessionId, Name = join.Name, State = ViewerState.Connecting, JoinedUtc = DateTime.UtcNow,
                 LatencyMs = join.LatencyMs, OverheadPercent = join.OverheadPercent,
-            });
+            }, join.Candidates);
             try
             {
                 StartChild(viewer);
@@ -360,13 +423,38 @@ namespace HdrCast.P2p
                     v.Info.Ipv6 = info.PathIsIpv6;
                     v.Info.RttMs = info.RttMs;
                 }
-                _log("[p2p] " + v.Info.Name + " connected via " + (info.PathIsIpv6 ? "IPv6 " : "IPv4 ") + info.Path);
+                _log("[p2p] " + v.Info.Name + " connected via " + (info.PathIsIpv6 ? "IPv6 " : "IPv4 ") + info.Path +
+                     (info.PathLearned ? " (a port their router picked for this PC, not the advertised one: it changes ports per destination)" : ""));
             }
             else if (info.State == LinkState.Closed || info.State == LinkState.Failed)
             {
-                EndViewer(v, info.State == LinkState.Failed ? "could not connect: " + info.Reason : info.Reason);
+                EndViewer(v, info.State == LinkState.Failed ? "could not connect: " + info.Reason + ExplainFailure(v, info.Reason) : info.Reason);
             }
             Changed?.Invoke();
+        }
+
+        /// <summary>For the log when a viewer never got through: whose side most likely kept it out.</summary>
+        string ExplainFailure(Viewer v, string reason)
+        {
+            if (!reason.StartsWith("no candidate", StringComparison.Ordinal)) return "";      // one-way: a firewall on their side
+            if (HasIpv6 && P2pDiagnostics.HasIpv6(v.Candidates)) return "; both have IPv6, so something drops UDP (a VPN, or a strict router firewall)";
+            if (!P2pDiagnostics.HasPublicIpv4(v.Candidates)) return "; they have no IPv6 and offered no public IPv4 address";
+            bool? open = Ipv4Open;
+            if (open == true)
+                return "; nothing of theirs arrived although this PC takes IPv4 from any port: their side drops UDP (VPN, proxy, game accelerator?) or they need IPv6";
+            if (open == false)
+                return "; if their router changes ports per destination, this PC must take IPv4 from any port first: " + ClosedIpv4Parts();
+            return "";
+        }
+
+        /// <summary>What keeps the IPv4 port from taking packets from any address and port, in words.</summary>
+        string ClosedIpv4Parts()
+        {
+            var parts = new List<string>();
+            RouterPortMapping? r = _router;
+            if (r != null && !r.Open) parts.Add(r.BehindAnotherNat ? "router behind another NAT" : "no router forward (UPnP)");
+            if (_o.InboundAllowed?.Invoke() == false) parts.Add("no firewall rule (click Allow)");
+            return parts.Count == 0 ? "unknown" : string.Join(", ", parts.ToArray());
         }
 
         void EndViewer(Viewer v, string reason)
@@ -418,7 +506,7 @@ namespace HdrCast.P2p
             {
                 HostId = g.PeerId, Name = g.DisplayName, TimeMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), SinceMs = _sinceMs,
                 Candidates = _link!.Candidates.ToList(), Codec = _o.Codec, Mbps = (int)Math.Round(_o.BitrateBps / 1e6),
-                MaxViewers = _o.MaxViewers, Viewers = Viewers.Count,
+                MaxViewers = _o.MaxViewers, Viewers = Viewers.Count, OpenIpv4 = Ipv4Open,
             };
             return SignedEnvelope.Seal(_keys!, SignedEnvelope.KindLive, g.GroupId, g.PeerId, rec.ToPayload());
         }
@@ -426,8 +514,14 @@ namespace HdrCast.P2p
         string DescribeLive()
         {
             int n = Viewers.Count;
-            return "Live in \"" + _o.Group.GroupName + "\" - " + n + (n == 1 ? " viewer" : " viewers") +
-                   (_link!.HasIpv6 ? "" : " (no IPv6 on this PC: only IPv4 viewers on the same network can join)");
+            bool publicV4 = P2pDiagnostics.HasPublicIpv4(_link!.Candidates);
+            string reach = _link.HasIpv6
+                ? (publicV4 ? "" : " (no public IPv4 found: viewers without IPv6 can only join from this network)")
+                : (publicV4 ? " (no IPv6 on this PC: IPv4 only, which some viewers' routers block)"
+                            : " (no IPv6 on this PC: only IPv4 viewers on the same network can join)");
+            if (publicV4 && Ipv4Open == false)
+                reach += " (IPv4 closed to routers that change ports: " + ClosedIpv4Parts() + ")";
+            return "Live in \"" + _o.Group.GroupName + "\" - " + n + (n == 1 ? " viewer" : " viewers") + reach;
         }
 
         void SetStatus(string s)
@@ -469,6 +563,7 @@ namespace HdrCast.P2p
             }
             catch (Exception) { }
             _link?.Dispose();
+            _router?.Dispose();                        // deletes the router forward (waits for the router, a few seconds at most)
             List<RemuxChild> children;
             lock (_lock)
             {

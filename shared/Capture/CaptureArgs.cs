@@ -49,6 +49,8 @@ namespace HdrCast.Capture
         public bool Audio { get; set; } = true;
         /// <summary>"default" or an MMDevice endpoint id.</summary>
         public string AudioDevice { get; set; } = "default";
+        /// <summary>Executable whose audio (with everything it started) is left out, e.g. "Discord.exe"; "" = none.</summary>
+        public string AudioExclude { get; set; } = "";
         public int PipeTimeoutSeconds { get; set; } = DefaultPipeTimeoutSeconds;
         /// <summary>Process id to watch; the engine exits when that process is gone. 0 = none.</summary>
         public int ParentPid { get; set; }
@@ -73,6 +75,7 @@ namespace HdrCast.Capture
             "  --audio-pipe <name>       named pipe for audio (default hdrcast-audio)\n" +
             "  --audio on|off            capture desktop audio (default on)\n" +
             "  --audio-device default|<endpoint id>\n" +
+            "  --audio-exclude <app.exe> leave this program's audio out (e.g. the voice chat)\n" +
             "  --pipe-timeout <s>        seconds to wait for the pipe client (default 30)\n" +
             "  --parent-pid <pid>        exit when this process disappears\n" +
             "  --dump <file> [--seconds <n>]  write raw frames to a file instead of the pipe\n" +
@@ -112,6 +115,13 @@ namespace HdrCast.Capture
                         string v = Next();
                         if (v.Length == 0) throw new CaptureArgsException("--audio-device needs a value");
                         a.AudioDevice = v;
+                        break;
+                    }
+                    case "--audio-exclude":
+                    {
+                        string v = Next();
+                        a.AudioExclude = AppAudioTarget.NormalizeExeName(v);
+                        if (a.AudioExclude.Length == 0) throw new CaptureArgsException("--audio-exclude: expected a program name like Discord.exe, got " + v);
                         break;
                     }
                     case "--pipe-timeout": a.PipeTimeoutSeconds = ParseInt(opt, Next(), 1, 3600); break;
@@ -212,6 +222,7 @@ namespace HdrCast.Capture
             {
                 list.Add("--audio-pipe"); list.Add(AudioPipe);
                 if (AudioDevice != "default") { list.Add("--audio-device"); list.Add(AudioDevice); }
+                if (AudioExclude.Length > 0) { list.Add("--audio-exclude"); list.Add(AudioExclude); }
             }
             if (PipeTimeoutSeconds != DefaultPipeTimeoutSeconds) { list.Add("--pipe-timeout"); list.Add(PipeTimeoutSeconds.ToString(CultureInfo.InvariantCulture)); }
             if (ParentPid > 0) { list.Add("--parent-pid"); list.Add(ParentPid.ToString(CultureInfo.InvariantCulture)); }

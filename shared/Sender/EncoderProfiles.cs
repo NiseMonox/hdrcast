@@ -194,22 +194,19 @@ namespace HdrCast.Sender.Model
             }
 
             // Colour signalling. The capture engine already produced PQ/BT.2020 (HDR) or BT.709 (SDR) samples,
-            // these flags only write the VUI so the player knows what it received.
-            if (s.Hdr)
-            {
-                a.Add("-color_primaries"); a.Add("bt2020");
-                a.Add("-color_trc"); a.Add("smpte2084");
-                a.Add("-colorspace"); a.Add("bt2020nc");
-            }
-            else
-            {
-                a.Add("-color_primaries"); a.Add("bt709");
-                a.Add("-color_trc"); a.Add("bt709");
-                a.Add("-colorspace"); a.Add("bt709");
-            }
-            a.Add("-color_range"); a.Add("tv");
+            // these flags only write the VUI so the player knows what it received. On their own they are not
+            // enough with ffmpeg 7.1+: FfmpegCommandBuilder also puts ColorTags on the raw input (see there).
+            a.AddRange(ColorTags(s.Hdr));
             a.Add("-chroma_sample_location"); a.Add("left");
             return a;
+        }
+
+        /// <summary>What the capture engine's samples are: PQ / BT.2020 (HDR) or BT.709 (SDR), limited range.</summary>
+        public static List<string> ColorTags(bool hdr)
+        {
+            return hdr
+                ? new List<string> { "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc", "-color_range", "tv" }
+                : new List<string> { "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-color_range", "tv" };
         }
 
         static string NvencPreset(QualityPreset p) => p == QualityPreset.Speed ? "p3" : p == QualityPreset.Balanced ? "p5" : "p7";

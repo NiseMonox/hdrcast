@@ -102,6 +102,15 @@ namespace HdrCast.P2p
             return true;
         }
 
+        /// <summary>An IPv4 address outside the private, shared (CGNAT), loopback, link-local and multicast ranges.</summary>
+        public static bool IsPublicIpv4(IPAddress a)
+        {
+            if (a.AddressFamily != AddressFamily.InterNetwork) return false;
+            byte[] b = a.GetAddressBytes();
+            return !(b[0] == 0 || b[0] == 10 || b[0] == 127 || (b[0] == 172 && b[1] >= 16 && b[1] <= 31) || (b[0] == 192 && b[1] == 168) ||
+                     (b[0] == 100 && b[1] >= 64 && b[1] <= 127) || (b[0] == 169 && b[1] == 254) || b[0] >= 224);
+        }
+
         static bool SamePrefix64(IPAddress x, IPAddress y)
         {
             byte[] a = x.GetAddressBytes(), b = y.GetAddressBytes();

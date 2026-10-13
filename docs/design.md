@@ -119,7 +119,18 @@ uint cr10 = (uint)round(512.0 + 896.0 * Cr);
 
 - `NAudio.Wasapi` 2.2.1（netstandard2.0）：`WasapiLoopbackCapture` 抓默认渲染设备；同时开一路 `WasapiOut` 播放静音，保证渲染引擎不进入空闲（否则 loopback 停止吐数据）。
 - 输出格式统一重采样/转换为 **f32le 48000 Hz 2ch**（设备 mix format 若不同则用 NAudio 的 `MediaFoundationResampler` 或简单线性重采样）。
-- **与视频锁同一时钟**：以 QPC 为准计算「应已输出的采样数」= elapsed × 48000；实际写入落后超过 20 ms 则补零，超前超过 20 ms 则丢弃多余采样。这样 ffmpeg 两路都用理想时间戳也不会漂。
+- **与视频锁同一时钟**：以 QPC 为准计算「应已输出的采样数」= elapsed × 48000；实际写入落后超过 150 ms 则补零，超前超过 150 ms 则丢弃多余采样。这样 ffmpeg 两路都用理想时间戳也不会漂。
+  容差必须远大于 loopback 的交付粒度：NAudio 轮询取数，音频一批几十毫秒、还略有延迟。v0.2.1 用 20 ms 时，写管道的线程在两批之间就补零，
+  下一批又被当成"超前"砍掉开头，每秒几十次（引擎统计 `audio_underrun` ≈ 38/s），观众听到的是低沉的嗡嗡声。容差只用来吸收时钟漂移和真正的卡顿。
+- **排除某个程序的声音**（`--audio-exclude <app.exe>`，GUI 的 *Leave out*，类似 Parsec 的 Echo Cancelling）：用 Windows 的进程 loopback
+  （`ActivateAudioInterfaceAsync(VAD\Process_Loopback)`，`PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE`，Windows 10 21H1+ / 11）
+  抓"除这个进程树之外的全部桌面声音"，典型用法是排除语音聊天，免得同在语音里的朋友听到自己的回声。
+  - 这个 API 一次只能排除**一个**进程树，所以目标是该程序名**最上层**的那个进程（Discord 的声音由主进程拉起的子进程播放）；
+    程序没在运行时排除引擎自己（等于全抓）。每秒拍一次进程快照（Toolhelp32，一两毫秒），程序启动 / 退出 / 重启就换目标重开采集。
+  - 虚拟端点没有 mix format，直接要 float 48 kHz 立体声（`AUTOCONVERTPCM`）；COM 全在一个 MTA 线程里做（引擎入口是 `[STAThread]`，
+    激活回调在 STA 上需要消息泵）。系统不支持时退回普通 loopback 并写日志。
+  - 实测（2026-09-24，Windows 11）：两个程序各放一个 −60 dBFS 的单音，排除其中一个后它在采集结果里是 −150 dBFS（没有），另一个仍是 −60 dBFS；
+    被排除的程序在开播后才启动也在下一次检查时切换，没有漏出。
 - 管道 `\\.\pipe\hdrcast-audio`，同为服务端。
 
 ### 2.5 ffmpeg 命令模板
@@ -168,6 +179,7 @@ ffmpeg -hide_banner -loglevel warning -nostdin -stats_period 1 -progress pipe:2
 - 崩溃保护：ffmpeg 或采集进程意外退出 → 停止另一方，3 s 后自动重启；新编码器的 stdout 接进同一个分发器，观众不用重新加入。
 - 进程树：两个 GUI 都创建 **Job Object（KILL_ON_JOB_CLOSE）** 并把每个子进程加入，任务管理器强杀 GUI 或 GUI 崩溃时子进程一起死。采集引擎另有 `--parent-pid`（用一个 `OpenProcess(SYNCHRONIZE)` 句柄轮询，不是每帧扫全系统进程表）。
 - **启动顺序**：采集引擎必须先把**两个**管道都建好，GUI 轮询到管道出现后才启动 ffmpeg（固定 sleep 不够：引擎要先建 D3D11 设备并编译 shader）。音频管道必须在等待视频管道客户端**之前**创建，否则两边互等。
+  轮询**只能用 `WaitNamedPipe`**，不能用 `File.Exists` / `GetFileAttributes`：对 `\\.\pipe\<name>` 查属性本身就是一次客户端连接，会占掉唯一的实例，ffmpeg 随后得到 ERROR_PIPE_BUSY（CRT 译成 `Error opening input: Invalid argument`），引擎写端报 `Pipe is broken`，无限重启（v0.2.0 在 Windows 上的实际故障，`NamedPipeProbeTests` 防回归）。
 - 音频端点打不开时**不终止会话**：管道照建，写静音，日志说明原因（ffmpeg 已经被告知有音频输入，缺管道会直接退出）。
 - 日志与界面里的命令行一律经 `SecretRedactor` 脱敏（passphrase 与邀请码），因为 README 会让用户把日志发出来排障。
 
@@ -279,6 +291,8 @@ JSON = {"v":1,"s":"http://101.43.23.94:18650","g":"<gid>","k":"<b64u(32 字节�
 | `join` | host id | `{"v":1,"t":ms,"sid":id,"viewer":id,"name":"小红","cands":[…],"latency":3500,"overhead":50}` |
 | `answer` | sid | `{"v":1,"t":ms,"sid":id,"ok":true,"reason":"","cands":[…]}`（`reason`：`full` / `stopped` / `busy`） |
 
+- `live` 可选字段 `"open4":true|false`（0.2.4 起）：主播的 IPv4 端口收不收得下任意地址端口来的包（路由器转发 + 防火墙规则，§8.7）；
+  还不知道时不写，旧主播也不写。观众据此说明 IPv4 失败是哪一边的问题。
 - 收方先验 `m`（常量时间比较），再解 `p`；payload 里的 `host` / `sid` 必须等于信封所在的 key。
 - `t` 与本机时间相差超过 10 分钟的 `join` 丢弃；主播缓存已处理的 `sid` 10 分钟防重放。
 - `cands` 每项是 `Endpoint` 能解析的 `host:port`（IPv6 带方括号），最多 8 项。
@@ -330,6 +344,9 @@ mac   = b64u(HMAC-SHA256(serverKey, METHOD + "\n" + PATH_AND_QUERY + "\n" + ts +
 - 长度 ≠ 58、magic 不符、type/role 未知、sid 未知、mac 不符、role 与自己相同 → 不是控制包。
 - 双方拿到对方候选后，每 100 ms 向对方**每个**候选发 PUNCH，最多 15 s；收到有效 PUNCH 立刻回 PUNCH_ACK（发回来源地址）。
   观众以第一个 PUNCH_ACK 的来源为路径；200 ms 内 IPv6 也确认则优先 IPv6。主播把数据发往观众**最近一次数据的来源**（限已确认地址）。
+- **学来的候选**（0.2.4 起）：有效 PUNCH / PUNCH_ACK 的来源不在对方候选里（对称型 NAT 给这个目的地新开了端口），就把来源加进
+  打洞目标（每会话最多 16 个候选）。只要一方收得下未请求的包（§8.7 路由器转发 + 防火墙规则），两个方向都能连：主播从观众的 PUNCH
+  学到观众的真实端口，观众从主播的 PUNCH 学到主播的真实端口，往那里打洞，对方 NAT 为我们开的口子放行，于是 PUNCH_ACK 能回来。
 - 路径确认后停止 PUNCH；2 s 内没往对方发过任何包就发 KEEPALIVE；15 s 收不到对方任何包判定断开；主动结束发 3 次 BYE。
 - 不是控制包、且来源是本会话已确认地址的数据报按 SRT 数据转发；其他来源一律丢弃。
 
@@ -340,6 +357,19 @@ mac   = b64u(HMAC-SHA256(serverKey, METHOD + "\n" + PATH_AND_QUERY + "\n" + ts +
   否则 Windows 出站会用临时地址，与公布的候选对不上。
 - IPv4：绑 `0.0.0.0`；候选为出口局域网地址（connect `8.8.8.8:53` 取源地址，只对同一局域网有用），以及（可选）经信令服务器 UDP 回显得到的公网映射。
 - UDP 回显（可选，默认端口 18651）：请求 `"HDRCECHO"` + 16 字节 nonce；回复 `"HDRCECHO"` + nonce + 族（4 或 6，1 字节）+ 端口（大端 2 字节）+ 地址（4 或 16 字节）。
+  没回复时写一次日志并重试（主播每分钟一次，直到拿到为止）。观众**每次加入前**都重做一次（0.2.4 起）：NAT 映射可能在两次加入
+  之间过期换端口。拿不到时观众的失败提示说 "the host offered no public IPv4 address"，而不是笼统的 "IPv6 only"。
+- **路由器端口转发**（UPnP IGD v1/v2，`RouterPortMapping`，0.2.4 起）：主播开播、观众观看期间，从局域网地址向 `239.255.255.250:1900`
+  发 SSDP 搜索（InternetGatewayDevice:1/2、WANIPConnection:1/2、WANPPPConnection:1）→ 读 LOCATION 的设备描述（不处理 DTD）找
+  WANIPConnection / WANPPPConnection 的 controlURL → `GetExternalIPAddress` → `AddPortMapping`（UDP，外部端口 = IPv4 socket 端口，
+  内部客户端 = 连向路由器时的本机地址，描述 `HdrCast`，租期 3600 s）。外部端口被占（718）换随机端口再试三次；只支持永久租期（725）
+  就用 0 并确保停止时删除。每 20 min 续租，失败则重新搜索；找不到路由器 / 被拒绝时 60 s 起指数退避重试（最长 15 min），同样的结果只记一次日志。
+  停止时 `DeletePortMapping`。成功且路由器外部地址是公网 → `外部地址:外部端口` 作为候选；外部地址是私网 / CGNAT（双重 NAT）→ 不公布，
+  状态说明转发帮不上。本机自己就有公网 IPv4 → 不找路由器，直接算"开着"。
+- **Windows 防火墙**：没有规则时只放行"本程序发过包的地址端口"的回包，对称型 NAT 的来包会被丢掉。界面用 COM `HNetCfg.FwPolicy2`
+  只读检查（当前网络配置文件、FirewallEnabled、BlockAllInboundTraffic、指向本 exe 的入站 UDP 规则，阻止规则优先）；
+  **Allow…** 以管理员身份运行 `<exe> firewall-allow`（UAC），加入站 UDP 允许规则（所有配置文件，任意端口 / 地址），停用本 exe 的入站阻止规则。
+- 主播"开着"（`open4`）= 路由器转发成功（或本机有公网 IPv4）且防火墙放行。
 
 ### 8.8 主播端分发
 

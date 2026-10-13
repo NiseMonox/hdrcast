@@ -130,11 +130,43 @@ namespace HdrCast.Tests
             var hostV6 = new[] { "[2400:aaaa:bbbb:cccc:1122:33ff:fe44:5566]:51234", "192.168.1.5:51235" };
             var hostV4Only = new[] { "192.168.1.5:51235", "203.0.113.7:40000" };
             var hostLanOnly = new[] { "192.168.1.5:51235" };
-            Assert.Contains("This PC has no IPv6", P2pDiagnostics.Explain(false, hostV6));
-            Assert.Contains("host's PC has no IPv6", P2pDiagnostics.Explain(true, hostV4Only));
-            Assert.Contains("IPv4 attempt did not get through", P2pDiagnostics.Explain(false, hostV4Only));
-            Assert.Contains("Neither side has IPv6", P2pDiagnostics.Explain(false, hostLanOnly));
-            Assert.Contains("path is blocked", P2pDiagnostics.Explain(true, hostV6));
+            var me = new[] { "192.168.5.14:59252" };
+            Assert.Contains("This PC has no IPv6", P2pDiagnostics.Explain(false, me, hostV6));
+            Assert.Contains("host's PC has no IPv6", P2pDiagnostics.Explain(true, me, hostV4Only));
+            Assert.Contains("IPv4 attempt did not get through", P2pDiagnostics.Explain(false, me, hostV4Only));
+            Assert.Contains("Neither side has IPv6", P2pDiagnostics.Explain(false, me, hostLanOnly));
+            Assert.Contains("path is blocked", P2pDiagnostics.Explain(true, me, hostV6));
+        }
+
+        [Fact]
+        public void Does_not_call_a_host_ipv6_only_when_its_public_ipv4_was_tried()
+        {
+            // the host's UDP echo got no answer: it offered IPv6 and its LAN address, so IPv4 was never tried
+            var hostNoEcho = new[] { "[2400:aaaa:bbbb:cccc:1122:33ff:fe44:5566]:51234", "192.168.1.3:57546" };
+            string noEcho = P2pDiagnostics.Explain(false, new[] { "192.168.5.14:59252" }, hostNoEcho);
+            Assert.Contains("the host offered no public IPv4 address", noEcho);
+
+            // with its public mapping the IPv4 attempt did happen and failed
+            var hostDual = new[] { "[2400:aaaa:bbbb:cccc:1122:33ff:fe44:5566]:51234", "192.168.1.3:57546", "203.0.113.7:57546" };
+            string meBlind = P2pDiagnostics.Explain(false, new[] { "192.168.5.14:59252" }, hostDual);
+            Assert.Contains("IPv4 attempt did not get through", meBlind);
+            Assert.Contains("this PC's public IPv4 address could not be found", meBlind);
+            string bothKnown = P2pDiagnostics.Explain(false, new[] { "192.168.5.14:59252", "198.51.100.9:59252" }, hostDual);
+            Assert.Contains("IPv4 attempt did not get through", bothKnown);
+            Assert.DoesNotContain("could not be found", bothKnown);
+        }
+
+        [Theory]
+        [InlineData("203.0.113.7:40000", true)]
+        [InlineData("192.168.1.3:57546", false)]
+        [InlineData("10.1.2.3:1", false)]
+        [InlineData("172.20.0.1:1", false)]
+        [InlineData("100.64.0.1:40000", false)]                // shared (CGNAT) range
+        [InlineData("169.254.1.1:1", false)]
+        [InlineData("[2400:aaaa:bbbb:cccc:1122:33ff:fe44:5566]:51234", false)]
+        public void Tells_public_ipv4_candidates_from_private_ones(string candidate, bool isPublic)
+        {
+            Assert.Equal(isPublic, P2pDiagnostics.HasPublicIpv4(new[] { candidate }));
         }
 
         [Fact]

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using HdrCast.Capture;
 using HdrCast.Common;
 using HdrCast.Sender.Model;
 using Xunit;
@@ -145,6 +146,101 @@ namespace HdrCast.Tests
                 try { Directory.Delete(dir, true); } catch (Exception) { }
             }
         }
+
+        [Theory]
+        [InlineData(VideoEncoder.LibX265)]
+        [InlineData(VideoEncoder.HevcNvenc)]
+        public void Hdr_colours_come_out_of_the_encoder_unchanged_and_tagged(VideoEncoder encoder)
+        {
+            // v0.2.1 with ffmpeg 9: the raw input was untagged, so ffmpeg treated it as BT.601 and re-matrixed it to
+            // BT.2020 (blue lost 23 luma code values) and NVENC wrote transfer / primaries "unknown": viewers saw the
+            // PQ picture as SDR with odd colours. Encodes known HDR10 patches with the sender's own arguments.
+            string? ffmpeg = FindFfmpeg();
+            if (ffmpeg == null) return;
+            if (!HasEncoder(ffmpeg, EncoderProfiles.Info(encoder).FfmpegName)) return;
+
+            const int w = 320, h = 160, pw = 64, ph = 80;          // 5 x 2 patches
+            var rgb = new[] { new[] { 255, 255, 255 }, new[] { 128, 128, 128 }, new[] { 255, 0, 0 }, new[] { 0, 255, 0 }, new[] { 0, 0, 255 },
+                              new[] { 0, 255, 255 }, new[] { 255, 0, 255 }, new[] { 255, 255, 0 }, new[] { 230, 180, 140 }, new[] { -1, -1, -1 } };
+            var expected = new int[rgb.Length][];
+            for (int i = 0; i < rgb.Length; i++)
+            {
+                // an SDR window on an HDR desktop at 200 nit SDR brightness (scRGB 2.5); the last one a 1000 nit highlight
+                double[] c = rgb[i][0] < 0 ? new[] { 12.5, 12.5, 12.5 } : Array.ConvertAll(rgb[i], v => ColorMath.SrgbToLinear(v / 255.0) * 2.5);
+                ColorMath.ScRgbToYuv10(c[0], c[1], c[2], 80, out int y, out int cb, out int cr);
+                expected[i] = new[] { y, cb, cr };
+            }
+            var frame = new byte[w * h * 3];
+            for (int i = 0; i < rgb.Length; i++)
+            {
+                int x0 = (i % 5) * pw, y0 = (i / 5) * ph;
+                for (int y = y0; y < y0 + ph; y++)
+                    for (int x = x0; x < x0 + pw; x++)
+                        Put(frame, (y * w + x) * 2, expected[i][0]);
+                for (int y = y0 / 2; y < (y0 + ph) / 2; y++)
+                    for (int x = x0; x < x0 + pw; x += 2)
+                    {
+                        Put(frame, w * h * 2 + (y * w + x) * 2, expected[i][1]);
+                        Put(frame, w * h * 2 + (y * w + x) * 2 + 2, expected[i][2]);
+                    }
+            }
+
+            string dir = Path.Combine(Path.GetTempPath(), "hdrcast-colour-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(dir);
+            try
+            {
+                string raw = Path.Combine(dir, "in.p010"), ts = Path.Combine(dir, "out.ts"), back = Path.Combine(dir, "back.p010");
+                using (FileStream f = File.Create(raw))
+                    for (int n = 0; n < 30; n++) f.Write(frame, 0, frame.Length);
+
+                List<string> args = FfmpegCommandBuilder.Build(new FfmpegPlan
+                {
+                    VideoPipeName = "colour-test", PixelFormat = HdrCast.Capture.CaptureFormat.P010, Width = w, Height = h, Fps = 30,
+                    Encoder = new EncoderSettings { Encoder = encoder, Preset = QualityPreset.Speed, Hdr = true, BitrateKbps = 8000, Fps = 30, GopSeconds = 1 },
+                    Audio = AudioCodec.None, Progress = false, OutputUrl = ts, LogLevel = "error",
+                });
+                args[args.IndexOf(FfmpegCommandBuilder.PipePath("colour-test"))] = raw;
+                string log = Run(ffmpeg, args, out int exit);
+                if (exit != 0 && encoder != VideoEncoder.LibX265) return;     // no such GPU here
+                Assert.True(exit == 0, "encode failed:\n" + ArgQuote.Join(args) + "\n" + Tail(log));
+
+                string probe = Run(ProbeTool(ffmpeg), new[] { "-hide_banner", "-loglevel", "error", "-show_streams", "-select_streams", "v:0", ts }, out int probeExit);
+                if (probeExit == 0)
+                {
+                    Assert.Contains("color_transfer=smpte2084", probe);
+                    Assert.Contains("color_primaries=bt2020", probe);
+                    Assert.Contains("color_space=bt2020nc", probe);
+                    Assert.Contains("color_range=tv", probe);
+                }
+
+                Run(ffmpeg, new[] { "-hide_banner", "-loglevel", "error", "-i", ts, "-frames:v", "20", "-f", "rawvideo", "-pix_fmt", "p010le", back }, out int decodeExit);
+                Assert.Equal(0, decodeExit);
+                byte[] all = File.ReadAllBytes(back);
+                int offset = all.Length - frame.Length;                          // the last decoded frame
+                for (int i = 0; i < rgb.Length; i++)
+                {
+                    int cx = (i % 5) * pw + pw / 2, cy = (i / 5) * ph + ph / 2;   // patch centre, away from the edges
+                    int y = Get(all, offset + (cy * w + cx) * 2);
+                    int cb = Get(all, offset + w * h * 2 + ((cy / 2) * w + cx) * 2);
+                    int cr = Get(all, offset + w * h * 2 + ((cy / 2) * w + cx) * 2 + 2);
+                    string what = "patch " + i + ": expected " + string.Join("/", expected[i]) + ", got " + y + "/" + cb + "/" + cr;
+                    Assert.True(Math.Abs(y - expected[i][0]) <= 3 && Math.Abs(cb - expected[i][1]) <= 3 && Math.Abs(cr - expected[i][2]) <= 3, what);
+                }
+            }
+            finally
+            {
+                try { Directory.Delete(dir, true); } catch (Exception) { }
+            }
+        }
+
+        static void Put(byte[] b, int i, int code10)
+        {
+            ushort s = ColorMath.ToP010Sample(code10);
+            b[i] = (byte)s;
+            b[i + 1] = (byte)(s >> 8);
+        }
+
+        static int Get(byte[] b, int i) => ColorMath.FromP010Sample((ushort)(b[i] | (b[i + 1] << 8)));
 
         [Fact]
         public void Av1_really_cannot_be_muxed_into_mpegts()

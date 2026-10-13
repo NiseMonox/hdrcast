@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
@@ -11,7 +12,9 @@ namespace HdrCast.Sender.Capture
 {
     /// <summary>
     /// Desktop audio via WASAPI loopback, converted to f32le 48 kHz stereo and written to the audio pipe
-    /// (design.md §2.4). The stream is kept locked to the video clock by <see cref="AudioClockAligner"/>:
+    /// (design.md §2.4). With an app to leave out (the voice chat) it is process loopback instead
+    /// (<see cref="ProcessLoopbackCapture"/>), following that app as it starts, quits and restarts.
+    /// The stream is kept locked to the video clock by <see cref="AudioClockAligner"/>:
     /// silence is inserted when we fall behind, surplus frames are dropped when we run ahead, so ffmpeg can
     /// use ideal timestamps on both inputs.
     /// </summary>
@@ -22,11 +25,16 @@ namespace HdrCast.Sender.Capture
 
         readonly string _pipeName;
         readonly string _deviceId;
+        readonly string _excludeApp;
         readonly AudioClockAligner _aligner = new AudioClockAligner(TargetSampleRate);
         readonly object _gate = new object();
+        readonly object _switchGate = new object();
         readonly Stopwatch _clock;
+        readonly int _selfPid = Process.GetCurrentProcess().Id;
 
-        WasapiLoopbackCapture? _capture;
+        IWaveIn? _capture;
+        ProcessLoopbackCapture? _processCapture;
+        Timer? _targetTimer;
         IWavePlayer? _silence;
         MMDevice? _device;
         NamedPipeServerStream? _pipe;
@@ -44,11 +52,13 @@ namespace HdrCast.Sender.Capture
         double _resamplePos;
         float[] _scratch = new float[0];
 
-        public AudioCapture(string pipeName, string deviceId, Stopwatch clock)
+        /// <param name="excludeApp">Program whose audio (with everything it started) is left out, e.g. the voice chat; "" = none.</param>
+        public AudioCapture(string pipeName, string deviceId, Stopwatch clock, string excludeApp = "")
         {
             _pipeName = pipeName;
             _deviceId = deviceId ?? "default";
             _clock = clock;
+            _excludeApp = excludeApp ?? "";
         }
 
         public bool Running => _running;
@@ -99,11 +109,19 @@ namespace HdrCast.Sender.Capture
             try
             {
                 _device = ResolveDevice(_deviceId);
-                _capture = new WasapiLoopbackCapture(_device);
-                WaveFormat f = _capture.WaveFormat;
-                FormatDescription = f.Encoding + " " + f.SampleRate + " Hz " + f.Channels + " ch " + f.BitsPerSample + " bit";
-                _capture.DataAvailable += OnData;
-                _capture.RecordingStopped += OnStopped;
+                lock (_switchGate)
+                {
+                    if (_excludeApp.Length > 0)
+                    {
+                        int target = ExcludeTarget(out int root);
+                        if (StartProcessCapture(target, root))
+                            _targetTimer = new Timer(_ => FollowExcludedApp(), null, 1000, 1000);
+                        else
+                            Log.Warn("audio: cannot leave out " + _excludeApp + " on this Windows (needs Windows 10 21H1 or newer); sending all desktop audio");
+                    }
+                    if (_capture == null) StartDeviceCapture();
+                }
+                WaveFormat f = _capture!.WaveFormat;
 
                 // A completely idle render endpoint delivers no loopback data at all, so play silence into it.
                 try
@@ -118,7 +136,6 @@ namespace HdrCast.Sender.Capture
                     Log.Warn("audio: could not start the silence keep-alive: " + ex.Message);
                 }
 
-                _capture.StartRecording();
                 Log.Info("audio: capturing " + FormatDescription + " from " + (_device?.FriendlyName ?? "default"));
             }
             catch (Exception ex)
@@ -126,11 +143,130 @@ namespace HdrCast.Sender.Capture
                 Degraded = true;
                 FormatDescription = "silence (" + ex.Message + ")";
                 Log.Warn("audio: no desktop audio (" + ex.Message + "); sending silence so the stream keeps its audio track");
-                try { _capture?.Dispose(); } catch (Exception) { }
+                lock (_switchGate)
+                {
+                    try { _targetTimer?.Dispose(); } catch (Exception) { }
+                    try { _capture?.Dispose(); } catch (Exception) { }
+                    _targetTimer = null;
+                    _capture = null;
+                    _processCapture = null;
+                }
                 try { _device?.Dispose(); } catch (Exception) { }
-                _capture = null;
                 _device = null;
             }
+        }
+
+        static string Describe(WaveFormat f) => f.Encoding + " " + f.SampleRate + " Hz " + f.Channels + " ch " + f.BitsPerSample + " bit";
+
+        /// <summary>Plain loopback of the whole endpoint. Call under _switchGate.</summary>
+        void StartDeviceCapture()
+        {
+            var loopback = new WasapiLoopbackCapture(_device);
+            loopback.DataAvailable += OnData;
+            loopback.RecordingStopped += OnStopped;
+            FormatDescription = Describe(loopback.WaveFormat);
+            _capture = loopback;
+            loopback.StartRecording();
+        }
+
+        /// <summary>
+        /// Everything except <paramref name="target"/>'s process tree (the excluded app, or this engine while that app is
+        /// not running). False when this Windows has no process loopback. Call under _switchGate.
+        /// </summary>
+        bool StartProcessCapture(int target, int root)
+        {
+            var capture = new ProcessLoopbackCapture(target, includeTree: false);
+            capture.DataAvailable += OnData;
+            capture.RecordingStopped += OnStopped;
+            try
+            {
+                capture.StartRecording();
+            }
+            catch (Exception ex)
+            {
+                capture.DataAvailable -= OnData;
+                capture.RecordingStopped -= OnStopped;
+                capture.Dispose();
+                Log.Warn("audio: process loopback unavailable: " + ex.Message);
+                return false;
+            }
+            _processCapture = capture;
+            _capture = capture;
+            FormatDescription = Describe(capture.WaveFormat) + ", without " + _excludeApp;
+            Log.Info(root > 0
+                ? "audio: leaving out " + _excludeApp + " (pid " + root + " and everything it started)"
+                : "audio: " + _excludeApp + " is not running; sending all desktop audio until it starts");
+            return true;
+        }
+
+        /// <summary>The process tree to exclude: the app's topmost process, or this engine (i.e. nothing) while it is not running.</summary>
+        int ExcludeTarget(out int root)
+        {
+            root = 0;
+            try { root = AppAudioTarget.FindRoot(ProcessSnapshot.Take(), _excludeApp); }
+            catch (Exception ex) { Log.Warn("audio: cannot list processes: " + ex.Message); }
+            return root > 0 ? root : _selfPid;
+        }
+
+        /// <summary>
+        /// Every second (a process snapshot takes a millisecond or two): when the app started, quit or restarted the excluded
+        /// tree changed, so restart the capture on it. Until then up to a second of a freshly started app can slip through.
+        /// </summary>
+        void FollowExcludedApp()
+        {
+            lock (_switchGate)
+            {
+                ProcessLoopbackCapture? current = _processCapture;
+                if (!_running || current == null) return;
+                int target = ExcludeTarget(out int root);
+                if (target == current.TargetPid) return;
+                current.DataAvailable -= OnData;
+                current.RecordingStopped -= OnStopped;
+                current.Dispose();
+                _processCapture = null;
+                _capture = null;
+                if (StartProcessCapture(target, root)) return;
+                Log.Warn("audio: sending all desktop audio for the rest of this session");
+                try { _targetTimer?.Dispose(); } catch (Exception) { }
+                _targetTimer = null;
+                try { StartDeviceCapture(); }
+                catch (Exception ex) { Log.Error("audio: cannot restart the capture: " + ex.Message); }
+            }
+        }
+
+        /// <summary>Programs that have an audio session on the endpoint, as exe names, for the "Leave out" list.</summary>
+        public static string[] ListAudioApps(string deviceId)
+        {
+            var names = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                using (MMDevice device = ResolveDevice(deviceId))
+                {
+                    AudioSessionManager manager = device.AudioSessionManager;
+                    manager.RefreshSessions();
+                    SessionCollection sessions = manager.Sessions;
+                    for (int i = 0; i < sessions.Count; i++)
+                    {
+                        AudioSessionControl s = sessions[i];
+                        int pid = (int)s.GetProcessID;
+                        if (s.IsSystemSoundsSession || pid <= 0) continue;
+                        try
+                        {
+                            using (Process p = Process.GetProcessById(pid)) names.Add(p.ProcessName + ".exe");
+                        }
+                        catch (Exception)
+                        {
+                            // gone meanwhile, or not ours to inspect
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("audio: cannot list audio sessions: " + ex.Message);
+            }
+            names.Remove(Process.GetCurrentProcess().ProcessName + ".exe");
+            return new List<string>(names).ToArray();
         }
 
         static MMDevice ResolveDevice(string id)
@@ -165,10 +301,11 @@ namespace HdrCast.Sender.Capture
 
         void OnData(object? sender, WaveInEventArgs e)
         {
-            if (!_running || e.BytesRecorded <= 0 || _capture == null) return;
+            // The format comes from the capture that raised this: a switch (the excluded app restarted) swaps them.
+            if (!_running || e.BytesRecorded <= 0 || !(sender is IWaveIn source)) return;
             try
             {
-                int frames = ConvertToTarget(e.Buffer, e.BytesRecorded, _capture.WaveFormat, out float[] converted);
+                int frames = ConvertToTarget(e.Buffer, e.BytesRecorded, source.WaveFormat, out float[] converted);
                 if (frames <= 0) return;
 
                 lock (_gate)
@@ -372,14 +509,24 @@ namespace HdrCast.Sender.Capture
         {
             _running = false;
             lock (_gate) Monitor.PulseAll(_gate);
-            try { _capture?.StopRecording(); } catch (Exception) { }
+            lock (_switchGate)
+            {
+                try { _targetTimer?.Dispose(); } catch (Exception) { }
+                _targetTimer = null;
+                try { _capture?.StopRecording(); } catch (Exception) { }
+            }
             try { _silence?.Stop(); } catch (Exception) { }
             if (_writerThread != null && _writerThread.IsAlive) _writerThread.Join(1000);
             try { _pipe?.Dispose(); } catch (Exception) { }
-            try { _capture?.Dispose(); } catch (Exception) { }
+            lock (_switchGate)
+            {
+                try { _capture?.Dispose(); } catch (Exception) { }
+                _capture = null;
+                _processCapture = null;
+            }
             try { _silence?.Dispose(); } catch (Exception) { }
             try { _device?.Dispose(); } catch (Exception) { }
-            _pipe = null; _capture = null; _silence = null; _device = null;
+            _pipe = null; _silence = null; _device = null;
         }
     }
 }

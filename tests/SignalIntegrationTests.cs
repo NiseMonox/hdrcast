@@ -307,6 +307,7 @@ namespace HdrCast.Tests
             if (ffmpeg == null || ffprobe == null) return;
             if (!Run(ffmpeg, new[] { "-hide_banner", "-encoders" }, 10000).Contains(" libx265 ")) return;
             using (SignalServer? server = SignalServer.TryStart())
+            using (var router = new FakeRouter())                  // never the real router: that would forward real ports
             {
                 if (server == null) return;
                 Invite invite = Invite.Create("full stack", server.Url);
@@ -329,13 +330,16 @@ namespace HdrCast.Tests
                 var host = new P2pHost(new P2pHostOptions
                 {
                     Group = hostGroup, FfmpegPath = ffmpeg, BitrateBps = 1_000_000, MaxViewers = 2, Addresses = Loopback(),
-                    EchoPort = server.EchoPort, HeartbeatMs = 1000,
+                    EchoPort = server.EchoPort, HeartbeatMs = 1000, RouterMapping = router.Options(),
                 }, ts, log);
                 var sessions = new List<ViewerSession>();
                 try
                 {
                     host.Start();
                     Assert.True(WaitFor(() => host.Status.StartsWith("Live"), 8000), host.Status);
+                    Assert.True(WaitFor(() => host.RouterMapping!.State == PortMappingState.Mapped, 8000), host.RouterMapping!.State + " " + host.RouterMapping.Problem);
+                    int hostPort = host.RouterMapping.Port;
+                    lock (router.Mappings) Assert.True(router.Mappings.ContainsKey(hostPort), "the host's port was not forwarded");
 
                     ViewerSession Watch(string name)
                     {
@@ -343,7 +347,7 @@ namespace HdrCast.Tests
                         var vs = new ViewerSession(new ViewerSessionOptions
                         {
                             Group = g, HostId = hostGroup.PeerId, LatencyMs = 300, OverheadPercent = 25, Addresses = Loopback(),
-                            EchoPort = server.EchoPort,
+                            EchoPort = server.EchoPort, RouterMapping = router.Options(),
                         }, log);
                         vs.Start();
                         sessions.Add(vs);
@@ -379,7 +383,7 @@ namespace HdrCast.Tests
 
                     // a third friend is refused: max viewers is 2
                     GroupConfig g3 = new GroupConfig().Normalize().Adopt(invite, "小绿");
-                    var third = new ViewerSession(new ViewerSessionOptions { Group = g3, HostId = hostGroup.PeerId, LatencyMs = 300, Addresses = Loopback(), EchoPort = server.EchoPort }, log);
+                    var third = new ViewerSession(new ViewerSessionOptions { Group = g3, HostId = hostGroup.PeerId, LatencyMs = 300, Addresses = Loopback(), EchoPort = server.EchoPort, MapRouterPort = false }, log);
                     third.Start();
                     sessions.Add(third);
                     Assert.True(WaitFor(() => third.Status.Contains("full"), 15000), third.Status);
@@ -387,6 +391,7 @@ namespace HdrCast.Tests
                     // the host stops: viewers learn it (BYE) and wait for it to come back
                     host.Stop();
                     Assert.True(WaitFor(() => red.State == ViewerSessionState.Waiting, 5000), red.Status);
+                    lock (router.Mappings) Assert.False(router.Mappings.ContainsKey(hostPort), "the host's forward outlived it");
                 }
                 finally
                 {

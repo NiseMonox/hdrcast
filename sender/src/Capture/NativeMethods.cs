@@ -3,7 +3,7 @@ using System.Runtime.InteropServices;
 
 namespace HdrCast.Sender.Capture
 {
-    /// <summary>Win32 P/Invoke used by the capture engine (console attach, timers, ctrl handler).</summary>
+    /// <summary>Win32 P/Invoke used by the capture engine (console attach, timers, ctrl handler) and the runner (pipe wait).</summary>
     internal static class NativeMethods
     {
         public const int ATTACH_PARENT_PROCESS = -1;
@@ -52,6 +52,11 @@ namespace HdrCast.Sender.Capture
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool CloseHandle(IntPtr hObject);
+
+        /// <summary>True when an instance of the pipe waits for a client. Only asks: it never connects, unlike any open.</summary>
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool WaitNamedPipeW(string lpNamedPipeName, uint nTimeOut);
 
         [DllImport("winmm.dll")]
         public static extern uint timeBeginPeriod(uint uPeriod);

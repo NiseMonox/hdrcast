@@ -100,7 +100,7 @@ namespace HdrCast.Sender.Capture
             {
                 try
                 {
-                    _audio = new AudioCapture(_args.AudioPipe, _args.AudioDevice, _clock);
+                    _audio = new AudioCapture(_args.AudioPipe, _args.AudioDevice, _clock, _args.AudioExclude);
                     _audio.CreatePipe();
                 }
                 catch (Exception ex)

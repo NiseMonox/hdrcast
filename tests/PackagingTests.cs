@@ -10,7 +10,7 @@ namespace HdrCast.Tests
     /// </summary>
     public class PackagingTests
     {
-        static string RepoRoot()
+        internal static string RepoRoot()
         {
             var dir = new DirectoryInfo(AppContext.BaseDirectory);
             while (dir != null && !File.Exists(Path.Combine(dir.FullName, "build.sh"))) dir = dir.Parent;
@@ -67,6 +67,17 @@ namespace HdrCast.Tests
             string build = File.ReadAllText(Path.Combine(root, "build.sh"));
             Assert.Contains("scripts/*.cmd", build);
             Assert.Contains("scripts/*.ps1", build);
+        }
+
+        [Fact]
+        public void Build_script_ships_the_tools_and_the_zip_by_default()
+        {
+            // Unzip and run: ffmpeg / ffprobe (sender) and mpv (viewer) ride along unless --no-tools is given.
+            string root = RepoRoot();
+            if (root.Length == 0) return;
+            string build = File.ReadAllText(Path.Combine(root, "build.sh"));
+            foreach (string s in new[] { "ffmpeg.exe", "ffprobe.exe", "mpv.exe", "--no-tools", "$DIST/tools", "HdrCast-$VERSION.zip", "srt://" })
+                Assert.Contains(s, build);
         }
     }
 }

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Threading;
 using System.Windows.Forms;
 using HdrCast.Capture;
+using HdrCast.Common;
 using HdrCast.Sender.Capture;
 
 namespace HdrCast.Sender
@@ -25,6 +26,9 @@ namespace HdrCast.Sender
             string verb = args[0].ToLowerInvariant();
             var rest = new string[args.Length - 1];
             Array.Copy(args, 1, rest, 0, rest.Length);
+
+            // The GUI's Allow… starts this elevated (Windows shows its UAC prompt): add the rule, no window, exit.
+            if (verb == WindowsFirewall.AllowVerb) return AllowThroughFirewall();
 
             NativeMethods.EnsureConsole();
             switch (verb)
@@ -58,6 +62,14 @@ namespace HdrCast.Sender
             Application.Run(new Gui.MainForm(invite));
             SenderLog.Write("app", "exit");
             return ExitCodes.Ok;
+        }
+
+        static int AllowThroughFirewall()
+        {
+            string exe = Application.ExecutablePath;
+            string? error = WindowsFirewall.AllowProgram(exe, "HdrCast Sender", HdrCast.Gui.FirewallRow.RuleDescription);
+            SenderLog.Write("app", error == null ? "firewall: inbound UDP allowed for " + exe : "firewall: could not add the rule for " + exe + ": " + error);
+            return error == null ? ExitCodes.Ok : ExitCodes.DeviceError;
         }
 
         static void ReportCrash(Exception ex)

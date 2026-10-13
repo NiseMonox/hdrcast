@@ -22,6 +22,10 @@ namespace HdrCast.P2p
         public int EchoPort { get; set; } = EchoProtocol.DefaultPort;
         /// <summary>Fixed local port for mpv (0 = any free port).</summary>
         public int LocalPort { get; set; }
+        /// <summary>Forward this PC's IPv4 port on the router (UPnP), so hosts whose routers change ports can reach it.</summary>
+        public bool MapRouterPort { get; set; } = true;
+        /// <summary>Null = the real router (tests point it at a stand-in).</summary>
+        public PortMappingOptions? RouterMapping { get; set; }
     }
 
     public enum ViewerSessionState
@@ -53,11 +57,14 @@ namespace HdrCast.P2p
         GroupKeys? _keys;
         SignalingClient? _signal;
         ViewerLink? _link;
+        RouterPortMapping? _router;
         Thread? _thread;
         ViewerSessionState _state = ViewerSessionState.Starting;
         string _status = "Starting";
         string _hostName = "";
+        string _echoCandidate = "";
         bool _everConnected;
+        bool _ipv4OnlyFailure;
 
         public ViewerSession(ViewerSessionOptions options, Action<string> log)
         {
@@ -74,6 +81,13 @@ namespace HdrCast.P2p
         public string PathDescription => _link?.DescribePath() ?? "";
         public bool EverConnected { get { lock (_lock) return _everConnected; } }
         public string SrtPassphrase => _keys?.SrtPassphrase ?? "";
+        /// <summary>The router forward of this PC's IPv4 port (null when not asked for).</summary>
+        public RouterPortMapping? RouterMapping => _router;
+        /// <summary>
+        /// The last attempt failed on IPv4 alone and the host's side is not known to be open: if the host's router
+        /// changes ports, only this PC taking unsolicited IPv4 (router forward + firewall rule) can help.
+        /// </summary>
+        public bool ThisSideCouldHelp { get { lock (_lock) return _ipv4OnlyFailure; } }
 
         public void Start()
         {
@@ -82,6 +96,19 @@ namespace HdrCast.P2p
             _link = new ViewerLink(_keys, _o.Addresses ?? LinkAddresses.Detect(), _o.LocalPort);
             _link.StateChanged += _ => Changed?.Invoke();
             _log("[p2p] this PC offers: " + string.Join(", ", _link.Candidates) + (_link.HasIpv6 ? "" : "  (no IPv6)"));
+            if (_o.MapRouterPort && _link.Ipv4Port.HasValue)
+            {
+                ViewerLink link = _link;
+                var router = new RouterPortMapping(link.Ipv4Port.Value, _o.RouterMapping, _log);
+                router.Changed += () =>
+                {
+                    IPEndPoint? ext = router.External;
+                    link.SetCandidate(LinkBase.SourceRouter, router.Open && ext != null ? Endpoint.Format(ext) : null);
+                    Changed?.Invoke();
+                };
+                _router = router;
+                router.Start();
+            }
             _thread = new Thread(Run) { IsBackground = true, Name = "p2p-viewer" };
             _thread.Start();
         }
@@ -89,10 +116,18 @@ namespace HdrCast.P2p
         void Run()
         {
             CancellationToken ct = _cts.Token;
-            if (_o.DiscoverPublicIpv4) DiscoverPublicIpv4();
+            bool echoTried = false;
             int failures = 0;
             while (!ct.IsCancellationRequested)
             {
+                if (_o.DiscoverPublicIpv4)
+                {
+                    // before every join: the echo may have been opened meanwhile, and the router may have dropped the
+                    // mapping while we waited, so the address the host would punch towards could be stale
+                    DiscoverPublicIpv4(logFailure: !echoTried);
+                    echoTried = true;
+                    if (ct.IsCancellationRequested) return;
+                }
                 string waitReason;
                 try
                 {
@@ -183,33 +218,58 @@ namespace HdrCast.P2p
                 LinkState s = _link.State;
                 if (s == LinkState.Connected)
                 {
-                    lock (_lock) _everConnected = true;
+                    lock (_lock)
+                    {
+                        _everConnected = true;
+                        _ipv4OnlyFailure = false;
+                    }
                     SetState(ViewerSessionState.Connected, "Connected to " + entry.Record.Name + " (" + _link.DescribePath() + ")");
-                    _log("[p2p] connected to " + entry.Record.Name + ": " + _link.DescribePath());
+                    _log("[p2p] connected to " + entry.Record.Name + ": " + _link.DescribePath() +
+                         (_link.PathLearned ? " (a port the host's router picked for this PC, not the advertised one: it changes ports per destination)" : ""));
                     return "";
                 }
                 if (s == LinkState.Failed || s == LinkState.Closed) break;
                 ct.WaitHandle.WaitOne(100);
             }
             ct.ThrowIfCancellationRequested();
+            string reason = _link.Reason;                  // before EndSession replaces it
             _link.EndSession("no path");
-            string why = P2pDiagnostics.Explain(_link.HasIpv6, entry.Record.Candidates);
-            _log("[p2p] could not reach " + entry.Record.Name + ": " + why + " (host offers " + string.Join(", ", entry.Record.Candidates) + ")");
+            bool ipv4Tried = !(_link.HasIpv6 && P2pDiagnostics.HasIpv6(entry.Record.Candidates)) &&
+                             P2pDiagnostics.HasPublicIpv4(entry.Record.Candidates) && P2pDiagnostics.HasPublicIpv4(_link.Candidates);
+            lock (_lock) _ipv4OnlyFailure = ipv4Tried && entry.Record.OpenIpv4 != true;
+            string why = P2pDiagnostics.Explain(_link.HasIpv6, _link.Candidates, entry.Record.Candidates, entry.Record.OpenIpv4);
+            _log("[p2p] could not reach " + entry.Record.Name + ": " + why + " (" + (reason.Length > 0 ? reason + "; " : "") +
+                 "host offers " + string.Join(", ", entry.Record.Candidates) +
+                 (entry.Record.OpenIpv4.HasValue ? ", host IPv4 " + (entry.Record.OpenIpv4.Value ? "open" : "not open") + " to every router" : "") + ")");
             return why;
         }
 
-        void DiscoverPublicIpv4()
+        /// <summary>This PC's public IPv4 mapping for the IPv4 attempt (IPv6 does not need it). False = no answer yet.</summary>
+        bool DiscoverPublicIpv4(bool logFailure)
         {
             try
             {
                 IPAddress? server = P2pHost.ResolveIpv4(_signal!.Host);
-                if (server == null) return;
-                IPEndPoint? mapped = _link!.DiscoverPublicIpv4(new IPEndPoint(server, _o.EchoPort), 1500);
-                if (mapped != null) _link.AddCandidate(Endpoint.Format(mapped));
+                if (server == null) return true;                   // IPv6-only signaling server: nothing to ask
+                var echo = new IPEndPoint(server, _o.EchoPort);
+                IPEndPoint? mapped = _link!.DiscoverPublicIpv4(echo, 1500);
+                if (mapped == null)
+                {
+                    if (logFailure)
+                        _log("[p2p] public IPv4 check: no answer from the signaling server's UDP echo at " + Endpoint.Format(echo) +
+                             " (is UDP " + _o.EchoPort + " open on the server?); without it IPv4 only works inside one network");
+                    return false;
+                }
+                string candidate = Endpoint.Format(mapped);
+                _link.SetCandidate(LinkBase.SourceEcho, candidate);
+                if (candidate != _echoCandidate)
+                    _log("[p2p] public IPv4 mapping: " + candidate + (_echoCandidate.Length > 0 ? " (was " + _echoCandidate + ")" : ""));
+                _echoCandidate = candidate;
+                return true;
             }
             catch (Exception)
             {
-                // optional extra: IPv6 does not need it
+                return false;
             }
         }
 
@@ -231,6 +291,7 @@ namespace HdrCast.P2p
             _cts.Cancel();
             _thread?.Join(3000);
             _link?.Dispose();
+            _router?.Dispose();                        // deletes the router forward (waits for the router, a few seconds at most)
             SetState(ViewerSessionState.Stopped, "Stopped");
         }
 
@@ -242,33 +303,48 @@ namespace HdrCast.P2p
     {
         public const string SignalingDown = "The signaling server cannot be reached - check this PC's internet connection";
 
-        public static string Explain(bool thisPcHasIpv6, IList<string> hostCandidates)
+        /// <summary>
+        /// Why the viewer did not get through. A public IPv4 candidate exists only when that side's UDP echo answered
+        /// (docs/design.md §8.7); without one on the host there was no IPv4 path to try at all. <paramref name="hostIpv4Open"/>
+        /// is the host's "open4" (router forward + firewall rule): it tells whose side kept the IPv4 attempt out.
+        /// </summary>
+        public static string Explain(bool thisPcHasIpv6, IList<string> thisPcCandidates, IList<string> hostCandidates,
+                                     bool? hostIpv4Open = null)
         {
-            bool hostV6 = false, hostPublicV4 = false;
-            foreach (string c in hostCandidates)
-            {
-                if (!Endpoint.TryParse(c, out HostPort? hp, out _) || !hp!.IsLiteral) continue;
-                IPAddress a = IPAddress.Parse(hp.Host);
-                if (a.AddressFamily == AddressFamily.InterNetworkV6) hostV6 |= LocalAddresses.IsGlobalUnicastV6(a) || IPAddress.IsLoopback(a);
-                else hostPublicV4 |= !IsPrivateV4(a);
-            }
-            if (!thisPcHasIpv6 && hostV6)
-                return "This PC has no IPv6 internet connection, and the host is reachable over IPv6 only. " +
+            bool hostV6 = HasIpv6(hostCandidates);
+            if (thisPcHasIpv6 && hostV6)
+                return "Both sides have IPv6 but the path is blocked - usually a firewall or VPN that drops all incoming UDP";
+            string ipv4;
+            if (!HasPublicIpv4(hostCandidates)) ipv4 = "the host offered no public IPv4 address";
+            else if (!HasPublicIpv4(thisPcCandidates)) ipv4 = "the IPv4 attempt did not get through (this PC's public IPv4 address could not be found)";
+            else if (hostIpv4Open == false)
+                ipv4 = "the IPv4 attempt did not get through: the host's PC only takes IPv4 from routers that keep ports, " +
+                       "so they should click Allow next to Firewall in HdrCast and turn UPnP on in their router";
+            else if (hostIpv4Open == true)
+                ipv4 = "the IPv4 attempt did not get through although the host takes IPv4 from any port: " +
+                       "something on this side drops UDP (a VPN, proxy or game accelerator?)";
+            else ipv4 = "the IPv4 attempt did not get through";
+            if (hostV6)
+                return "This PC has no IPv6 internet connection, and " + ipv4 + ". " +
                        "Turn on IPv6 on your router or ask your ISP (check at test-ipv6.com)";
-            if (thisPcHasIpv6 && !hostV6)
-                return "The host's PC has no IPv6 internet connection; they need to turn IPv6 on (check at test-ipv6.com)";
-            if (!thisPcHasIpv6 && !hostV6)
-                return hostPublicV4
-                    ? "Neither side has IPv6 and the IPv4 attempt did not get through; at least one side needs IPv6"
-                    : "Neither side has IPv6; at least one side needs IPv6 (check at test-ipv6.com)";
-            return "Both sides have IPv6 but the path is blocked - usually a firewall or VPN that drops all incoming UDP";
+            if (thisPcHasIpv6)
+                return "The host's PC has no IPv6 internet connection, and " + ipv4 + "; they need to turn IPv6 on (check at test-ipv6.com)";
+            return "Neither side has IPv6, and " + ipv4 + "; at least one side needs IPv6 (check at test-ipv6.com)";
         }
 
-        static bool IsPrivateV4(IPAddress a)
+        /// <summary>A global IPv6 candidate (loopback counts too, for tests).</summary>
+        public static bool HasIpv6(IEnumerable<string> candidates) =>
+            AnyAddress(candidates, a => a.AddressFamily == AddressFamily.InterNetworkV6 && (LocalAddresses.IsGlobalUnicastV6(a) || IPAddress.IsLoopback(a)));
+
+        /// <summary>An IPv4 candidate outside the private, shared (CGNAT), loopback and link-local ranges.</summary>
+        public static bool HasPublicIpv4(IEnumerable<string> candidates) =>
+            AnyAddress(candidates, LocalAddresses.IsPublicIpv4);
+
+        static bool AnyAddress(IEnumerable<string> candidates, Func<IPAddress, bool> test)
         {
-            byte[] b = a.GetAddressBytes();
-            return b[0] == 10 || b[0] == 127 || (b[0] == 172 && b[1] >= 16 && b[1] <= 31) || (b[0] == 192 && b[1] == 168) ||
-                   (b[0] == 100 && b[1] >= 64 && b[1] <= 127) || (b[0] == 169 && b[1] == 254);
+            foreach (string c in candidates)
+                if (Endpoint.TryParse(c, out HostPort? hp, out _) && hp!.IsLiteral && test(IPAddress.Parse(hp.Host))) return true;
+            return false;
         }
     }
 }

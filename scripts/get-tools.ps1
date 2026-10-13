@@ -3,8 +3,8 @@
     Downloads the external tools HdrCast needs into the tools\ folder next to the HdrCast executables.
 
 .DESCRIPTION
-    HdrCast does not ship ffmpeg or mpv (they are GPL builds with their own distribution terms), so this
-    fetches them:
+    The release zip already carries both in tools\ (versions and licences in tools\README.txt). This script
+    fetches or updates them, for a package built with build.sh --no-tools or for newer builds (-Force):
 
       ffmpeg.exe / ffprobe.exe   the sender needs these to encode and send    (BtbN win64-gpl build)
       mpv.exe                    the viewer needs this to play the stream     (zhongfly mpv-winbuild)

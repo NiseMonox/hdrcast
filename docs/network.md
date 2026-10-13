@@ -21,8 +21,10 @@
   "有状态"的：挡住没人请求过的入站，放行"自己先发出去"那条流的回包。双方同时向对方发包，两边都先有了出站，
   于是都放行。**谁都不用做端口转发，也不需要公网 IPv4。**
 - **候选地址**：IPv6 用出口网卡上的**稳定**地址（Windows 默认用临时地址发包，但临时地址每天变，而且"从哪个地址发"
-  必须和"公布哪个地址"一致，所以 socket 直接绑在稳定地址上）；IPv4 候选是局域网地址（同一局域网的人直连用）和经
-  信令服务器 UDP 回显得到的公网映射（IPv4 打洞的额外尝试，碰上运营商级 NAT 基本不成）。
+  必须和"公布哪个地址"一致，所以 socket 直接绑在稳定地址上）；IPv4 候选是局域网地址（同一局域网的人直连用）、经
+  信令服务器 UDP 回显得到的公网映射，以及路由器 UPnP 转发出来的端口（§1.1）。
+- **学来的地址**：对方的包从一个它没公布过的地址端口来（对称型 NAT 给每个目的地新开端口），就把这个地址也加进打洞
+  目标：对方 NAT 正是为我们开的这个口子，往这里发的包进得去。
 - **选路**：先收到 ACK 的路径胜出；IPv4 先通的话再等 200 ms，IPv6 也通就用 IPv6。主播跟着观众的选择走。
 - **每位观众一条独立的 SRT 连接**：主播端每个观众一个 remux ffmpeg（`-c copy`，不重编码），按**该观众**选的地区延迟和
   oheadbw 重传；谁的网络差只影响谁。
@@ -33,20 +35,42 @@
 
 | | 主播 | 观众 |
 |---|---|---|
-| 公网 IPv4 | 不需要 | 不需要 |
-| IPv6 | 需要（或者观众全在同一局域网） | 需要 |
-| 路由器端口转发 / 防火墙规则 | **不需要** | **不需要** |
-| Windows 防火墙 | 第一次开播可能弹"允许访问网络"，点允许（点取消理论上也能打洞，未实测） | 同左 |
+| IPv6 | 双方都有最省事，下面几行都不用管 | 同左 |
+| 公网 IPv4 | 没有 IPv6 时，至少一方的路由器要拿到公网 IPv4（不是 10.x / 100.64~127.x / 172.16~31.x / 192.168.x） | 同左 |
+| 路由器端口转发 | 不用手动做：开播时程序自动用 UPnP 转发自己的 IPv4 端口，下播删除（路由器要开着 UPnP，大多默认开） | 同左（观看期间） |
+| Windows 防火墙 | 界面 **Firewall** 一栏是橙色时点 **Allow…**（Windows 要管理员确认一次；换了新版本的目录要再点一次） | 同左（只有主播是对称型 NAT 时才用得上） |
 | 上行带宽 | 码率 × 观众数 × 1.25~1.5（§7） | 很少（只有 ACK） |
 | 下行带宽 | 很少 | 码率 × 1.3 |
+
+没有 IPv6 的一方只能走 IPv4，条件是：
+
+1. **信令服务器的 UDP 18651 放行**（§6）。公网 IPv4 候选只能靠这个回显得到；不通的话主播只公布 IPv6 和局域网地址，
+   观众那边根本没有 IPv4 可试（主播日志：`public IPv4 check: no answer…`，状态栏：`no public IPv4 found`）。
+2. **看路由器怎么给端口**：
+   - **锥形 NAT**（同一个内网端口发往任何目的地都用同一个公网端口，家用路由器大多是）：双方同时往对方的公网映射发包，
+     路由器和 Windows 防火墙都放行回包，什么都不用开。
+   - **对称型 NAT**（每个目的地换一个公网端口：国内运营商、运营商级 NAT 常见）：它发来的包来自一个对方没见过的端口，
+     对方的路由器和 Windows 防火墙会当成"没请求过的包"丢掉。这时**另一方**必须收得下这种包：路由器 UPnP 转发（程序自动做）
+     加 Windows 防火墙规则（点 Allow…）。收到之后程序记下真实端口反过来打洞（design.md §8.6），所以谁当主播都行，
+     只要另一方是开着的。**双方都是对称型 NAT 时 IPv4 过不去**，至少一方要开 IPv6。
+   - 实例（2026-09-25）：朋友（江苏电信，没有 IPv6）公布的端口是 :20833，发给主播时变成 :20834。主播这边只有防火墙规则时，
+     网卡上一个包都没收到（XG-100NE 丢掉了）；路由器 UPnP 转发一加上，不到一秒就连上。
 
 ### 1.2 连不上时状态栏说的是什么
 
 | 提示 | 含义 / 怎么办 |
 |---|---|
-| This PC has no IPv6 internet connection… | 本机没有 IPv6 出口，而主播只有 IPv6：按 §2 打开 IPv6 |
+| This PC has no IPv6 internet connection, and the host offered no public IPv4 address… | 本机没有 IPv6，主播也没公布公网 IPv4（主播那边的 UDP 回显没回复，见 §1.1 第 1 条），IPv4 根本没试：本机按 §2 打开 IPv6，或者先把 UDP 18651 放行 |
+| This PC has no IPv6 internet connection, and the IPv4 attempt did not get through… | 本机没有 IPv6，IPv4 打洞也没成（至少一方 NAT 不配合，§1.1 第 2 条；后面注明 *could not be found* 的是本机自己的公网 IPv4 也没拿到）：按 §2 打开 IPv6 |
+| …did not get through: the host's PC only takes IPv4 from routers that keep ports… | 主播的 IPv4 没打开（路由器没转发或防火墙没放行），而本机路由器多半是对称型 NAT：让主播点 Allow…、确认路由器开着 UPnP；或者本机开 IPv6 |
+| …did not get through although the host takes IPv4 from any port… | 主播那边是开着的，包还是没到：本机的 VPN / 代理 / 加速器（Clash TUN、UU 之类）截走了 UDP，关掉或让 HdrCastReceiver 直连 |
+| 主播状态栏 `IPv4 closed to routers that change ports: …` | 主播的 IPv4 没打开，冒号后面写了缺什么：`no router forward (UPnP)` → 路由器里打开 UPnP；`no firewall rule (click Allow)` → 点 Allow…；`router behind another NAT` → 路由器外面还有一层 NAT（光猫路由模式或运营商级 NAT），转发帮不上 |
+| 日志 `[p2p] router: could not forward UDP …` | 路由器没开 UPnP、或拒绝了转发（括号里是路由器的错误码）。每分钟起重试，开了之后不用重开程序 |
+| 日志 `connected via IPv4 … (a port their router picked for this PC …)` | 对方是对称型 NAT，靠这边打开的 IPv4 连上的：正常 |
+| 主播日志 `left (could not connect: no candidate answered; …)` | 对方的包一个都没到。分号后面是判断：这边 IPv4 已打开 → 对方那边有东西截走了 UDP；没打开 → 先按提示打开 |
 | The host's PC has no IPv6 internet connection… | 主播那边没有 IPv6：让主播按 §2 打开 |
-| Neither side has IPv6… | 双方都没有 IPv6，IPv4 打洞也没成：至少一方要有 IPv6 |
+| Neither side has IPv6… | 双方都没有 IPv6，IPv4 也没通：至少一方要有 IPv6 |
+| 主播状态栏 `no public IPv4 found` / 日志 `public IPv4 check: no answer…` | 信令服务器的 UDP 18651 没回复：在腾讯云安全组放行（§6）。主播端每分钟重试、观众端每次加入前重试，放行后不用重开 |
 | Both sides have IPv6 but the path is blocked… | 都有 IPv6 但包过不去：多半是 VPN（关掉）或路由器"IPv6 防火墙：阻止所有入站"之类的严格设置（改成默认 / 标准） |
 | Not live right now / Nobody in the group is live | 主播还没点 Start；列表每 10 s 自动刷新 |
 | … is full | 达到主播设的 Max viewers |
@@ -80,6 +104,10 @@
 3. 按 4×RTT 算，澳洲只要 ~640 ms，中国只要 ~480 ms；但我们的目标是"推流式"而非远程桌面：多留几倍余量能扛住跨境线路的突发丢包（重传要在 latency 内完成），代价只是延迟大一点。中国线路按丢包 3~7 % 取乘数 6~8 并留余量，得到 3500 ms；`oheadbw` 也提高到 50 %，给重传留带宽。
 4. latency 由两端协商取**最大值**（发送端的 `peerlatency` 与接收端的 `rcvlatency`）。两端都用观众的值，所以观众选的就是生效值（实测：API 里 `msReceiveTsbPdDelay` / `msSendTsbPdDelay` 正好等于 URL 里的值）。
 5. 端到端总延迟 ≈ 接收 SRT (1.5~3.5 s) + mpv `cache-pause-wait` (1.5 s) + 编码 (~0.4 s)，即日本约 3.5 s、中国约 5.5 s。
+   实测（2026-09-24，本机回环，NVENC → SRT 1500 ms → mpv 用接收端的原样参数，画面里烧 UTC 时间戳、经 IPC 截图对比）：**3.58 s**，三次一致，
+   mpv 的 `demuxer-cache-duration` 稳定在 1.55 s。界面上的 "ping 38 ms" 是网络往返，不是画面延迟。
+6. latency 决定的是**抗丢包**（重传窗口），不是画质：线路好时 1.5 s 和 3.5 s 画面一样，只是晚两秒；画质只由码率和编码预设决定。
+   跨境（中国）观众应选 China 预设（3500 ms、oheadbw 50 %），不然偶发的丢包重传赶不上就会花屏。
 
 > 观众可以自己调：卡顿（mpv 反复缓冲）就把 latency 加 500 ms 重新 Play；线路好就往下减。
 
@@ -109,8 +137,17 @@ recv_buffer_size = 8000000                                    # UDP socket 缓�
 
 ## 5. 防火墙要开什么
 
-**什么都不用开。** 打洞靠的就是路由器和 Windows 防火墙对"自己先发出去的流"的放行：主播和观众都只发起出站 UDP。
-第一次开播或观看时 Windows 可能弹"允许访问网络"，点允许即可。
+- **双方都有 IPv6，或双方都是锥形 NAT**：什么都不用开。打洞靠的就是路由器和 Windows 防火墙对"自己先发出去的流"的放行。
+- **有一方是对称型 NAT**（§1.1 第 2 条）：另一方要收得下"没请求过的"UDP，两样都要：
+  - **路由器**：程序自己用 UPnP 把当前 IPv4 端口转发到本机。租期 1 小时，直播 / 观看期间每 20 分钟续一次，停止时删除；
+    程序崩溃的话最多 1 小时后自动失效。日志里是 `[p2p] router: …` 几行。路由器设置里 UPnP 要开着（大多默认开）。
+  - **Windows 防火墙**：界面 **Firewall** 一栏是橙色时点 **Allow…**。Windows 弹 UAC 确认后加一条入站规则
+    "HdrCast Sender"（观众端是 "HdrCast Receiver"）：只对这个 exe、只 UDP、所有网络类型；以前在 Windows 弹窗里点"取消"
+    留下的阻止规则会被停用（不删除）。主播开播时如果还没放行，程序会问一次。
+  - 规则认 exe 的完整路径：换到新版本的目录（比如 `D:\HdrCast-0.2.4\`）要再点一次。撤销：Windows 安全中心 → 防火墙和网络保护
+    → 高级设置 → 入站规则，删掉这条。
+- **安全性**：开的只是 HdrCast 自己的一个 UDP 端口。程序只认用组密钥签名的打洞包和已确认地址来的数据，其余一律丢弃；
+  视频本身是 SRT AES-256 加密的。
 
 ## 6. 腾讯云上的信令服务器做什么
 
@@ -121,7 +158,8 @@ recv_buffer_size = 8000000                                    # UDP socket 缓�
 - **看不到什么**：组密钥、SRT passphrase、视频。所有消息都用组密钥派生的 key 签名，服务器不知道这个 key，
   所以就算服务器被人控制，也只能让人连不上，没法把观众引到别处。
 - **流量**：每个在播的主播每 10 s 一个几百字节的心跳，每个观众每 10 s 一次列表查询。和视频比可以忽略，不影响那台机器上的生产服务。
-- **端口**：TCP 18650（HTTP API）、UDP 18651（IPv4 地址回显，可选）。需要在腾讯云安全组放行。
+- **端口**：TCP 18650（HTTP API）、UDP 18651（IPv4 地址回显）。都要在腾讯云安全组放行。UDP 18651 只有在所有人都有
+  IPv6 时才可以不开：不开的话谁都拿不到公网 IPv4 映射，没有 IPv6 的观众一律连不上（§1.1）。
 - **挂了会怎样**：已经连上的人照常看；新的人加入不了、列表刷不出来，恢复后自动继续。
 
 ## 7. 上传带宽估算

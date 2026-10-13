@@ -89,8 +89,9 @@ namespace HdrCast.Sender.Capture
                                                     ShaderParams.SizeInBytes + " (must match cbuffer Params)");
 
             string entry = _format == CaptureFormat.P010 ? ConvertShaderSource.EntryP010 : ConvertShaderSource.EntryNv12;
+            // bytes, not the string: see ConvertShaderSource.SourceBytes
             using (CompilationResult result = ShaderBytecode.Compile(
-                       ConvertShaderSource.Source, entry, ConvertShaderSource.Profile,
+                       ConvertShaderSource.SourceBytes(), entry, ConvertShaderSource.Profile,
                        ShaderFlags.OptimizationLevel3, EffectFlags.None, "hdrcast_convert.hlsl"))
             {
                 if (result.HasErrors || result.Bytecode == null)

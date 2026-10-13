@@ -3,12 +3,13 @@
 把 Windows 桌面（含 HDR10 与桌面音频）以 10~100 Mbps 的高码率"推流式"分享给中国 / 日本 / 澳大利亚的朋友，延迟 1.5~5 s，画面不糊不卡。私人用，**点对点**：谁都能开播，同组的朋友直接从主播的电脑收流，不需要中继、不需要公网 IPv4、不用改路由器。
 
 - **点对点（IPv6 打洞）**：双方经信令服务器交换地址后同时给对方发包，两边路由器和 Windows 防火墙都会放行这条流。信令服务器只转几百字节的签名元数据（谁在播、候选地址），**视频从不经过它**。
+- **没有 IPv6 也能连**：IPv4 走公网映射打洞；对方路由器是对称型 NAT（国内常见，每个目的地换端口）时，程序自动在路由器上用 UPnP 转发自己的端口，界面 Firewall 一栏点一次 **Allow…** 放行 Windows 防火墙，再按对方的真实端口反向打洞（见 [docs/network.md](docs/network.md) §1.1）。
 - **一次邀请码，永久可用**：主播建组后发一段 `hdrcast:…` 给朋友，朋友复制整条消息打开任一 app 就会提示加入，贴一次两个 app 都配好。
 - **HDR10 全链路**：DXGI 桌面复制 → 自研 D3D11 compute shader（scRGB → PQ / BT.2020 / P010）→ NVENC HEVC Main10 → SRT（AES-256，每位观众单独重传）→ mpv HDR 直通。SDR 观众由 mpv 做色调映射。
 - **码率、帧率、分辨率随便选**：10~100 Mbps、30/60/120 fps、原生 / 1440p / 1080p；支持 hevc_nvenc / hevc_amf / hevc_qsv / libx265。
 - **多人同时看**：一路编码，按观众各起一个只转封装的 ffmpeg（不重编码），每人按自己地区的延迟重传；谁卡了只影响他自己。
-- **桌面音频**：WASAPI loopback，不用虚拟声卡；与视频同一时钟。
-- **两个绿色 exe**：`HdrCastSender.exe`（开播）与 `HdrCastReceiver.exe`（观看），.NET Framework 4.8，Windows 10/11 直接跑；ffmpeg 与 mpv 用 `scripts\get-tools.cmd` 一键下载。
+- **桌面音频**：WASAPI loopback，不用虚拟声卡；与视频同一时钟。可以排除一个程序的声音（例如语音软件，免得观众听到自己的回声）。
+- **两个绿色 exe**：`HdrCastSender.exe`（开播）与 `HdrCastReceiver.exe`（观看），.NET Framework 4.8，Windows 10/11 直接跑；发行包的 `tools\` 里已经带了 ffmpeg / ffprobe / mpv，解压就能用（`scripts\get-tools.cmd force` 换新版本）。
 
 > 现状：点对点整条链路（邀请码、信令、打洞、多观众分发、HEVC Main10 PQ）已在 Linux 上用模拟的有状态防火墙端到端测过；
 > **Windows 上的运行时（采集、GPU shader、WASAPI、真实路由器打洞）还没实测**，步骤见 [docs/windows-checklist.md](docs/windows-checklist.md)。
@@ -35,18 +36,18 @@
 
 ## 快速开始：开播的人
 
-1. **装工具**：双击 `scripts\get-tools.cmd`（只开播就 `get-tools.cmd sender`，会下载 ffmpeg；只看就 `viewer`，下载 mpv）。
+1. **解压**发行包：ffmpeg / ffprobe / mpv 已经在 `tools\` 里（版本和来源见 `tools\README.txt`），不用另外下载。
 2. **运行 `HdrCastSender.exe`**，右上是 **Share with your group**。
 3. **Create group…**：起个组名和你的名字，邀请码自动复制到剪贴板。把它发到微信 / LINE / Discord 群里（**只发给信得过的人**：有码就能看）。
    朋友已经发过你邀请码的话，直接复制那条消息、点 **Paste invite**（或者打开 app 时它会自己提示）。
 4. 选显示器、码率、**Max viewers**（可以顺手填 *my upload*，你家上行 Mbps），点 **Start**。
-   状态栏 **Viewers** 一行显示谁在看、走 IPv6 还是 IPv4、往返延迟，以及当前需要的上行。
+   状态栏 **Viewers** 一行显示谁在看、走 IPv6 还是 IPv4、网络 ping（不是画面延迟）、每人的 SRT latency，以及当前需要的上行。
 
 ## 快速开始：看的人
 
 英文版给朋友看：[README.en.md](README.en.md)。
 
-1. **装 mpv**：双击 `scripts\get-tools.cmd viewer`（或 `get-tools.cmd`，两个都装）。
+1. **解压**发行包：mpv 已经在 `tools\` 里。
 2. **复制朋友发来的整条邀请消息**，打开 `HdrCastReceiver.exe`：会弹出"要加入这个组吗"，点是、填你的名字。没弹的话点 **Paste invite**。
 3. **Watch** 列表里是正在直播的朋友（每 10 秒刷新）。**Latency** 按你在哪选：日本 1500 / 澳洲 2000 / 中国 3500 ms。点 **Play**。
 4. 连不上时状态栏会直接说原因，比如"这台电脑没有 IPv6"或"主播没有 IPv6"。先去 <https://test-ipv6.com> 看看自己的 IPv6，见 [docs/faq.md](docs/faq.md)。
@@ -67,7 +68,9 @@
 | .NET Framework 4.8 | 两端 | Windows 自带 | 无需安装 |
 | Python 3 | 信令服务器 | Ubuntu 自带 | 只用标准库 |
 
-`scripts\get-tools.cmd` 一键下载 ffmpeg / mpv（`sender` / `viewer` / `both`，加 `force` 重新下载）；`scripts\check-tools.cmd` 检查编码器和 `srt://` 支持。
+发行包的 `tools\` 里已经带了上面的 ffmpeg（BtbN）和 mpv（zhongfly），`build.sh` 打包时从 `./tools`（或 `--tools DIR`）拷进去，
+先验证都支持 `srt://`；`--no-tools` 打不带工具的小包。`scripts\get-tools.cmd` 一键下载 / 更新 ffmpeg / mpv（`sender` / `viewer` / `both`，
+加 `force` 重新下载）；`scripts\check-tools.cmd` 检查编码器和 `srt://` 支持。
 
 ## 目录结构
 

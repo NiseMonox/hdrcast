@@ -65,6 +65,8 @@ namespace HdrCast.Sender.Gui
         ComboBox _audioDevice = null!;
         ComboBox _audioCodec = null!;
         NumericUpDown _audioBitrate = null!;
+        ComboBox _audioExclude = null!;
+        const string NoExclusion = "(none)";
 
         // group
         Label _groupName = null!;
@@ -74,6 +76,7 @@ namespace HdrCast.Sender.Gui
         NumericUpDown _maxViewers = null!;
         NumericUpDown _uploadMbps = null!;
         Label _uploadNeeded = null!;
+        FirewallRow _firewall = null!;
 
         // tools / controls
         TextBox _ffmpegPath = null!;
@@ -124,6 +127,7 @@ namespace HdrCast.Sender.Gui
             if (!string.IsNullOrEmpty(startupInvite))
                 Shown += (s, e) => { GroupConfig? next = InviteUi.Import(this, _group.Current, startupInvite!); if (next != null) SaveGroup(next); };
             Activated += (s, e) => { if (_group.RefreshIfChanged()) RefreshGroupUi(); };
+            Shown += (s, e) => _firewall.Refresh();
 
             _uiTimer = new System.Windows.Forms.Timer { Interval = 300 };
             _uiTimer.Tick += (s, e) => UiTick();
@@ -305,6 +309,33 @@ namespace HdrCast.Sender.Gui
             t.Controls.Add(Caption("Bitrate (kbps)"), 0, 3);
             t.Controls.Add(_audioBitrate, 1, 3);
 
+            // Parsec-style echo cancelling: the voice chat's own audio stays out of the stream.
+            _audioExclude = new ComboBox { Dock = DockStyle.Fill, DropDownStyle = ComboBoxStyle.DropDown };
+            _audioExclude.Items.Add(NoExclusion);
+            _audioExclude.DropDown += (s, e) => RefreshAudioApps();
+            _audioExclude.TextChanged += (s, e) =>
+            {
+                if (_suppressEvents) return;
+                string text = _audioExclude.Text.Trim();
+                _settings.AudioExcludeApp = text == NoExclusion ? "" : text;
+            };
+            t.Controls.Add(Caption("Leave out"), 0, 4);
+            t.Controls.Add(_audioExclude, 1, 4);
+            var excludeHint = new Label
+            {
+                Text = "A program whose sound is not sent, e.g. your voice chat (Discord.exe), so friends in the call do not " +
+                       "hear themselves. Everything it starts is left out too. Needs Windows 10 21H1 or newer.",
+                AutoSize = true, ForeColor = SystemColors.GrayText, Margin = new Padding(3, 0, 3, 3), MaximumSize = new Size(Font.Height * 30, 0),
+            };
+            t.Controls.Add(Caption(""), 0, 5);
+            t.Controls.Add(excludeHint, 1, 5);
+
+            // The Picture group beside this one is taller; without a filler row the last row took the extra height
+            // and its caption drifted below its box.
+            t.RowCount = 7;
+            for (int i = 0; i < 6; i++) t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            t.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
             g.Controls.Add(t);
             return g;
         }
@@ -349,6 +380,8 @@ namespace HdrCast.Sender.Gui
             AddRow(t, "Max viewers", Flow(_maxViewers, Caption("   my upload (Mbps, 0 = unknown)"), _uploadMbps));
             _uploadNeeded = new Label { AutoSize = true, Margin = new Padding(3, 3, 3, 3), MaximumSize = new Size(Font.Height * 30, 0) };
             AddRow(t, "", _uploadNeeded);
+            _firewall = new FirewallRow(this, "HdrCast Sender", OnRunnerLog);
+            AddRow(t, "Firewall", _firewall.Panel);
 
             g.Controls.Add(t);
             return g;
@@ -411,7 +444,9 @@ namespace HdrCast.Sender.Gui
             left.Controls.Add(browse, 2, 0);
             left.Controls.Add(_ffmpegFound, 3, 0);
 
-            var buttons = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight, Margin = new Padding(0) };
+            // No wrapping: in the AutoSize column the panel was measured one button wide, so at 150 % scaling Stop and
+            // Open logs wrapped onto rows the layout then clipped, and a running stream could only be ended by closing.
+            var buttons = new FlowLayoutPanel { AutoSize = true, WrapContents = false, FlowDirection = FlowDirection.LeftToRight, Margin = new Padding(0) };
             _start = new Button { Text = "Start", AutoSize = true, MinimumSize = new Size(Font.Height * 6, 0) };
             _start.Click += (s, e) => StartStream();
             _stop = new Button { Text = "Stop", AutoSize = true, MinimumSize = new Size(Font.Height * 6, 0), Enabled = false };
@@ -507,6 +542,7 @@ namespace HdrCast.Sender.Gui
                 SelectAudioDevice(_settings.AudioDevice);
                 _audioCodec.SelectedIndex = _settings.AudioCodec == AudioCodec.Opus ? 1 : 0;
                 _audioBitrate.Value = Clamp(_settings.AudioBitrateKbps, (int)_audioBitrate.Minimum, (int)_audioBitrate.Maximum);
+                _audioExclude.Text = _settings.AudioExcludeApp.Length == 0 ? NoExclusion : _settings.AudioExcludeApp;
 
                 _maxViewers.Value = Clamp(_settings.MaxViewers, 1, 16);
                 _uploadMbps.Value = Clamp(_settings.UploadMbps, 0, 100000);
@@ -623,6 +659,24 @@ namespace HdrCast.Sender.Gui
                 _audioDevice.Items.Add(parts.Length > 1 ? parts[1] : parts[0]);
             }
             _audioDevice.SelectedIndex = 0;
+            _suppressEvents = saved;
+        }
+
+        /// <summary>Fills the "Leave out" list with the programs that have audio right now (the text itself is kept).</summary>
+        void RefreshAudioApps()
+        {
+            string[] apps;
+            try { apps = AudioCapture.ListAudioApps(_settings.AudioDevice); }
+            catch (Exception) { apps = new string[0]; }
+            bool saved = _suppressEvents;
+            _suppressEvents = true;
+            string text = _audioExclude.Text;
+            _audioExclude.BeginUpdate();
+            _audioExclude.Items.Clear();
+            _audioExclude.Items.Add(NoExclusion);
+            foreach (string app in apps) _audioExclude.Items.Add(app);
+            _audioExclude.EndUpdate();
+            _audioExclude.Text = text;
             _suppressEvents = saved;
         }
 
@@ -754,10 +808,12 @@ namespace HdrCast.Sender.Gui
             SendPlan? plan = BuildPlan(false);
             if (plan == null) return;
             SaveSettings();
+            _firewall.OfferOnce("friends whose routers change ports (common in China) cannot connect to you.");
             AppendLog("[app] " + plan.Summary);
             // Viewers come and go through the group; the encoder keeps running for all of them, and a restarted
             // encoder is spliced into the same fan-out, so a session always restarts automatically.
             _ts = new SwitchableStream();
+            FirewallRow firewall = _firewall;
             _p2p = new P2pHost(new P2pHostOptions
             {
                 Group = _group.Current,
@@ -765,6 +821,7 @@ namespace HdrCast.Sender.Gui
                 BitrateBps = _settings.BitrateBps,
                 MaxViewers = _settings.MaxViewers,
                 Job = _job,
+                InboundAllowed = () => firewall.InboundAllowed,
             }, _ts, OnRunnerLog);
             try
             {
@@ -907,8 +964,11 @@ namespace HdrCast.Sender.Gui
                 {
                     List<ViewerInfo> viewers = host.Viewers;
                     string list = viewers.Count == 0 ? "nobody yet" : string.Join(",  ", viewers.ConvertAll(v =>
+                        // "ping" is the path's round trip; the picture itself trails by the viewer's SRT latency plus
+                        // its player buffer (about 3.5 s with the Japan preset), so say which number is which.
                         v.Name + (v.State == ViewerState.Watching
-                            ? " (" + (v.Ipv6 ? "IPv6" : "IPv4") + (v.RttMs >= 0 ? ", " + Math.Round(v.RttMs) + " ms" : "") + ")"
+                            ? " (" + (v.Ipv6 ? "IPv6" : "IPv4") + (v.RttMs >= 0 ? ", ping " + Math.Round(v.RttMs) + " ms" : "") +
+                              ", SRT latency " + (v.LatencyMs / 1000.0).ToString("0.#", CultureInfo.InvariantCulture) + " s)"
                             : " (connecting)")).ToArray());
                     _stViewers.Text = host.Status + "  |  " + list + (viewers.Count > 0 ? "  |  upload ≈ " + Math.Ceiling(host.UploadMbps) + " Mbps" : "");
                 }
@@ -939,6 +999,7 @@ namespace HdrCast.Sender.Gui
             _audioDevice.Enabled = !running && _settings.Audio;
             _audioCodec.Enabled = !running && _settings.Audio;
             _audioBitrate.Enabled = !running && _settings.Audio;
+            _audioExclude.Enabled = !running && _settings.Audio;
             _createGroup.Enabled = !running;
             _pasteInvite.Enabled = !running;
             _maxViewers.Enabled = !running;

@@ -97,12 +97,22 @@ namespace HdrCast.Group
         public int Mbps { get; set; }
         public int MaxViewers { get; set; }
         public int Viewers { get; set; }
+        /// <summary>
+        /// The host's IPv4 port takes packets from any address and port (router forward + firewall rule), so viewers
+        /// whose routers change ports can reach it. Null = not known yet, or a host older than 0.2.4.
+        /// </summary>
+        public bool? OpenIpv4 { get; set; }
 
-        public Dictionary<string, object?> ToPayload() => new Dictionary<string, object?>
+        public Dictionary<string, object?> ToPayload()
         {
-            ["v"] = 1, ["t"] = TimeMs, ["host"] = HostId, ["name"] = Name, ["since"] = SinceMs,
-            ["cands"] = Candidates.ToArray(), ["codec"] = Codec, ["mbps"] = Mbps, ["max"] = MaxViewers, ["viewers"] = Viewers,
-        };
+            var p = new Dictionary<string, object?>
+            {
+                ["v"] = 1, ["t"] = TimeMs, ["host"] = HostId, ["name"] = Name, ["since"] = SinceMs,
+                ["cands"] = Candidates.ToArray(), ["codec"] = Codec, ["mbps"] = Mbps, ["max"] = MaxViewers, ["viewers"] = Viewers,
+            };
+            if (OpenIpv4.HasValue) p["open4"] = OpenIpv4.Value;
+            return p;
+        }
 
         public static LiveRecord? FromPayload(Dictionary<string, object?> p, string expectedHost)
         {
@@ -117,6 +127,7 @@ namespace HdrCast.Group
                 Mbps = (int)(MiniJson.AsLong(MiniJson.Get(p, "mbps")) ?? 0),
                 MaxViewers = (int)(MiniJson.AsLong(MiniJson.Get(p, "max")) ?? 0),
                 Viewers = (int)(MiniJson.AsLong(MiniJson.Get(p, "viewers")) ?? 0),
+                OpenIpv4 = MiniJson.AsBool(MiniJson.Get(p, "open4")),
             };
             return r.HostId == expectedHost ? r : null;
         }

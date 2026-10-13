@@ -247,6 +247,53 @@ namespace HdrCast.Tests
             Assert.True(pad > 0);
             Assert.Equal(48000, a.WrittenFrames);
         }
+
+        [Theory]
+        [InlineData(62, 3, 0)]      // measured: NAudio's loopback capture calls back every ~62 ms with ~62 ms of audio
+        [InlineData(62, 3, 25)]     // the same, delivered late
+        [InlineData(100, 30, 0)]    // a slower, busier machine
+        [InlineData(10, 5, 0)]      // event-driven capture
+        public void Bursty_loopback_audio_passes_through_untouched(int periodMs, int jitterMs, int lateMs)
+        {
+            // v0.2.1 on Windows: WASAPI loopback hands audio over in bursts while the pipe writer checks every 20 ms
+            // whether the stream fell behind the video clock. With a 20 ms tolerance the writer padded ~40 ms of
+            // silence between two bursts and the next burst lost ~40 ms to the "ahead" check: a third of the audio
+            // survived, in slivers 16 times a second, which viewers heard as a low buzz.
+            Assert.Equal((0L, 0L), ReplayLoopback(new AudioClockAligner(48000), periodMs, jitterMs, lateMs));
+        }
+
+        [Fact]
+        public void The_old_tolerance_chopped_bursty_audio()
+        {
+            (long padded, long dropped) = ReplayLoopback(new AudioClockAligner(48000, 20), 62, 3, 0);
+            Assert.True(padded > 48000 * 5 && dropped > 48000 * 5, "padded " + padded + ", dropped " + dropped);
+        }
+
+        /// <summary>20 s of loopback capture delivered every <paramref name="periodMs"/> (+ jitter) and <paramref name="lateMs"/>
+        /// late, with the pipe writer's idle check every 20 ms in between. Returns the silence padded and the audio dropped, in frames.</summary>
+        static (long padded, long dropped) ReplayLoopback(AudioClockAligner a, int periodMs, int jitterMs, int lateMs)
+        {
+            var rng = new Random(1);
+            long captured = 0, nextCapture = periodMs, padded = 0, dropped = 0;
+            for (long ms = 1; ms <= 20_000; ms++)
+            {
+                long expected = a.ExpectedFrames(ms, 1000);
+                if (ms >= nextCapture)
+                {
+                    long available = Math.Max(0, ms - lateMs) * 48;  // the endpoint renders continuously
+                    AudioAlignment r = a.Align(expected, (int)(available - captured));
+                    captured = available;
+                    padded += r.PadFrames;
+                    dropped += r.DropFrames;
+                    nextCapture = ms + periodMs + rng.Next(jitterMs + 1);
+                }
+                else if (ms % 20 == 0)
+                {
+                    padded += a.PadIfBehind(expected);                // the writer found nothing to send
+                }
+            }
+            return (padded, dropped);
+        }
     }
 
     public class CaptureArgsTests
@@ -311,6 +358,17 @@ namespace HdrCast.Tests
         }
 
         [Fact]
+        public void The_app_to_leave_out_survives_the_round_trip_to_the_engine()
+        {
+            CaptureArgs a = CaptureArgs.Parse(new[] { "--output", "0", "--audio-exclude", "discord" });
+            Assert.Equal("discord.exe", a.AudioExclude);
+            Assert.Equal("discord.exe", CaptureArgs.Parse(a.ToArgv()).AudioExclude);
+            Assert.Throws<CaptureArgsException>(() => CaptureArgs.Parse(new[] { "--output", "0", "--audio-exclude", " " }));
+            Assert.DoesNotContain("--audio-exclude", CaptureArgs.Parse(new[] { "--output", "0" }).ToArgv());
+        }
+
+
+        [Fact]
         public void Argv_round_trip_is_stable()
         {
             var original = new CaptureArgs
@@ -329,6 +387,49 @@ namespace HdrCast.Tests
             Assert.Equal(original.VideoPipe, again.VideoPipe);
             Assert.Equal(original.AudioDevice, again.AudioDevice);
             Assert.Equal(original.ParentPid, again.ParentPid);
+        }
+    }
+
+    public class AppAudioTargetTests
+    {
+        [Theory]
+        [InlineData("Discord.exe", "Discord.exe")]
+        [InlineData(" discord ", "discord.exe")]
+        [InlineData(@"C:\Users\me\AppData\Local\Discord\app-1.0.9\Discord.exe", "Discord.exe")]
+        [InlineData("\"QQ.exe\"", "QQ.exe")]
+        [InlineData("", "")]
+        [InlineData(null, "")]
+        [InlineData("a<b", "")]
+        public void Names_are_reduced_to_an_exe_file_name(string? input, string expected)
+        {
+            Assert.Equal(expected, AppAudioTarget.NormalizeExeName(input));
+        }
+
+        [Fact]
+        public void The_whole_app_is_left_out_through_its_topmost_process()
+        {
+            // Discord: the main process starts helpers with the same name, one of which plays the audio.
+            var ps = new[]
+            {
+                new ProcessEntry(4, 0, "System"),
+                new ProcessEntry(50, 4, "explorer.exe"),
+                new ProcessEntry(100, 50, "Discord.exe"),
+                new ProcessEntry(101, 100, "Discord.exe"),
+                new ProcessEntry(102, 100, "Discord.exe"),
+                new ProcessEntry(103, 101, "Discord.exe"),
+                new ProcessEntry(200, 999, "Discord.exe"),       // a stray one whose parent is gone
+            };
+            Assert.Equal(100, AppAudioTarget.FindRoot(ps, "discord.exe"));
+            Assert.Equal(0, AppAudioTarget.FindRoot(ps, "QQ.exe"));
+            Assert.Equal(0, AppAudioTarget.FindRoot(ps, ""));
+        }
+
+        [Fact]
+        public void Reused_parent_ids_cannot_make_the_walk_loop()
+        {
+            var ps = new[] { new ProcessEntry(5, 6, "a.exe"), new ProcessEntry(6, 5, "a.exe"), new ProcessEntry(7, 7, "a.exe") };
+            int root = AppAudioTarget.FindRoot(ps, "a.exe");
+            Assert.Contains(root, new[] { 5, 6, 7 });
         }
     }
 

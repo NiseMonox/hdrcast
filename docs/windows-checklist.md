@@ -7,7 +7,8 @@ Linux 这边能验证的（`dotnet build` / `dotnet test`，含真 ffmpeg + 真�
 ## 0. 准备
 
 - [ ] Windows HDR 已打开（`Win + Alt + B`，或 设置 → 显示 → 使用 HDR）。
-- [ ] **工具一键装**：双击 `scripts\get-tools.cmd`（两个都装）。它下载 BtbN 的 ffmpeg win64-gpl（含 nvenc/amf/qsv、libsrt、libplacebo、ddagrab）和 zhongfly 的 mpv（含 libsrt）到 `HdrCast\tools\`，装完自己验证 srt 支持并列出可用编码器。已经装过会跳过，`get-tools.cmd force` 强制重下。
+- [ ] **工具**：发行包的 `tools\` 里已带 BtbN 的 ffmpeg win64-gpl（含 nvenc/amf/qsv、libsrt、libplacebo、ddagrab）和 zhongfly 的 mpv（含 libsrt），版本见 `tools\README.txt`。
+  用 `--no-tools` 打的小包才需要双击 `scripts\get-tools.cmd`（两个都装）：它下载到 `HdrCast\tools\`，装完自己验证 srt 支持并列出可用编码器。已经装过会跳过，`get-tools.cmd force` 强制重下。
 - [ ] 手动装（脚本失败时）：ffmpeg 取 <https://www.gyan.dev/ffmpeg/builds/> 的 **release full**，mpv 取 <https://github.com/zhongfly/mpv-winbuild/releases> 的 `mpv-x86_64-*.7z`，把 `ffmpeg.exe` / `ffprobe.exe` / `mpv.exe` 放进 `HdrCast\tools\`。
 - [ ] .NET Framework 4.8 是 Windows 10 1903+/11 自带的，不用装。
 - [ ] 信令服务器在线（已部署在腾讯云）：浏览器打开 <http://101.43.23.94:18650/v1/health> 显示 `{"ok":true,"v":1}`。
@@ -86,7 +87,14 @@ idx  device         name                      size        pos          hz     hd
       日志里的地址那一行 SuffixOrigin 应为 **Link**（不是 Random = 临时地址）。
 - [ ] 信令服务器的 UDP 18651 放行后，日志还有 `[p2p] public IPv4 mapping: …`（没有也不影响 IPv6）。
 - [ ] 状态栏 **Viewers**：`Live in "…" - 0 viewers | nobody yet`。
-- [ ] 第一次 Start 可能弹 Windows 防火墙"允许访问"：**先点取消**，看观众还能不能连上（记录结果：打洞理论上不需要放行），再点允许。
+- [ ] 发送端 **Share with your group** 里的 **Firewall** 一栏：新版本目录第一次打开是橙色 `Only replies get in…` 加带盾牌的 **Allow…**。
+      第一次 Start 程序会问一次是否放行 → 是 → Windows UAC 确认 → 变成灰色 `Friends can reach this PC through Windows Firewall.`；
+      Windows 防火墙高级设置的入站规则里多了 "HdrCast Sender"（程序 = 这个 exe，UDP，所有配置文件）。点否的话本次不再问，按钮还在。
+- [ ] 开播几秒内日志有 `[p2p] router: UDP NNNNN forwarded to this PC (XG-100NE, internet address …:NNNNN)`；
+      Stop 后有 `[p2p] router: forward of UDP NNNNN removed`（路由器 UPnP 页面里 HdrCast 那条也消失）。
+      路由器关了 UPnP 时是 `could not forward UDP … no UPnP router answered`，状态栏说明 IPv4 没打开缺什么。
+- [ ] 没有 IPv6 的朋友（对称型 NAT，例如江苏电信）Play：主播日志 `connected via IPv4 …:端口 (a port their router picked for this PC …)`。
+- [ ] 反过来让这位朋友开播、这边看（这边接收端的 Firewall 也要 Allow）：接收端日志 `connected to … (a port the host's router picked …)`。
 - [ ] 接收端 **Watch** 列表 10 s 内出现主播 → **Play** → 状态 `Connected to …（IPv6 [2400:…]:NNNNN, N ms）` → mpv 出画面；
       发送端 **Viewers** 显示这位观众（IPv6 / RTT）。
 - [ ] **外网**：笔记本连手机热点（确认 test-ipv6.com 有 IPv6），不改任何路由器设置，Play 能连上。这是打洞穿过家里路由器

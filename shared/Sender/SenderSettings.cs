@@ -56,6 +56,8 @@ namespace HdrCast.Sender.Model
         [DataMember(Name = "audioDevice", Order = 21)] public string AudioDevice { get; set; } = "default";
         [DataMember(Name = "audioCodec", Order = 22)] public AudioCodec AudioCodec { get; set; }
         [DataMember(Name = "audioBitrateKbps", Order = 23)] public int AudioBitrateKbps { get; set; }
+        /// <summary>Program whose audio is left out of the stream, e.g. the voice chat ("" = none).</summary>
+        [DataMember(Name = "audioExcludeApp", Order = 24)] public string AudioExcludeApp { get; set; } = "";
 
         // ---- group ----
         // The SRT settings of each viewer (latency, overhead, passphrase) come from the group key and that viewer's
@@ -89,6 +91,7 @@ namespace HdrCast.Sender.Model
             AudioDevice = "default";
             AudioCodec = AudioCodec.Aac;
             AudioBitrateKbps = 192;
+            AudioExcludeApp = "";
 
             MaxViewers = 4;
             UploadMbps = 0;
@@ -114,6 +117,7 @@ namespace HdrCast.Sender.Model
             if (AudioBitrateKbps < 32) AudioBitrateKbps = 32;
             if (AudioBitrateKbps > 512) AudioBitrateKbps = 512;
             if (string.IsNullOrWhiteSpace(AudioDevice)) AudioDevice = "default";
+            AudioExcludeApp = AppAudioTarget.NormalizeExeName(AudioExcludeApp);
             // 1, 3 and 6 were the AV1 encoders in older files
             if (!Enum.IsDefined(typeof(VideoEncoder), Encoder)) Encoder = VideoEncoder.HevcNvenc;
             if (MaxViewers < 1) MaxViewers = 1;
@@ -203,6 +207,7 @@ namespace HdrCast.Sender.Model
                 AudioPipe = audioPipe,
                 Audio = Audio,
                 AudioDevice = AudioDevice,
+                AudioExclude = AppAudioTarget.NormalizeExeName(AudioExcludeApp),
                 ParentPid = parentPid,
             };
         }

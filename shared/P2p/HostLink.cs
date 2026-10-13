@@ -15,6 +15,8 @@ namespace HdrCast.P2p
         public string Reason { get; set; } = "";
         public string Path { get; set; } = "";
         public bool PathIsIpv6 { get; set; }
+        /// <summary>The path is an address the viewer never advertised: its router picked a new port for this PC.</summary>
+        public bool PathLearned { get; set; }
         public double RttMs { get; set; }
         public long BytesToViewer { get; set; }
     }
@@ -218,6 +220,7 @@ namespace HdrCast.P2p
                 Reason = e.Session.Reason,
                 Path = path == null ? "" : Endpoint.Format(path),
                 PathIsIpv6 = path != null && path.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6,
+                PathLearned = path != null && !e.Session.IsAdvertised(path),
                 RttMs = e.Session.RttMs,
                 BytesToViewer = System.Threading.Interlocked.Read(ref e.BytesToViewer),
             };

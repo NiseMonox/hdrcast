@@ -227,14 +227,29 @@ namespace HdrCast.Sender
                 bool all = true;
                 foreach (string name in plan.PipeNames)
                 {
-                    // Named pipes show up as entries of the \\.\pipe\ pseudo-directory; File.Exists is the
-                    // cheapest way to ask, and it is false on any platform without them.
-                    if (!File.Exists(@"\\.\pipe\" + name)) { all = false; break; }
+                    if (!PipeListening(name)) { all = false; break; }
                 }
                 if (all) return true;
                 Thread.Sleep(50);
             }
             return false;
+        }
+
+        /// <summary>
+        /// True once the engine's pipe exists and waits for a client. Never File.Exists: querying the attributes of
+        /// \\.\pipe\name is itself a client connection. It takes the only instance, so ffmpeg then gets ERROR_PIPE_BUSY
+        /// (reported as "Error opening input: Invalid argument") and the engine's writes fail with "Pipe is broken".
+        /// </summary>
+        static bool PipeListening(string name)
+        {
+            try
+            {
+                return Capture.NativeMethods.WaitNamedPipeW(@"\\.\pipe\" + name, 1);
+            }
+            catch (Exception)
+            {
+                return false;   // not Windows
+            }
         }
 
         void OnCaptureStats(int gen, string line)
@@ -339,8 +354,10 @@ namespace HdrCast.Sender
         {
             // Single choke point for the log: ffmpeg echoes the srt:// URL on failure, passphrase included.
             line = SecretRedactor.Redact(line);
-            SenderLog.Write(line);
-            LogLine?.Invoke(line);
+            // The window's LogLine handler writes the file (it also logs the P2P host); writing here too put every
+            // [run] / [capture] / [ffmpeg] line in the log twice.
+            if (LogLine != null) LogLine(line);
+            else SenderLog.Write(line);
         }
     }
 }

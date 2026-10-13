@@ -1,5 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
+using System.Text;
+using HdrCast.Capture;
 using HdrCast.Common;
 using HdrCast.Receiver;
 using Xunit;
@@ -181,8 +186,109 @@ namespace HdrCast.Tests
             // The GUIs create one unconditionally; on Linux (where the tests run) it must degrade quietly.
             using (var job = new ProcessJob())
             {
+                // On Windows the job is real (KILL_ON_JOB_CLOSE): assigning the test host would kill it on Dispose.
+                if (OperatingSystem.IsWindows()) return;
                 Assert.False(job.Assign(System.Diagnostics.Process.GetCurrentProcess()) && !job.IsAvailable);
             }
+        }
+    }
+
+    public class NamedPipeProbeTests
+    {
+        [Fact]
+        public void Named_pipes_are_never_probed_by_opening_them()
+        {
+            // v0.2.0 on Windows: the runner polled File.Exists(@"\\.\pipe\...") before starting ffmpeg. Asking a pipe
+            // for its attributes connects to it, so the probe took the engine's only instance: ffmpeg got
+            // ERROR_PIPE_BUSY ("Error opening input: Invalid argument") on every start and nothing was ever encoded.
+            string root = PackagingTests.RepoRoot();
+            if (root.Length == 0) return;
+            string[] opens = { "File.Exists(", "File.GetAttributes(", "new FileInfo(", "Directory.Exists(" };
+            var offenders = new List<string>();
+            foreach (string dir in new[] { "sender", "receiver", "shared" })
+            {
+                foreach (string file in Directory.GetFiles(Path.Combine(root, dir), "*.cs", SearchOption.AllDirectories))
+                {
+                    string rel = file.Substring(root.Length + 1);
+                    if (rel.Contains("/obj/") || rel.Contains("/bin/")) continue;
+                    string[] lines = File.ReadAllLines(file);
+                    for (int i = 0; i < lines.Length; i++)
+                    {
+                        string code = lines[i].Trim();
+                        if (code.StartsWith("//", StringComparison.Ordinal)) continue;
+                        if (code.IndexOf("pipe", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                        foreach (string open in opens)
+                            if (code.Contains(open)) offenders.Add(rel + ":" + (i + 1) + ": " + code);
+                    }
+                }
+            }
+            Assert.Empty(offenders);
+        }
+    }
+
+    public class ShaderSourceTests
+    {
+        /// <summary>
+        /// 0.2.2 on Chinese Windows: "hdrcast_convert.hlsl(187,6): error X3000: syntax error: unexpected end of file".
+        /// SharpDX's Compile(string) converts the source to the ANSI code page but passes the UTF-16 length. Comments
+        /// held a section sign and two em dashes, two bytes each in GBK and Big5, so the last 3 bytes of the shader
+        /// (its closing brace) never reached the compiler. Japanese Windows only lost the final newline.
+        /// </summary>
+        [Fact]
+        public void The_shader_source_is_plain_ascii()
+        {
+            string source = ConvertShaderSource.Source;
+            for (int i = 0; i < source.Length; i++)
+                Assert.True(source[i] < 128, "non-ASCII U+" + ((int)source[i]).ToString("X4") + " at offset " + i);
+            Assert.Equal(source.Length, ConvertShaderSource.SourceBytes().Length);
+        }
+
+        [Fact]
+        public void The_shader_compiles_whatever_the_ansi_code_page()
+        {
+            if (!OperatingSystem.IsWindows()) return;           // d3dcompiler_47 ships with Windows
+            Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+            string source = ConvertShaderSource.Source;
+            var failures = new List<string>();
+            foreach (int codePage in new[] { 1252, 932, 936, 950, 949, 65001 })
+            {
+                // what SharpDX's string overload hands the compiler: the ANSI bytes, cut to the UTF-16 length
+                byte[] ansi = Encoding.GetEncoding(codePage, EncoderFallback.ReplacementFallback, DecoderFallback.ReplacementFallback)
+                                      .GetBytes(source);
+                byte[] seen = new byte[Math.Min(ansi.Length, source.Length)];
+                Array.Copy(ansi, seen, seen.Length);
+                foreach (string entry in new[] { ConvertShaderSource.EntryP010, ConvertShaderSource.EntryNv12 })
+                {
+                    string? error = Compile(seen, entry);
+                    if (error != null) failures.Add("code page " + codePage + ", " + entry + ": " + error);
+                }
+            }
+            Assert.Empty(failures);
+        }
+
+        [ComImport, Guid("8BA5FB08-5195-40e2-AC58-0D989C3A0102"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        interface ID3DBlob
+        {
+            [PreserveSig] IntPtr GetBufferPointer();
+            [PreserveSig] UIntPtr GetBufferSize();
+        }
+
+        [DllImport("d3dcompiler_47.dll", CharSet = CharSet.Ansi)]
+        static extern int D3DCompile(byte[] source, UIntPtr size, string name, IntPtr defines, IntPtr include,
+                                     string entry, string target, uint flags1, uint flags2,
+                                     out ID3DBlob? code, out ID3DBlob? errors);
+
+        /// <summary>Null when it compiles (same profile and optimisation level as the sender), else the compiler's message.</summary>
+        [SupportedOSPlatform("windows")]
+        static string? Compile(byte[] source, string entry)
+        {
+            const uint OptimizationLevel3 = 1u << 15;
+            int hr = D3DCompile(source, (UIntPtr)source.Length, "hdrcast_convert.hlsl", IntPtr.Zero, IntPtr.Zero,
+                                entry, ConvertShaderSource.Profile, OptimizationLevel3, 0, out ID3DBlob? code, out ID3DBlob? errors);
+            string message = errors == null ? "" : Marshal.PtrToStringAnsi(errors.GetBufferPointer(), (int)errors.GetBufferSize()) ?? "";
+            if (code != null) Marshal.ReleaseComObject(code);
+            if (errors != null) Marshal.ReleaseComObject(errors);
+            return hr >= 0 ? null : "0x" + hr.ToString("X8") + " " + message.Trim('\0', '\r', '\n', ' ');
         }
     }
 }

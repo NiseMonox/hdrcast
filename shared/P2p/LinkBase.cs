@@ -35,9 +35,13 @@ namespace HdrCast.P2p
     {
         protected readonly GroupKeys Keys;
         protected readonly object Sync = new object();
+        public const string SourceEcho = "echo";
+        public const string SourceRouter = "router";
+
         readonly UdpChannel? _v6;
         readonly UdpChannel? _v4;
         readonly List<string> _candidates = new List<string>();
+        readonly List<KeyValuePair<string, string>> _learned = new List<KeyValuePair<string, string>>();
         readonly Thread _ticker;
         volatile bool _disposed;
 
@@ -76,17 +80,37 @@ namespace HdrCast.P2p
         public int? Ipv4Port => _v4?.LocalEndPoint.Port;
         public IPEndPoint? Ipv6EndPoint => _v6?.LocalEndPoint;
 
-        /// <summary>"[v6]:port" and "lan4:port" plus anything added with <see cref="AddCandidate"/>.</summary>
+        /// <summary>"[v6]:port" and "lan4:port", then the ones set with <see cref="SetCandidate"/> (duplicates once).</summary>
         public IList<string> Candidates
         {
-            get { lock (_candidates) return _candidates.ToArray(); }
+            get
+            {
+                lock (_candidates)
+                {
+                    var all = new List<string>(_candidates);
+                    foreach (KeyValuePair<string, string> kv in _learned)
+                        if (!all.Contains(kv.Value)) all.Add(kv.Value);
+                    return all.ToArray();
+                }
+            }
         }
 
-        /// <summary>Adds e.g. the public IPv4 mapping learned from the UDP echo.</summary>
-        public void AddCandidate(string candidate)
+        /// <summary>
+        /// Sets, replaces or (with null) removes the candidate one source vouches for: <see cref="SourceEcho"/> (the
+        /// public IPv4 mapping the UDP echo saw) or <see cref="SourceRouter"/> (the router's forward of our port).
+        /// </summary>
+        public void SetCandidate(string source, string? candidate)
         {
             lock (_candidates)
-                if (!_candidates.Contains(candidate)) _candidates.Add(candidate);
+            {
+                int i = _learned.FindIndex(kv => kv.Key == source);
+                if (candidate == null)
+                {
+                    if (i >= 0) _learned.RemoveAt(i);
+                }
+                else if (i >= 0) _learned[i] = new KeyValuePair<string, string>(source, candidate);
+                else _learned.Add(new KeyValuePair<string, string>(source, candidate));
+            }
         }
 
         public long WanBytesIn => (_v6?.BytesIn ?? 0) + (_v4?.BytesIn ?? 0);

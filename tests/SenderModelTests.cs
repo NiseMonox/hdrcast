@@ -212,6 +212,20 @@ namespace HdrCast.Tests
             Assert.Equal("192k", Value(a, "-b:a"));
         }
 
+        [Theory]
+        [InlineData(true)]
+        [InlineData(false)]
+        public void The_raw_video_input_itself_is_colour_tagged(bool hdr)
+        {
+            // Output-side tags alone let ffmpeg 7.1+ re-matrix the frames and drop transfer / primaries (v0.2.1).
+            List<string> a = FfmpegCommandBuilder.Build(Plan(hdr));
+            List<string> input = a.GetRange(0, a.IndexOf("-i"));
+            Assert.Equal(hdr ? "bt2020" : "bt709", Value(input, "-color_primaries"));
+            Assert.Equal(hdr ? "smpte2084" : "bt709", Value(input, "-color_trc"));
+            Assert.Equal(hdr ? "bt2020nc" : "bt709", Value(input, "-colorspace"));
+            Assert.Equal("tv", Value(input, "-color_range"));
+        }
+
         [Fact]
         public void Without_audio_there_is_only_one_input()
         {
@@ -382,6 +396,17 @@ namespace HdrCast.Tests
             Assert.Equal(VideoEncoder.HevcNvenc, s.Encoder);
             Assert.Equal(50, s.BitrateMbps);
             Assert.Empty(s.Validate());
+        }
+
+        [Fact]
+        public void The_app_to_leave_out_is_cleaned_up_and_reaches_the_engine()
+        {
+            var s = new SenderSettings { AudioExcludeApp = "  Discord " }.Normalize();
+            Assert.Equal("Discord.exe", s.AudioExcludeApp);
+            CaptureArgs a = s.ToCaptureArgs(new OutputInfo { Index = 0 }, 1920, 1080, CaptureFormat.P010, "v", "a", 1);
+            Assert.Equal("Discord.exe", a.AudioExclude);
+            Assert.Equal("", new SenderSettings().Normalize().AudioExcludeApp);
+            Assert.Equal("", Json.Deserialize<SenderSettings>("{\"audio\":true}")!.Normalize().AudioExcludeApp);   // older files
         }
 
         [Fact]

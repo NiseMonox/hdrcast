@@ -27,8 +27,16 @@ namespace HdrCast.Capture
         public const int Nv12GroupSize = 64;
         public const int Nv12GroupsX = 1024;
 
+        /// <summary>
+        /// The source as the compiler must get it. Never hand <see cref="Source"/> to SharpDX as a string: that overload
+        /// converts it to the system ANSI code page but passes the UTF-16 length, so every character that becomes two
+        /// bytes cuts one byte off the end. On Chinese Windows the shader lost its closing brace (0.2.2).
+        /// </summary>
+        public static byte[] SourceBytes() => System.Text.Encoding.UTF8.GetBytes(Source);
+
+        // ASCII only (see SourceBytes).
         public const string Source = @"
-// HdrCast desktop -> P010 / NV12 conversion (design.md §2.3). Generated from ConvertShaderSource.cs.
+// HdrCast desktop -> P010 / NV12 conversion (design.md section 2.3). Generated from ConvertShaderSource.cs.
 Texture2D<float4> srcTex     : register(t0);   // duplicated desktop: R16G16B16A16_FLOAT scRGB linear or B8G8R8A8_UNORM sRGB
 Texture2D<float4> cursorTex  : register(t1);   // BGRA8 straight-alpha cursor; a == 0 && r > 0.5 means 'invert desktop'
 SamplerState linearSampler   : register(s0);
@@ -102,7 +110,7 @@ float4 fetch_cursor(uint x, uint y)
     return cursorTex.SampleLevel(linearSampler, cu, 0);
 }
 
-// Pixel in linear scRGB (1.0 = sdrWhite nit) with the cursor composited — the HDR (P010) working space.
+// Pixel in linear scRGB (1.0 = sdrWhite nit) with the cursor composited - the HDR (P010) working space.
 float3 pixel_linear(uint x, uint y)
 {
     float4 s = fetch_src(x, y);
@@ -117,7 +125,7 @@ float3 pixel_linear(uint x, uint y)
     return lerp(c, kl, k.a);
 }
 
-// Pixel in sRGB-encoded [0,1] with the cursor composited — the SDR (NV12) working space.
+// Pixel in sRGB-encoded [0,1] with the cursor composited - the SDR (NV12) working space.
 float3 pixel_srgb(uint x, uint y)
 {
     float4 s = fetch_src(x, y);
