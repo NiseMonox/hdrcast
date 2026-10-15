@@ -54,6 +54,48 @@ impl FrameLayout {
     pub fn frame_bytes(&self) -> usize {
         crate::color::frame_bytes(self.format, self.width, self.height)
     }
+
+    /// The line the engine prints to stdout once the display is open and before it creates the pipes
+    /// (design.md section 2.2): what its consumer has to read from the video pipe, e.g.
+    /// `{"layout":{"format":"p010","width":3840,"height":2160}}`. With `--format auto` the backend chooses
+    /// (macOS falls back to nv12 when the system refuses HDR capture), so this is the only reliable answer.
+    pub fn to_json_line(&self) -> String {
+        // By hand, so the key order does not depend on serde_json's preserve_order feature.
+        format!(
+            r#"{{"layout":{{"format":"{}","width":{},"height":{}}}}}"#,
+            self.format.name(),
+            self.width,
+            self.height
+        )
+    }
+
+    /// Parses a [`to_json_line`](Self::to_json_line) line; `None` for anything else, the statistics lines
+    /// included.
+    pub fn try_parse(line: &str) -> Option<FrameLayout> {
+        let line = line.trim();
+        if !(line.starts_with('{') && line.contains("\"layout\"")) {
+            return None;
+        }
+        let value: serde_json::Value = serde_json::from_str(line).ok()?;
+        let layout = value.get("layout")?;
+        let format = match layout.get("format")?.as_str()? {
+            "p010" => CaptureFormat::P010,
+            "nv12" => CaptureFormat::Nv12,
+            _ => return None,
+        };
+        let size = |key: &str| {
+            layout
+                .get(key)?
+                .as_u64()
+                .and_then(|v| u32::try_from(v).ok())
+                .filter(|v| *v >= 2 && v % 2 == 0)
+        };
+        Some(FrameLayout {
+            format,
+            width: size("width")?,
+            height: size("height")?,
+        })
+    }
 }
 
 /// Outcome of one [`VideoSource::next_frame`] call.

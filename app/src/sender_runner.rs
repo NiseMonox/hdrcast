@@ -1,8 +1,10 @@
 //! Owns the capture engine and the encoder ffmpeg for one sharing session (docs/design.md §2.5, §2.7).
 //!
-//! The capture engine is started first (it is the pipe server); once both pipes listen, ffmpeg is started on
-//! them and its stdout, the MPEG-TS, is handed to the P2P fan-out. If either process exits the other is stopped
-//! and, when asked to, the pair is started again after a pause; viewers stay connected across that.
+//! The capture engine is started first (it is the pipe server). It says which frames it is going to send (its
+//! layout line: pixel format and size) before it creates the pipes; once both pipes listen, ffmpeg is started
+//! on them for exactly those frames and its stdout, the MPEG-TS, is handed to the P2P fan-out. If either
+//! process exits the other is stopped and, when asked to, the pair is started again after a pause; viewers
+//! stay connected across that.
 
 use std::path::PathBuf;
 use std::process::ChildStdout;
@@ -10,9 +12,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hdrcast_capture::CaptureStats;
+use hdrcast_capture::{CaptureFormat, CaptureStats, FrameLayout};
 use hdrcast_core::common::line_process::LineProcess;
 use hdrcast_core::common::process_job::ProcessJob;
+use hdrcast_media::sender::encoder_profiles;
+use hdrcast_media::sender::ffmpeg_command::{self, FfmpegPlan};
 use hdrcast_media::sender::ffmpeg_progress::{FfmpegProgress, FfmpegProgressParser};
 
 const RESTART_DELAY: Duration = Duration::from_millis(3000);
@@ -48,8 +52,9 @@ pub struct SendPlan {
     pub capture_exe: PathBuf,
     pub capture_argv: Vec<String>,
     pub ffmpeg_exe: PathBuf,
-    pub ffmpeg_argv: Vec<String>,
-    pub summary: String,
+    /// The encoder as planned from the display's state. Its pixel format, size and HDR flag give way to what
+    /// the engine announces ([`FfmpegPlan::for_frames`]) before ffmpeg is started.
+    pub ffmpeg: FfmpegPlan,
     /// Pipes the capture engine creates and ffmpeg opens; ffmpeg is not started until they listen.
     pub pipe_names: Vec<String>,
 }
@@ -63,6 +68,23 @@ pub struct RunnerSnapshot {
     pub uptime: Duration,
     pub capture: Option<CaptureStats>,
     pub progress: Option<FfmpegProgress>,
+    /// The frames the engine of the current attempt announced.
+    pub layout: Option<FrameLayout>,
+    /// The session was planned as HDR (the display was in HDR mode and HDR was not switched off).
+    pub planned_hdr: bool,
+}
+
+/// "HEVC (NVIDIA NVENC) 40 Mbps 3840x2160@60 HDR10": what is being sent, for the log.
+pub fn summary(plan: &FfmpegPlan) -> String {
+    format!(
+        "{} {} Mbps {}x{}@{} {}",
+        encoder_profiles::info(plan.encoder.encoder).display_name,
+        plan.encoder.bitrate_kbps / 1000,
+        plan.width,
+        plan.height,
+        plan.fps,
+        if plan.pixel_format == CaptureFormat::P010 { "HDR10" } else { "SDR" }
+    )
 }
 
 type LogFn = Arc<dyn Fn(&str) + Send + Sync>;
@@ -85,6 +107,8 @@ struct Gate {
     capture_stats: Option<CaptureStats>,
     progress: Option<FfmpegProgress>,
     parser: FfmpegProgressParser,
+    /// What the engine of the current generation announced; `None` until it did.
+    layout: Option<FrameLayout>,
 }
 
 struct Shared {
@@ -117,6 +141,7 @@ impl SenderRunner {
             capture_stats: None,
             progress: None,
             parser: FfmpegProgressParser::new(),
+            layout: None,
         };
         Self { shared: Arc::new(Shared { gate: Mutex::new(gate), job, log, ts_started }) }
     }
@@ -131,6 +156,8 @@ impl SenderRunner {
             uptime: if running { g.started.map(|t| t.elapsed()).unwrap_or_default() } else { Duration::ZERO },
             capture: g.capture_stats,
             progress: g.progress.clone(),
+            layout: g.layout,
+            planned_hdr: g.plan.as_ref().is_some_and(|p| p.ffmpeg.encoder.hdr),
         }
     }
 
@@ -182,12 +209,14 @@ impl SenderRunner {
     }
 }
 
-enum PipeWait {
-    Ready,
+enum EngineWait {
+    /// The engine announced its frames and both pipes listen.
+    Ready(FrameLayout),
     /// The session was stopped or replaced meanwhile.
     Cancelled,
     EngineExited,
-    TimedOut,
+    /// Carries what was missing, for the log.
+    TimedOut(String),
 }
 
 impl Shared {
@@ -221,6 +250,7 @@ impl Shared {
             }
             g.generation += 1;
             g.attempt += 1;
+            g.layout = None;
             (plan, g.generation, g.attempt)
         };
         let text = if attempt == 1 { "Starting…".to_string() } else { format!("Restarting (attempt {attempt})…") };
@@ -229,29 +259,14 @@ impl Shared {
         let mut capture = LineProcess::new(&plan.capture_exe, &plan.capture_argv);
         capture.job(Some(self.job.clone()));
         let me = self.clone();
-        capture.on_stdout_line(move |line| me.on_capture_stats(gen, line));
+        capture.on_stdout_line(move |line| me.on_capture_line(gen, line));
         let me = self.clone();
         capture.on_stderr_line(move |line| me.emit(&format!("[capture] {line}")));
         let me = self.clone();
         capture.on_exited(move |code| me.on_capture_exited(gen, code));
 
-        let mut ffmpeg = LineProcess::new(&plan.ffmpeg_exe, &plan.ffmpeg_argv);
-        // stdout is the stream itself; -progress shares stderr with ffmpeg's log messages
-        ffmpeg.job(Some(self.job.clone())).read_stdout_lines(false);
-        let me = self.clone();
-        ffmpeg.on_stderr_line(move |line| {
-            if FfmpegProgressParser::is_progress_line(line) {
-                me.on_ffmpeg_progress(gen, line);
-            } else {
-                me.emit(&format!("[ffmpeg] {line}"));
-            }
-        });
-        let me = self.clone();
-        ffmpeg.on_exited(move |code| me.on_ffmpeg_exited(gen, code));
-
         // The logged command lines have the passphrase masked: the log folder is meant to be shareable.
         self.emit(&format!("[run] {}", capture.safe_command_line()));
-        self.emit(&format!("[run] {}", ffmpeg.safe_command_line()));
 
         if let Err(e) = capture.start() {
             self.emit(&format!("[run] failed to start: {e}"));
@@ -265,25 +280,55 @@ impl Shared {
         }
 
         self.set_state(RunnerState::Starting, "Waiting for the capture engine…");
-        match self.wait_for_pipes(&plan, &capture, gen) {
-            PipeWait::Ready => {}
-            PipeWait::Cancelled => return,
+        let layout = match self.wait_for_engine(&plan, &capture, gen) {
+            EngineWait::Ready(layout) => layout,
+            EngineWait::Cancelled => return,
             // its exit callback reports why and restarts
-            PipeWait::EngineExited => return,
-            PipeWait::TimedOut => {
-                let why = format!("the capture engine did not open its pipes within {} s", PIPE_WAIT.as_secs());
+            EngineWait::EngineExited => return,
+            EngineWait::TimedOut(why) => {
                 self.emit(&format!("[run] {why}"));
                 // stopping it runs its exit callback, which restarts the session when that is wanted
                 capture.stop();
                 return;
             }
+        };
+
+        // ffmpeg reads what the engine announced, not what was planned: with `--format auto` the engine chose,
+        // and a Mac whose system refuses HDR capture sends SDR from a display in HDR mode.
+        let encode = plan.ffmpeg.for_frames(layout);
+        let argv = match ffmpeg_command::build(&encode) {
+            Ok(argv) => argv,
+            Err(e) => {
+                self.emit(&format!("[run] cannot encode {} {}x{}: {e}", layout.format, layout.width, layout.height));
+                self.give_up(gen, &capture, &format!("cannot encode these frames: {e}"));
+                return;
+            }
+        };
+        self.emit(&format!("[run] sending {}", summary(&encode)));
+        if plan.ffmpeg.encoder.hdr && !encode.encoder.hdr {
+            self.emit(
+                "[run] the display is in HDR mode, but it could not be captured as HDR here (the capture lines above say why): sending SDR",
+            );
         }
+
+        let mut ffmpeg = LineProcess::new(&plan.ffmpeg_exe, &argv);
+        // stdout is the stream itself; -progress shares stderr with ffmpeg's log messages
+        ffmpeg.job(Some(self.job.clone())).read_stdout_lines(false);
+        let me = self.clone();
+        ffmpeg.on_stderr_line(move |line| {
+            if FfmpegProgressParser::is_progress_line(line) {
+                me.on_ffmpeg_progress(gen, line);
+            } else {
+                me.emit(&format!("[ffmpeg] {line}"));
+            }
+        });
+        let me = self.clone();
+        ffmpeg.on_exited(move |code| me.on_ffmpeg_exited(gen, code));
+        self.emit(&format!("[run] {}", ffmpeg.safe_command_line()));
 
         if let Err(e) = ffmpeg.start() {
             self.emit(&format!("[run] failed to start: {e}"));
-            self.gate.lock().unwrap().auto_restart = false;
-            capture.stop();
-            self.fail(gen, &format!("could not start: {e}"));
+            self.give_up(gen, &capture, &format!("could not start: {e}"));
             return;
         }
         let ffmpeg = Arc::new(ffmpeg);
@@ -313,30 +358,44 @@ impl Shared {
         true
     }
 
-    /// Polls for the engine's pipes. Never by looking at the pipe as a file: on Windows, querying the attributes
-    /// of `\\.\pipe\name` is itself a client connection; it takes the only instance, ffmpeg then gets
-    /// ERROR_PIPE_BUSY ("Error opening input: Invalid argument") and the engine's writes fail.
-    fn wait_for_pipes(&self, plan: &SendPlan, capture: &LineProcess, gen: u64) -> PipeWait {
-        if plan.pipe_names.is_empty() {
-            return PipeWait::Ready;
-        }
+    /// Polls for the engine's layout line and its pipes; the engine prints the line before it creates the
+    /// pipes. Never looks at a pipe as a file: on Windows, querying the attributes of `\\.\pipe\name` is itself
+    /// a client connection; it takes the only instance, ffmpeg then gets ERROR_PIPE_BUSY ("Error opening
+    /// input: Invalid argument") and the engine's writes fail.
+    fn wait_for_engine(&self, plan: &SendPlan, capture: &LineProcess, gen: u64) -> EngineWait {
         let begun = Instant::now();
         while begun.elapsed() < PIPE_WAIT {
             if !self.current(gen) {
-                return PipeWait::Cancelled;
+                return EngineWait::Cancelled;
             }
             if capture.has_exited() {
-                return PipeWait::EngineExited;
+                return EngineWait::EngineExited;
             }
-            if plan.pipe_names.iter().all(|name| hdrcast_capture::pipe_listening(name)) {
-                return PipeWait::Ready;
+            let layout = self.gate.lock().unwrap().layout;
+            if let Some(layout) = layout {
+                if plan.pipe_names.iter().all(|name| hdrcast_capture::pipe_listening(name)) {
+                    return EngineWait::Ready(layout);
+                }
             }
             thread::sleep(Duration::from_millis(50));
         }
-        PipeWait::TimedOut
+        let missing = if self.gate.lock().unwrap().layout.is_some() {
+            "did not open its pipes"
+        } else {
+            "did not say which frames it sends"
+        };
+        EngineWait::TimedOut(format!("the capture engine {missing} within {} s", PIPE_WAIT.as_secs()))
     }
 
-    fn on_capture_stats(&self, gen: u64, line: &str) {
+    /// One line of the engine's stdout: its layout (once), then statistics every second.
+    fn on_capture_line(&self, gen: u64, line: &str) {
+        if let Some(layout) = FrameLayout::try_parse(line) {
+            let mut g = self.gate.lock().unwrap();
+            if gen == g.generation {
+                g.layout = Some(layout);
+            }
+            return;
+        }
         match CaptureStats::try_parse(line) {
             Some(stats) => {
                 let mut g = self.gate.lock().unwrap();
@@ -346,6 +405,23 @@ impl Shared {
             }
             None => self.emit(&format!("[capture] {line}")),
         }
+    }
+
+    /// Ends the session after the engine of `gen` was started, for a reason a restart would not change. The
+    /// engine's exit is marked as dealt with first: its exit callback (on another thread, after the kill) would
+    /// otherwise put its own reason over `why`.
+    fn give_up(&self, gen: u64, capture: &LineProcess, why: &str) {
+        {
+            let mut g = self.gate.lock().unwrap();
+            // A stop or a newer launch has taken this engine over (and stops it).
+            if gen != g.generation || g.user_stopped {
+                return;
+            }
+            g.exit_handled = gen;
+            g.capture = None;
+        }
+        capture.stop();
+        self.fail(gen, why);
     }
 
     fn on_ffmpeg_progress(&self, gen: u64, line: &str) {

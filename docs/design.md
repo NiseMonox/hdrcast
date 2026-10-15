@@ -62,7 +62,7 @@ ffmpeg（7.1 与 master）的 mpegts 封装器**不支持 AV1-in-MPEG-TS**（本
 | `HdrCast hdrcast:…` | 应用，启动后提示加入这条邀请 |
 | `HdrCast list-outputs [--json]` | 枚举显示器：索引、设备名（Windows `\\.\DISPLAYn`，macOS 是 `CGDirectDisplayID`）、友好名、分辨率、刷新率、HDR 是否开启（Windows：`DXGI_OUTPUT_DESC1.ColorSpace == RGB_FULL_G2084_NONE_P2020`）、MaxLuminance |
 | `HdrCast audio-devices` | 列出音频输出端点（Windows） |
-| `HdrCast capture <参数>` | 采集引擎（无窗口，stdout 写 JSON 统计，stderr 写日志）。应用把自己当子进程这样启动 |
+| `HdrCast capture <参数>` | 采集引擎（无窗口，stdout 先写一行帧格式、再每秒写 JSON 统计，stderr 写日志）。应用把自己当子进程这样启动 |
 | `HdrCast firewall-allow` | 加 Windows 防火墙入站规则后退出；由界面的 **放行…** 以管理员身份启动（§8.7） |
 
 `main` 先把参数交给 `hdrcast_capture::cli_main`，是引擎模式就直接跑完退出，不创建窗口。Windows 的发行版是窗口子系统程序：
@@ -73,7 +73,7 @@ ffmpeg（7.1 与 master）的 mpegts 封装器**不支持 AV1-in-MPEG-TS**（本
 ```
 capture --output <idx>           DXGI 输出索引（list-outputs 给出的 index，按 adapter 顺序 EnumAdapters1 → EnumOutputs 全局编号）
         --fps <n>                目标恒定帧率，默认 60
-        --format auto|p010|nv12  auto = 桌面是 HDR 就 p010，否则 nv12
+        --format auto|p010|nv12  auto = 桌面是 HDR 就 p010，否则 nv12（选了哪个见 stdout 第一行，§2.2）
         --size WxH               可选，输出分辨率（shader 内双线性缩放）；缺省 = 显示器原生
         --sdr-white <nits>       scRGB 1.0 对应的亮度，默认 80（Windows 规范值；不要跟随 SDR 亮度滑块）
         --cursor on|off          默认 on
@@ -87,8 +87,14 @@ capture --output <idx>           DXGI 输出索引（list-outputs 给出的 inde
 
 - 采集引擎是 **管道服务端**（`NamedPipeServerStream`，Out，缓冲 64 MB），创建后等待 ffmpeg 连接。
 - 帧格式：`p010le`（Y 平面 W×H×2 字节 + UV 交错平面 W×(H/2)×2 字节，10 bit 高位对齐即 `value << 6`）或 `nv12`（W×H + W×H/2）。W、H 强制偶数。
+- **格式声明**：打开显示器之后、创建管道之前，向 stdout 写一行 `{"layout":{"format":"p010","width":3840,"height":2160}}`（dump 模式也写）。
+  `--format auto` 时由后端决定（macOS 系统不给 HDR 采集时退回 nv12），所以管道里是什么**只以这一行为准**：应用读到它、并且两个管道都在等连接，
+  才按它启动 ffmpeg（像素格式、尺寸、HDR 编码与否都取自这一行，`FfmpegPlan::for_frames`）。显式 `--format p010|nv12` 而后端给不了时，
+  引擎报错退出（退出码 3），不写这一行，也不建管道——不会把另一种格式写进别人按指定格式读的管道。
+  应用对 HDR 模式的显示器传 `auto`、SDR 传 `nv12`；面板显示实际发送的格式，HDR 屏退成 SDR 时附一句原因见日志。
 - **恒定帧率**：用 `QueryPerformanceCounter` 做定时器；每个 tick 写一帧。节拍器与等待函数必须用**同一个时基**（`Stopwatch.GetTimestamp()` 的绝对值），混用「从 0 开始的 ElapsedTicks」会让等待永远立即返回，退化成按桌面刷新率忙转。`AcquireNextFrame(timeout=0 或很短)` 拿到新帧就转换，没有就重复上一帧（复制已转换好的缓冲，不重跑 shader）。这样 ffmpeg 侧用理想时间戳即可，不用 wallclock。
-- 统计：每秒向 stdout 写一行 JSON：`{"t":秒,"captured":n,"duplicated":n,"dropped":n,"fps":x,"gpu_ms":x,"audio_underrun":n}`。GUI 逐行解析显示。
+- 统计：每秒向 stdout 写一行 JSON：`{"t":秒,"captured":n,"duplicated":n,"dropped":n,"fps":x,"gpu_ms":x,"audio_underrun":n,"pipe_queue_ms":x}`。GUI 逐行解析显示
+  （格式声明那一行没有顶层数字，不会被当成统计）。
 
 ### 2.3 色彩转换（compute shader，HLSL，运行时用 d3dcompiler_47 编译）
 
@@ -525,7 +531,7 @@ P2P 层**只搬运、不解释**：不看载荷，也不替它加密或认证。
 | DXGI 桌面复制 + D3D11 shader | ScreenCaptureKit（`SCStream`）。色彩转换由系统做：SDR 取 `420v`（NV12），HDR 取 10 bit 双平面（先试 `x420`，不给就取 `xf44` 在 CPU 上降成 4:2:0），PQ / BT.2020，需要 macOS 15 + Apple 芯片 |
 | WASAPI loopback | 同一条 `SCStream` 的系统音频（macOS 13+，`excludesCurrentProcessAudio`）。没有"排除某个程序" |
 | 命名管道 `\\.\pipe\<name>` | 临时目录下的 FIFO（`mkfifo`，0600，写端非阻塞 + `poll`）。4K60 P010 是 1.5 GB/s，FIFO 的吞吐是否够要实测 |
-| `--format p010` 总能给出 | 系统给不了 HDR 采集时引擎**报错退出**而不是悄悄改成 nv12（ffmpeg 已经按 p010 开始读了）；显示器列表里的 `hdr` 因此表示"这块屏现在有 EDR 余量，并且这台 Mac 能采 HDR" |
+| HDR 屏总能采成 p010 | 应用对 HDR 屏传 `--format auto`：`x420`、`xf44` 都被系统拒绝时引擎退回 nv12，并在格式声明里说出来（§2.2），应用照它启动 ffmpeg，面板显示 SDR 和原因。只有命令行上显式写 `--format p010` 时才报错退出。显示器列表里的 `hdr` 表示"这块屏现在有 EDR 余量，并且这台 Mac 能采 HDR"，只用来预告格式 |
 | NVENC / AMF / QSV / x265 | `hevc_videotoolbox`（HDR：`-profile:v main10`、`p010le`；`-realtime 1 -allow_sw 0`）或 x265 |
 | mpv `--gpu-api=d3d11 --hwdec=d3d11va` | `--vo=gpu-next --hwdec=videotoolbox`（其余选项相同；HDR 直通是否还需要别的选项要在 XDR 屏上看） |
 | mpv IPC 命名管道 | 临时目录下的 Unix 套接字 |

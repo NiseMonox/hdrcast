@@ -3,9 +3,8 @@
 
 use std::sync::{Arc, Mutex, Weak};
 
-use hdrcast_capture::CaptureArgs;
+use hdrcast_capture::{CaptureArgs, CaptureFormat};
 use hdrcast_core::common::firewall::row as firewall_row;
-use hdrcast_media::sender::encoder_profiles;
 use hdrcast_media::sender::ffmpeg_command::{self, AudioCodec, FfmpegPlan};
 use hdrcast_media::sender::settings::HdrMode;
 use hdrcast_p2p::{P2pHost, P2pHostOptions, SwitchableStream, ViewerState};
@@ -13,7 +12,7 @@ use serde_json::{json, Value};
 
 use crate::commands;
 use crate::control_host::ControlHub;
-use crate::sender_runner::{RunnerState, SendPlan, SenderRunner};
+use crate::sender_runner::{self, RunnerState, SendPlan, SenderRunner};
 use crate::state::{self, AppState, Inner};
 
 struct Session {
@@ -63,7 +62,11 @@ fn build_plan(app: &AppState, inner: &Inner) -> Result<SendPlan, Vec<String>> {
     let video_pipe = format!("{}-{pid}", CaptureArgs::DEFAULT_VIDEO_PIPE);
     let audio_pipe = format!("{}-{pid}", CaptureArgs::DEFAULT_AUDIO_PIPE);
 
-    let capture = sender.to_capture_args(output, width, height, format, &video_pipe, &audio_pipe, pid);
+    // A display in HDR mode is captured with `--format auto`: the engine has the last word, because a Mac whose
+    // system refuses HDR capture can still send SDR. The runner tells ffmpeg what the engine announces. SDR is
+    // asked for by name: that the engine can always deliver.
+    let capture_format = if format == CaptureFormat::P010 { CaptureFormat::Auto } else { format };
+    let capture = sender.to_capture_args(output, width, height, capture_format, &video_pipe, &audio_pipe, pid);
     let mut capture_argv = vec!["capture".to_string()];
     capture_argv.extend(capture.to_argv());
 
@@ -80,26 +83,14 @@ fn build_plan(app: &AppState, inner: &Inner) -> Result<SendPlan, Vec<String>> {
         audio_bitrate_kbps: sender.audio_bitrate_kbps.max(0) as u32,
         ..FfmpegPlan::default()
     };
-    let ffmpeg_argv = ffmpeg_command::build(&plan).map_err(|e| vec![e.to_string()])?;
+    // Refuse an unusable plan now, while the user is looking, rather than after the engine started.
+    ffmpeg_command::build(&plan).map_err(|e| vec![e.to_string()])?;
 
     let mut pipe_names = vec![video_pipe];
     if sender.audio {
         pipe_names.push(audio_pipe);
     }
-    Ok(SendPlan {
-        capture_exe: state::current_exe(),
-        capture_argv,
-        ffmpeg_exe: ffmpeg,
-        ffmpeg_argv,
-        pipe_names,
-        summary: format!(
-            "{} {} Mbps {width}x{height}@{}{}",
-            encoder_profiles::info(sender.encoder).display_name,
-            sender.bitrate_mbps,
-            sender.fps,
-            if hdr { " HDR10" } else { " SDR" }
-        ),
-    })
+    Ok(SendPlan { capture_exe: state::current_exe(), capture_argv, ffmpeg_exe: ffmpeg, ffmpeg: plan, pipe_names })
 }
 
 /// Goes live. The error is the list of things to fix first, as sentences.
@@ -114,7 +105,7 @@ pub fn start(app: &Arc<AppState>) -> Result<(), Vec<String>> {
         (plan, inner.group.current().clone(), inner.sender.bitrate_bps(), inner.sender.max_viewers.max(1) as u32, inner.ui.remote_control, display)
     };
     let keys = group.keys().map_err(|_| vec!["There is no group yet.".to_string()])?;
-    app.log(&format!("[app] {}", plan.summary));
+    app.log(&format!("[app] {}", sender_runner::summary(&plan.ffmpeg)));
 
     // Viewers come and go through the group; the encoder keeps running for all of them, and a restarted
     // encoder is spliced into the same fan-out, so a session always restarts automatically.
@@ -218,7 +209,7 @@ pub fn control_set(app: &AppState, sid: &str, allow: bool) -> Result<(), String>
 
 pub fn status(app: &AppState) -> Value {
     let Some(session) = current(app) else {
-        return json!({ "state": "idle", "detail": "", "attempt": 0, "uptimeSec": 0, "capture": null, "encode": null, "p2p": null });
+        return json!({ "state": "idle", "detail": "", "attempt": 0, "uptimeSec": 0, "capture": null, "encode": null, "video": null, "p2p": null });
     };
     let run = session.runner.snapshot();
     let host = session.host.lock().unwrap().clone();
@@ -259,6 +250,17 @@ pub fn status(app: &AppState) -> Value {
         "encode": run.progress.map(|p| json!({
             "fps": p.fps, "frame": p.frame, "bitrateKbps": p.bitrate_kbps, "speed": p.speed, "dropFrames": p.drop_frames,
         })),
+        // What is really being sent, as the engine announced it; the plan only says what was expected.
+        "video": run.layout.map(|l| {
+            let hdr = l.format == CaptureFormat::P010;
+            json!({
+                "hdr": hdr,
+                "width": l.width,
+                "height": l.height,
+                "format": state::format_label(hdr, l.width, l.height),
+                "hdrUnavailable": run.planned_hdr && !hdr,
+            })
+        }),
         "p2p": p2p,
     })
 }

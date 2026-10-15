@@ -231,11 +231,16 @@ pub fn plan_view(sender: &SenderSettings, outputs: &[OutputInfo]) -> Value {
         "width": width,
         "height": height,
         "fps": sender.fps,
-        "format": format!("{} {width}x{height}", if hdr { "p010 / HDR10" } else { "nv12 / SDR" }),
+        "format": format_label(hdr, width, height),
         "note": note,
         "uploadNeedMbps": need,
         "uploadTooMuch": sender.upload_mbps > 0 && need > f64::from(sender.upload_mbps) * 0.8,
     })
+}
+
+/// "p010 / HDR10 3840x2160": the frames of a stream, as the page shows them.
+pub fn format_label(hdr: bool, width: u32, height: u32) -> String {
+    format!("{} {width}x{height}", if hdr { "p010 / HDR10" } else { "nv12 / SDR" })
 }
 
 /// Upload a stream needs: bitrate × viewers × (1 + SRT overhead).

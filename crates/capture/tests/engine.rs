@@ -222,6 +222,11 @@ struct FakeBackend {
     /// How long opening the endpoint takes: before it delivers anything, and after it began to deliver.
     audio_open_delay: (Duration, Duration),
     parent_gone_after: Option<Duration>,
+    /// The format the screen comes out as whatever was asked for (a Mac whose system refuses HDR capture);
+    /// `None` = p010 when asked for, nv12 otherwise.
+    delivers: Option<CaptureFormat>,
+    /// Every layout the engine announced, with the number of backend events before it.
+    announced: Arc<Mutex<Vec<(FrameLayout, usize)>>>,
 }
 
 impl FakeBackend {
@@ -243,11 +248,17 @@ impl FakeBackend {
             audio_burst: Some(Duration::from_millis(62)),
             audio_open_delay: (Duration::ZERO, Duration::ZERO),
             parent_gone_after: None,
+            delivers: None,
+            announced: Arc::default(),
         }
     }
 
     fn events(&self) -> Vec<String> {
         self.events.lock().unwrap().clone()
+    }
+
+    fn announced(&self) -> Vec<(FrameLayout, usize)> {
+        self.announced.lock().unwrap().clone()
     }
 }
 
@@ -257,10 +268,10 @@ impl Backend for FakeBackend {
         if let Some(error) = &self.video_error {
             return Err(error.clone());
         }
-        let format = if args.format == CaptureFormat::P010 {
-            CaptureFormat::P010
-        } else {
-            CaptureFormat::Nv12
+        let format = match (self.delivers, args.format) {
+            (Some(format), _) => format,
+            (None, CaptureFormat::P010) => CaptureFormat::P010,
+            (None, _) => CaptureFormat::Nv12,
         };
         Ok(Box::new(FakeVideo {
             layout: FrameLayout {
@@ -344,6 +355,11 @@ fn run_engine(
     let mut engine = CaptureEngine::with_backend(args, Box::new(backend.clone()));
     let sink_stats = Arc::clone(&stats);
     engine.set_stats_sink(move |s| sink_stats.lock().unwrap().push(*s));
+    let (announced, events) = (Arc::clone(&backend.announced), Arc::clone(&backend.events));
+    engine.set_layout_sink(move |layout| {
+        let before = events.lock().unwrap().len();
+        announced.lock().unwrap().push((*layout, before));
+    });
     let stop = engine.stop_handle();
     // The stopper gives up waiting as soon as the engine returned on its own (the sender is dropped).
     let (finished, engine_finished) = std::sync::mpsc::channel::<()>();
@@ -543,6 +559,85 @@ fn a_display_that_cannot_be_opened_is_a_device_error() {
         ["open video"],
         "no pipe is created for a display that is not there"
     );
+}
+
+#[test]
+fn with_format_auto_the_backend_chooses_and_says_so_before_the_pipes_exist() {
+    let mut backend = FakeBackend::new();
+    // An HDR display on a Mac whose system refuses the HDR pixel formats: the backend falls back to SDR.
+    backend.delivers = Some(CaptureFormat::Nv12);
+    backend.audio_burst = None;
+    let (code, stats) = run_engine(
+        &backend,
+        CaptureArgs {
+            format: CaptureFormat::Auto,
+            audio: false,
+            ..args(50)
+        },
+        Some(Duration::from_millis(500)),
+    );
+    assert_eq!(code, exit_codes::OK);
+
+    let events = backend.events();
+    let announced = backend.announced();
+    let layout = FrameLayout {
+        format: CaptureFormat::Nv12,
+        width: WIDTH,
+        height: HEIGHT,
+    };
+    // Once, after the display was opened and before the first pipe: the app starts ffmpeg as soon as the
+    // pipes are there, so by then it has to know what to tell it.
+    assert_eq!(announced, [(layout, 1)], "{events:?}");
+    assert_eq!(events[0], "open video");
+    assert_eq!(events[1], format!("create video {}", 64 << 20));
+
+    // and the pipe carries what was announced
+    let frame_bytes = layout.frame_bytes() as u64;
+    let total = backend.video_pipe.total.load(Ordering::SeqCst);
+    assert!(total > 0 && total % frame_bytes == 0, "{total} bytes");
+    assert_accounted(stats.last().unwrap(), total / frame_bytes);
+}
+
+#[test]
+fn a_format_asked_for_by_name_that_cannot_be_had_is_refused() {
+    let mut backend = FakeBackend::new();
+    backend.delivers = Some(CaptureFormat::Nv12);
+    let (code, stats) = run_engine(
+        &backend,
+        CaptureArgs {
+            format: CaptureFormat::P010,
+            ..args(60)
+        },
+        None,
+    );
+    assert_eq!(code, exit_codes::DEVICE_ERROR);
+    assert!(stats.is_empty());
+    // No pipe and no layout: whoever asked for p010 would read nv12 as noise.
+    assert_eq!(backend.events(), ["open video"]);
+    assert!(backend.announced().is_empty());
+}
+
+#[test]
+fn a_dump_announces_its_layout_too() {
+    let dir = common::TempDir::new("engine-dump-layout");
+    let backend = FakeBackend::new();
+    let (code, _) = run_engine(
+        &backend,
+        CaptureArgs {
+            format: CaptureFormat::P010,
+            dump_path: Some(dir.file("frames.p010").to_string_lossy().into_owned()),
+            dump_seconds: 1,
+            ..args(30)
+        },
+        None,
+    );
+    assert_eq!(code, exit_codes::OK);
+    let layout = FrameLayout {
+        format: CaptureFormat::P010,
+        width: WIDTH,
+        height: HEIGHT,
+    };
+    assert_eq!(backend.announced(), [(layout, 1)]);
 }
 
 #[test]

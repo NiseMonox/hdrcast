@@ -79,7 +79,7 @@ selftest: SKIPPED - nothing to verify without capturing; see docs/macos-checklis
 - [ ] `hdr`：XDR 内建屏为 `on`；外接 HDR 显示器在"显示器 → 高动态范围"打开时 `on`、关掉后 `off`；
       **不少非 XDR 的 Mac 内建屏也会是 `on`**（它们支持 EDR，`maximumPotentialExtendedDynamicRangeColorComponentValue` 约为 2）——
       这是按定义得到的结果，请记下你的机器上每块屏的 `hdr` 值。macOS 14 及更早、或 Intel 机器上应全部是 `off`
-      （`hdr` 的含义是"引擎会把这块屏采成 HDR10"，App 据此告诉 ffmpeg 读 p010 还是 nv12）。验证 **A9**。
+      （`hdr` 的含义是"引擎会把这块屏采成 HDR10"，App 据此预告格式；真正告诉 ffmpeg 读什么的是引擎 stdout 的第一行，见第 7 步）。验证 **A9**。
 - [ ] `--json` 输出同样内容（`"deviceName":"1"`、`"hdr":true` …）。
 
 ## 4. 录屏权限
@@ -205,8 +205,12 @@ open /tmp/hc-hdr-pq-raw.png /tmp/hc-hdr-tonemapped.png
 - [ ] `hc-hdr-pq-raw.png` 发灰发平——正常（PQ 信号直接当 sRGB 看）。
 - [ ] `hc-hdr-tonemapped.png` 看起来就是你的桌面：**色相正确**（红是红、肤色正常）。若偏色，把 `F` 里的 `-colorspace bt2020nc` 换成
       `-colorspace bt709` 再出一张对比，哪张对就说明数据实际用的是哪个矩阵（对应 A2）。
-- [ ] `--format auto` 在 `hdr=on` 的屏上应与 `--format p010` 走同一条路；在 `hdr=off` 的屏上 `--format p010` 会打印
-      `[W] capture: --format p010 was asked for, but the display is not in an HDR (extended dynamic range) state; capturing SDR instead …`。
+- [ ] `--format auto` 在 `hdr=on` 的屏上应与 `--format p010` 走同一条路，区别只在退路：`auto` 在 `x420`、`xf44` 都不行时退成 nv12 照常录，
+      `p010` 则报错退出（`this display cannot be captured as p010 here (it would come out as nv12)`，不建管道）。
+      两种情况下 stdout 第一行都是格式声明，例如 `{"layout":{"format":"p010","width":1920,"height":1080}}`——**App 就是按这一行启动 ffmpeg 的**，
+      请确认它和日志里 `-> p010 1920x1080` / `HDR pictures arrive as …` 一致（`$B capture … --format auto … --dump … | head -1`）。
+      在 `hdr=off` 的屏上 `--format p010` 会先打印
+      `[W] capture: --format p010 was asked for, but the display is not in an HDR (extended dynamic range) state; capturing SDR instead …`，然后同样报错退出。
 - [ ] 换成原生尺寸、60 fps、release 版（`target/release/hdrcast-capture`）录 3 秒：统计里 `fps`≈60、`dropped` 不增长，
       `gpu_ms`（拷贝 / 转换耗时）：`'x420'` 路径 4K 下应在 2–4 ms，`'xf44'` 路径会高（若 > 10 ms 请报）。
 
@@ -362,8 +366,10 @@ open dist/HdrCast.app
       日志依次出现 `[run] …HdrCast capture …`、`[capture] … first picture …`、`[state] streaming: Streaming`；面板采集 ≈ 60 fps，编码 speed ≈ 1.0×。
       - 4K / 5K 屏如果"丢帧"持续增长：是第 10 步说的 FIFO 吞吐问题，先把分辨率降到 1440p 确认，再把统计发回来。
 - [ ] Windows 观众看到的画面颜色正常（SDR 屏开播：不偏色；HDR 屏开播：面板 source 是 `bt.2020 / pq`，白色窗口不刺眼）、声音同步。
-- [ ] HDR 选"自动"、但系统 / 显示器给不了 HDR 采集时：采集引擎直接报错退出（日志 `[capture] … this display cannot be captured as p010 here…`，
-      面板显示 `capture engine stopped: GPU / display error` 并每 3 s 重试）。把 HDR 改成"始终 SDR"即可。这是有意的：否则 ffmpeg 会把 SDR 帧当成 P010 读。
+- [ ] HDR 屏、HDR 选"自动"时，日志有 `[run] sending HEVC (Apple VideoToolbox) … HDR10`，面板"丢帧"格下面是 `p010 / HDR10 …`。
+- [ ] 系统给不了 HDR 采集时（第 7 步是结局三的机器）：照常开播，只是发 SDR——日志 `[capture] … capturing SDR instead …`、
+      `[run] sending … SDR`、`[run] the display is in HDR mode, but it could not be captured as HDR here …`；
+      面板"丢帧"格下面是 `nv12 / SDR …`，磁贴下方有一句"这块屏幕开着 HDR，但……推的是 SDR"。观众画面正常（不是花屏）。
 - [ ] **停止**：`pgrep -fl 'HdrCast|ffmpeg'` 只剩应用本身；临时目录里没有残留的 `hdrcast-*.fifo`。
 
 ## 15. 远程控制

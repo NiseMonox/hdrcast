@@ -1,6 +1,6 @@
 //! Port of tests/SenderModelTests.cs, plus what the Rust version added (platforms, VideoToolbox).
 
-use hdrcast_capture::{CaptureArgs, CaptureFormat, OutputInfo};
+use hdrcast_capture::{CaptureArgs, CaptureFormat, FrameLayout, OutputInfo};
 use hdrcast_media::sender::encoder_profiles::{self, EncoderSettings, QualityPreset, VideoEncoder};
 use hdrcast_media::sender::ffmpeg_command::{self, AudioCodec, FfmpegPlan, FfmpegPlanError};
 use hdrcast_media::sender::{FfmpegProgressParser, HdrMode, ScaleMode, SenderSettings};
@@ -652,6 +652,44 @@ mod ffmpeg_command_line {
         assert_eq!(
             error.to_string(),
             "HDR encoding needs p010 input (and SDR needs nv12)"
+        );
+    }
+
+    #[test]
+    fn the_plan_follows_the_frames_the_engine_announced() {
+        let layout = |format, width, height| FrameLayout {
+            format,
+            width,
+            height,
+        };
+        // Planned as HDR, but the engine fell back to SDR (a Mac that refuses HDR capture): the same command
+        // as a plan made for SDR in the first place.
+        let fell_back = plan(true, true).for_frames(layout(CaptureFormat::Nv12, 2560, 1440));
+        assert_eq!(fell_back, plan(false, true));
+        let a = ffmpeg_command::build(&fell_back).unwrap();
+        assert_eq!(value(&a, "-pix_fmt"), "nv12");
+        assert_eq!(value(&a, "-color_trc"), "bt709");
+
+        // and the other way round, with the size the engine really delivers
+        let hdr = plan(false, true).for_frames(layout(CaptureFormat::P010, 3840, 2160));
+        assert!(hdr.encoder.hdr);
+        let a = ffmpeg_command::build(&hdr).unwrap();
+        assert_eq!(value(&a, "-pix_fmt"), "p010le");
+        assert_eq!(value(&a, "-video_size"), "3840x2160");
+        assert_eq!(value(&a, "-color_trc"), "smpte2084");
+        // everything else stays as planned
+        assert_eq!(
+            hdr,
+            FfmpegPlan {
+                pixel_format: CaptureFormat::P010,
+                width: 3840,
+                height: 2160,
+                encoder: EncoderSettings {
+                    hdr: true,
+                    ..plan(false, true).encoder
+                },
+                ..plan(false, true)
+            }
         );
     }
 

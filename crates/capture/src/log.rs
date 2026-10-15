@@ -1,4 +1,5 @@
-//! Timestamped log lines on stderr (design.md section 2.1: stdout is reserved for the JSON stats).
+//! Timestamped log lines on stderr (design.md section 2.1: stdout is reserved for the JSON lines, the layout
+//! and the statistics).
 
 use std::io::Write;
 

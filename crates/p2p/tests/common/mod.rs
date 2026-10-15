@@ -516,8 +516,7 @@ pub fn repo_root() -> PathBuf {
 /// Says why a test does nothing. Written to the process's own stderr, past the test harness's capture, so the
 /// note shows in a plain `cargo test` (where a skipped test otherwise looks exactly like one that ran).
 pub fn skip(test: &str, why: &str) {
-    let line = format!("SKIPPED {test}: {why}
-");
+    let line = format!("SKIPPED {test}: {why}\n");
     let _ = std::io::stderr().write_all(line.as_bytes()); // in one piece: other tests print at the same time
 }
 

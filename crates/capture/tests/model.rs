@@ -6,7 +6,7 @@ use hdrcast_capture::app_audio::{self, ProcessEntry};
 use hdrcast_capture::clock::TICKS_PER_SECOND;
 use hdrcast_capture::color;
 use hdrcast_capture::pacer::FramePacer;
-use hdrcast_capture::{CaptureArgs, CaptureFormat, CaptureStats, OutputInfo};
+use hdrcast_capture::{CaptureArgs, CaptureFormat, CaptureStats, FrameLayout, OutputInfo};
 
 mod color_math {
     use super::*;
@@ -804,6 +804,83 @@ mod capture_stats {
         assert_eq!(CaptureStats::try_parse("{}"), None);
         assert_eq!(CaptureStats::try_parse("[1,2]"), None);
         assert_eq!(CaptureStats::try_parse("{\"note\":\"text only\"}"), None);
+    }
+
+    #[test]
+    fn the_layout_line_is_not_taken_for_statistics() {
+        let layout = FrameLayout {
+            format: CaptureFormat::P010,
+            width: 3840,
+            height: 2160,
+        };
+        assert_eq!(CaptureStats::try_parse(&layout.to_json_line()), None);
+    }
+}
+
+mod frame_layout {
+    use super::*;
+
+    fn layout(format: CaptureFormat, width: u32, height: u32) -> FrameLayout {
+        FrameLayout {
+            format,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn the_line_says_format_and_size() {
+        assert_eq!(
+            layout(CaptureFormat::P010, 3840, 2160).to_json_line(),
+            r#"{"layout":{"format":"p010","width":3840,"height":2160}}"#
+        );
+        assert_eq!(
+            layout(CaptureFormat::Nv12, 1920, 1080).to_json_line(),
+            r#"{"layout":{"format":"nv12","width":1920,"height":1080}}"#
+        );
+    }
+
+    #[test]
+    fn the_line_round_trips() {
+        for l in [
+            layout(CaptureFormat::P010, 3840, 2160),
+            layout(CaptureFormat::Nv12, 2, 2),
+            layout(CaptureFormat::Nv12, 1366, 768),
+        ] {
+            assert_eq!(FrameLayout::try_parse(&l.to_json_line()), Some(l));
+        }
+        // as it arrives through a pipe on Windows, and with the keys in another order
+        assert_eq!(
+            FrameLayout::try_parse(
+                "{\"layout\":{\"height\":1080,\"format\":\"nv12\",\"width\":1920}}\r\n"
+            ),
+            Some(layout(CaptureFormat::Nv12, 1920, 1080))
+        );
+    }
+
+    #[test]
+    fn other_lines_and_impossible_layouts_are_rejected() {
+        let stats = CaptureStats {
+            fps: 60.0,
+            ..CaptureStats::default()
+        };
+        for line in [
+            stats.to_json_line().as_str(),
+            "capture: output 0 (\\\\.\\DISPLAY1 AW3225QF) 3840x2160 -> p010 3840x2160 @60fps",
+            "",
+            "{\"layout\":null}",
+            // `auto` is a request, never a layout
+            r#"{"layout":{"format":"auto","width":3840,"height":2160}}"#,
+            r#"{"layout":{"format":"yuv444","width":3840,"height":2160}}"#,
+            // 4:2:0 needs even sizes
+            r#"{"layout":{"format":"nv12","width":1365,"height":768}}"#,
+            r#"{"layout":{"format":"nv12","width":0,"height":768}}"#,
+            r#"{"layout":{"format":"nv12","width":-2,"height":768}}"#,
+            r#"{"layout":{"format":"nv12","width":1366}}"#,
+            r#"{"layout":{"format":"nv12","width":1366,"height":768}"#,
+        ] {
+            assert_eq!(FrameLayout::try_parse(line), None, "{line}");
+        }
     }
 }
 

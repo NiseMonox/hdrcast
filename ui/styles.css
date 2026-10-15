@@ -1366,6 +1366,15 @@ input[type="range"].slider:disabled {
   text-overflow: ellipsis;
 }
 
+.hero-note {
+  font-size: 12px;
+  line-height: 1.4;
+  opacity: 0.8;
+  margin-top: -6px;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
 .person {
   display: flex;
   align-items: center;

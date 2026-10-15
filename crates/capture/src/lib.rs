@@ -2,8 +2,9 @@
 //!
 //! A child process of the app (same executable, `capture` verb) grabs one desktop, converts every frame on
 //! the GPU to raw P010 (HDR10) or NV12 (SDR) and serves a constant-rate stream through a named pipe that
-//! ffmpeg reads as rawvideo; desktop audio goes through a second pipe as f32le 48 kHz stereo. Statistics are
-//! one JSON line per second on stdout, logs go to stderr.
+//! ffmpeg reads as rawvideo; desktop audio goes through a second pipe as f32le 48 kHz stereo. On stdout, one
+//! JSON line first says which frames go into the video pipe ([`FrameLayout`]), then statistics follow once per
+//! second; logs go to stderr.
 //!
 //! Layout of the crate:
 //! * platform-neutral model and logic: [`args`], [`stats`], [`output`], [`pacer`], [`aligner`], [`color`],
@@ -14,8 +15,9 @@
 //!   parts in `unix/`, and a stub for everything else.
 //!
 //! The app's `main` starts with [`cli_main`]; to launch the engine it builds a [`CaptureArgs`], spawns itself
-//! with `capture` + [`CaptureArgs::to_argv`], waits for both pipes with [`pipe_listening`], starts ffmpeg on
-//! [`pipe_path`] and parses the child's stdout with [`CaptureStats::try_parse`].
+//! with `capture` + [`CaptureArgs::to_argv`], reads the frame layout from the child's stdout
+//! ([`FrameLayout::try_parse`]), waits for both pipes with [`pipe_listening`], starts ffmpeg on [`pipe_path`]
+//! for that layout and parses the rest of the child's stdout with [`CaptureStats::try_parse`].
 
 pub mod aligner;
 pub mod app_audio;
@@ -62,6 +64,6 @@ pub use output::OutputInfo;
 pub use pacer::FramePacer;
 pub use platform::{
     enumerate_outputs, list_audio_apps, list_audio_devices, pipe_listening, pipe_path,
-    AudioDeviceInfo,
+    AudioDeviceInfo, FrameLayout,
 };
 pub use stats::CaptureStats;

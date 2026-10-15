@@ -13,7 +13,7 @@ use crate::color;
 use crate::frame::{FramePool, FrameSink, SharedFrame};
 use crate::log;
 use crate::pacer::FramePacer;
-use crate::platform::{self, Backend, FrameStatus, VideoError, VideoSource};
+use crate::platform::{self, Backend, FrameLayout, FrameStatus, VideoError, VideoSource};
 use crate::stats::CaptureStats;
 use crate::timer::HighResTimer;
 
@@ -77,6 +77,7 @@ pub struct CaptureEngine {
     gpu_ms_count: u32,
     last_written: u64,
     stats_sink: Box<dyn FnMut(&CaptureStats) + Send>,
+    layout_sink: Box<dyn FnMut(&FrameLayout) + Send>,
 }
 
 impl CaptureEngine {
@@ -98,12 +99,19 @@ impl CaptureEngine {
             gpu_ms_count: 0,
             last_written: 0,
             stats_sink: Box::new(|stats| log::stdout_line(&stats.to_json_line())),
+            layout_sink: Box::new(|layout| log::stdout_line(&layout.to_json_line())),
         }
     }
 
     /// Sends the once-per-second statistics to `sink` instead of printing them to stdout as a JSON line.
     pub fn set_stats_sink(&mut self, sink: impl FnMut(&CaptureStats) + Send + 'static) {
         self.stats_sink = Box::new(sink);
+    }
+
+    /// Sends the frame layout (once, when the display is open and before the pipes exist) to `sink` instead of
+    /// printing it to stdout as a JSON line ([`FrameLayout::to_json_line`]).
+    pub fn set_layout_sink(&mut self, sink: impl FnMut(&FrameLayout) + Send + 'static) {
+        self.layout_sink = Box::new(sink);
     }
 
     pub fn stop_handle(&self) -> StopHandle {
@@ -124,17 +132,20 @@ impl CaptureEngine {
             }
         };
         let layout = video.layout();
-        // The app names the pixel format to ffmpeg before this engine starts. A backend that cannot deliver a
-        // format asked for by name (macOS without HDR capture on this system or display) must not put another
-        // one into the same pipe: ffmpeg would read it as noise. Only `--format auto` leaves the choice here.
+        // A format asked for by name is a promise to whoever reads the pipe: a backend that cannot keep it
+        // (macOS without HDR capture on this system or display) must not put another one into the pipe, where
+        // it would be read as noise. `--format auto` leaves the choice to the backend instead; the layout line
+        // below says what it chose, and the app starts ffmpeg only once it has read that line.
         if self.args.format != CaptureFormat::Auto && layout.format != self.args.format {
+            let (asked, got) = (self.args.format.name(), layout.format.name());
             log::error(format!(
-                "capture: this display cannot be captured as {} here (it would come out as {});                  set HDR to \"Always SDR\" for this display",
-                self.args.format.name(),
-                layout.format.name()
+                "capture: this display cannot be captured as {asked} here (it would come out as {got}); \
+                 use --format {got} or --format auto"
             ));
             return exit_codes::DEVICE_ERROR;
         }
+        // Before any pipe exists: whoever waits for the pipes knows the format by the time they are there.
+        (self.layout_sink)(&layout);
 
         let pool = FramePool::new(POOL_FRAMES, layout.frame_bytes());
         let video_path = platform::pipe_path(&self.args.video_pipe);

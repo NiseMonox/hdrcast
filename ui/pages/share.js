@@ -271,8 +271,9 @@ function LivePanel({ status, group, sender }) {
         <div class="s">${cap ? `${cap.gpuMs.toFixed(2)} ms GPU` : ' '}</div></div>
       <div class="tile"><div class="k">${t('share.tDropped')}</div>
         <div class="v">${cap || enc ? dropped : '—'}</div>
-        <div class="s">${status.plan?.format || ''}</div></div>
+        <div class="s">${share.video?.format || status.plan?.format || ''}</div></div>
     </div>`}
+    ${!failed && share.video?.hdrUnavailable && html`<div class="hero-note">${t('share.hdrUnavailable')}</div>`}
   </div>`;
 }
 

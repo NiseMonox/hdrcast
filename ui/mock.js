@@ -1,5 +1,6 @@
 // A stand-in backend for working on the UI in a plain browser (never loaded inside the app).
-// URL switches: ?fresh (no group yet), ?live (already sharing), ?watching, ?mac, ?lang=zh|ja|en, ?theme=dark|light
+// URL switches: ?fresh (no group yet), ?live (already sharing), ?watching, ?mac, ?lang=zh|ja|en, ?theme=dark|light,
+// ?nohdr (the system refuses HDR capture: an HDR display is sent as SDR, as on a Mac without it)
 
 const q = new URLSearchParams(location.search);
 const handlers = new Map();
@@ -71,18 +72,24 @@ function status() {
   const wup = w.startedMs ? (now() - w.startedMs) / 1000 : 0;
   const connected = w.active && wup > 2.5;
   const playing = w.active && wup > 4.5;
+  const p = plan();
+  const sentHdr = p.hdr && !q.has('nohdr');
   return {
     share: {
-      state: s.state, detail: s.detail, attempt: 1, uptimeSec: up, summary: '',
+      state: s.state, detail: s.detail, attempt: 1, uptimeSec: up,
       capture: streaming ? { fps: db.sender.fps - 0.02 + wobble * 0.02, duplicated: Math.floor(up * 12), dropped: 0, gpuMs: 0.61 + wobble * 0.05, audioUnderrun: 0 } : null,
       encode: streaming ? { fps: db.sender.fps, frame: Math.floor(up * db.sender.fps), bitrateKbps: db.sender.bitrateMbps * 1000 * (0.97 + wobble * 0.03), speed: 1.0, dropFrames: 0 } : null,
+      video: streaming ? {
+        hdr: sentHdr, width: p.width, height: p.height, hdrUnavailable: p.hdr && !sentHdr,
+        format: (sentHdr ? 'p010 / HDR10 ' : 'nv12 / SDR ') + p.width + 'x' + p.height,
+      } : null,
       p2p: s.state === 'idle' || s.state === 'failed' ? null : {
         status: `Live in "${db.group.groupName}" - ${db.viewers.length} viewer${db.viewers.length === 1 ? '' : 's'}`,
         hasIpv6: true, ipv4Open: db.firewall.allowed, uploadMbps: db.viewers.length * db.sender.bitrateMbps * 1.25,
         viewers: db.viewers.map((v) => ({ ...v, state: now() - v.joinedMs > 2500 ? 'watching' : 'connecting', joinedSec: (now() - v.joinedMs) / 1000 })),
       },
     },
-    plan: plan(),
+    plan: p,
     watch: {
       active: w.active, hostId: w.hostId, hostName: w.hostName,
       session: w.active ? {

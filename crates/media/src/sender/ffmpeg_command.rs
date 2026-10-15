@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use hdrcast_capture::{CaptureArgs, CaptureFormat};
+use hdrcast_capture::{CaptureArgs, CaptureFormat, FrameLayout};
 use hdrcast_core::common::arg_quote;
 
 use super::encoder_profiles::{self, EncoderSettings};
@@ -37,6 +37,20 @@ pub struct FfmpegPlan {
     /// Where -progress writes: stderr, because stdout carries the stream (lines are told apart by shape).
     pub progress_url: String,
     pub log_level: String,
+}
+
+impl FfmpegPlan {
+    /// This plan for the frames the capture engine announced (its layout line, see [`FrameLayout`]): their
+    /// pixel format and size, and HDR encoding exactly when the frames are p010. The engine has the last word
+    /// because with `--format auto` it chooses, and macOS falls back to SDR when the system refuses HDR capture.
+    pub fn for_frames(&self, layout: FrameLayout) -> FfmpegPlan {
+        let mut plan = self.clone();
+        plan.pixel_format = layout.format;
+        plan.width = layout.width;
+        plan.height = layout.height;
+        plan.encoder.hdr = layout.format == CaptureFormat::P010;
+        plan
+    }
 }
 
 impl Default for FfmpegPlan {
