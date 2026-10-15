@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/p2p", "crates/capture", "crates/control", "crates/media", "app"]
+
+[workspace.package]
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+authors = ["NiseMonox"]
+rust-version = "1.85"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+
+# The capture loop and the UDP forwarders are unusable unoptimised (a 4K P010 frame is 25 MB).
+[profile.dev]
+opt-level = 1

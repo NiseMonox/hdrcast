@@ -278,10 +278,10 @@ if ($failed.Count -gt 0) {
 
 Write-Host "All set. Next:" -ForegroundColor White
 if ($Role -ne 'viewer') {
-    Write-Host "  1. HdrCastSender.exe list-outputs        which display to share, and whether HDR is on"
-    Write-Host "  2. HdrCastSender.exe capture --selftest  check the HDR conversion on this GPU"
-    Write-Host "  3. HdrCastSender.exe                     the GUI; press 'Test encoders' first"
+    Write-Host "  1. scripts\check-tools.cmd         lists the displays and whether HDR is on"
+    Write-Host "  2. HdrCast.exe capture --selftest  (from a .cmd file or with ^| more) checks the HDR conversion on this GPU"
+    Write-Host "  3. HdrCast.exe                     the app; press Test next to Encoder first"
 } else {
-    Write-Host "  run HdrCastReceiver.exe and paste the address your friend sent you"
+    Write-Host "  copy the invite your friend sent you, then start HdrCast.exe"
 }
 exit 0

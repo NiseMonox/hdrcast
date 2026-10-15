@@ -23,17 +23,17 @@ set "ROOT=%~dp0.."
 for %%I in ("%ROOT%") do set "ROOT=%%~fI"
 call :find FFMPEG ffmpeg.exe
 if not defined FFMPEG ( echo ffmpeg.exe not found. Run check-tools.cmd. & pause & exit /b 1 )
-if not exist "%ROOT%\HdrCastSender.exe" ( echo HdrCastSender.exe not found in %ROOT% & pause & exit /b 1 )
+if not exist "%ROOT%\HdrCast.exe" ( echo HdrCast.exe not found in %ROOT% & pause & exit /b 1 )
 set "OUT=%~dp0dump"
 if not exist "%OUT%" mkdir "%OUT%"
 if /i "%FORMAT%"=="p010" ( set "PIXFMT=p010le" ) else ( set "PIXFMT=nv12" )
 set "DUMP=%OUT%\frames.%FORMAT%"
 
 echo ===== displays =====
-"%ROOT%\HdrCastSender.exe" list-outputs
+"%ROOT%\HdrCast.exe" list-outputs
 echo.
 echo ===== 1/3 capture %SECONDS% s from output %OUTPUT% ^(%FORMAT%, %SIZE%, %FPS% fps, sdr-white %SDR_WHITE%^) =====
-"%ROOT%\HdrCastSender.exe" capture --output %OUTPUT% --fps %FPS% --format %FORMAT% --size %SIZE% --sdr-white %SDR_WHITE% --audio off --dump "%DUMP%" --seconds %SECONDS%
+"%ROOT%\HdrCast.exe" capture --output %OUTPUT% --fps %FPS% --format %FORMAT% --size %SIZE% --sdr-white %SDR_WHITE% --audio off --dump "%DUMP%" --seconds %SECONDS%
 if errorlevel 1 ( echo capture failed with %ERRORLEVEL% & pause & exit /b 1 )
 for %%F in ("%DUMP%") do echo dump: %%~fF ^(%%~zF bytes^)
 echo.

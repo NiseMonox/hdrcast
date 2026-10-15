@@ -8,20 +8,18 @@ set "ROOT=%~dp0.."
 for %%I in ("%ROOT%") do set "ROOT=%%~fI"
 call :find FFMPEG ffmpeg.exe
 call :find MPV mpv.exe
-call :find SENDER HdrCastSender.exe
-call :find RECEIVER HdrCastReceiver.exe
+call :find APP HdrCast.exe
 set "TMPF=%TEMP%\hdrcast-check-tools.txt"
 
 echo ===== HdrCast tool check =====
 echo root      : %ROOT%
-if defined SENDER (echo sender    : %SENDER%) else (echo sender    : HdrCastSender.exe not found in %ROOT%)
-if defined RECEIVER (echo receiver  : %RECEIVER%) else (echo receiver  : HdrCastReceiver.exe not found in %ROOT%)
+if defined APP (echo app       : %APP%) else (echo app       : HdrCast.exe not found in %ROOT%)
 echo.
 
-echo ----- ffmpeg ^(sender^) -----
+echo ----- ffmpeg ^(for sharing^) -----
 if not defined FFMPEG (
   echo ffmpeg.exe NOT FOUND. Download the "full" build from https://www.gyan.dev/ffmpeg/builds/ and put ffmpeg.exe
-  echo next to HdrCastSender.exe, into tools\, or on PATH.
+  echo next to HdrCast.exe, into tools\, or on PATH.
   goto :mpv
 )
 echo path      : %FFMPEG%
@@ -40,10 +38,10 @@ echo           ^(listed = compiled in; ok = a 1-frame test encode succeeded, i.e
 echo.
 
 :mpv
-echo ----- mpv ^(receiver^) -----
+echo ----- mpv ^(for watching^) -----
 if not defined MPV (
   echo mpv.exe NOT FOUND. Download a build that bundles libsrt: https://github.com/shinchiro/mpv-winbuild-cmake/releases
-  echo or https://github.com/zhongfly/mpv-winbuild/releases ; put mpv.exe next to HdrCastReceiver.exe, into tools\, or on PATH.
+  echo or https://github.com/zhongfly/mpv-winbuild/releases ; put mpv.exe next to HdrCast.exe, into tools\, or on PATH.
   goto :outputs
 )
 echo path      : %MPV%
@@ -52,13 +50,13 @@ set "VER="
 set /p VER=<"%TMPF%"
 echo version   : !VER!
 "%MPV%" --list-protocols > "%TMPF%" 2>nul
-findstr /C:"srt://" "%TMPF%" >nul && (echo srt       : yes) || (echo srt       : NO - use the "ffmpeg pipe" fallback in HdrCastReceiver, or a shinchiro/zhongfly build)
+findstr /C:"srt://" "%TMPF%" >nul && (echo srt       : yes) || (echo srt       : NO - set Settings ^> Player input to "ffmpeg pipe" in HdrCast, or use a shinchiro/zhongfly build)
 echo.
 
 :outputs
-if defined SENDER (
-  echo ----- displays ^(HdrCastSender.exe list-outputs^) -----
-  "%SENDER%" list-outputs
+if defined APP (
+  echo ----- displays ^(HdrCast.exe list-outputs^) -----
+  "%APP%" list-outputs
   echo.
 )
 del "%TMPF%" >nul 2>nul

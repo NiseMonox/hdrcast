@@ -1,0 +1,141 @@
+import { useEffect, useState } from './vendor/preact-htm.js';
+import { invoke, listen } from './api.js';
+import { setLanguage } from './i18n.js';
+
+const MAX_LOG_LINES = 1500;
+
+export const state = {
+  ready: false,
+  init: null,          // static facts from app_init (platform, version, lists)
+  settings: null,      // { ui, sender, receiver }
+  status: null,        // the latest runtime snapshot (pushed a few times a second)
+  group: null,
+  tools: null,
+  firewall: null,
+  outputs: [],
+  audioDevices: [],
+  logs: [],
+  page: 'share',
+  sheet: null,         // { name, props }
+  toasts: [],
+};
+
+const listeners = new Set();
+
+export function setState(patch) {
+  Object.assign(state, patch);
+  for (const l of listeners) l();
+}
+
+export function useStore() {
+  const [, force] = useState(0);
+  useEffect(() => {
+    const l = () => force((n) => n + 1);
+    listeners.add(l);
+    return () => listeners.delete(l);
+  }, []);
+  return state;
+}
+
+export function applyAppearance() {
+  const ui = state.settings?.ui;
+  const root = document.documentElement;
+  if (ui?.theme === 'light' || ui?.theme === 'dark') root.dataset.theme = ui.theme;
+  else delete root.dataset.theme;
+  setLanguage(ui?.language || 'auto', state.init?.locale || navigator.language);
+  root.lang = document.documentElement.dataset.lang || 'en';
+}
+
+export async function boot() {
+  const init = await invoke('app_init');
+  setState({
+    init,
+    settings: { ui: init.ui, sender: init.sender, receiver: init.receiver },
+    group: init.group,
+    tools: init.tools,
+    firewall: init.firewall,
+    outputs: init.outputs,
+    audioDevices: init.audioDevices,
+    status: init.status,
+    logs: init.logs || [],
+    ready: true,
+  });
+  applyAppearance();
+  document.documentElement.classList.toggle('backdrop', !!init.backdrop);
+  document.documentElement.classList.add(init.platform === 'macos' ? 'mac' : init.platform === 'windows' ? 'win' : 'linux');
+
+  listen('status', (status) => {
+    const patch = { status };
+    if (status.group) patch.group = status.group;
+    if (status.firewall) patch.firewall = status.firewall;
+    setState(patch);
+  });
+  listen('log', (payload) => {
+    const logs = state.logs.concat(payload.lines);
+    setState({ logs: logs.length > MAX_LOG_LINES ? logs.slice(logs.length - MAX_LOG_LINES) : logs });
+  });
+  listen('invite', (preview) => {
+    if (!state.sheet) openSheet('invite-found', { preview });
+  });
+  if (init.startupInvite) openSheet('join', { preview: init.startupInvite });
+}
+
+// ---- settings: edit locally at once, save a moment later, take back what the backend normalised -----------------
+
+let saveTimer = null;
+let saveSeq = 0;
+
+export function editSettings(section, patch) {
+  const settings = { ...state.settings, [section]: { ...state.settings[section], ...patch } };
+  setState({ settings });
+  if (section === 'ui') applyAppearance();
+  clearTimeout(saveTimer);
+  const seq = ++saveSeq;
+  saveTimer = setTimeout(async () => {
+    try {
+      const saved = await invoke('settings_save', { settings: state.settings });
+      if (seq !== saveSeq) return;          // edited again meanwhile: keep what the user sees
+      setState({ settings: { ui: saved.ui, sender: saved.sender, receiver: saved.receiver }, tools: saved.tools || state.tools });
+    } catch (e) {
+      toast(String(e), { kind: 'warn' });
+    }
+  }, 250);
+}
+
+/** Flushes a pending save, so a Start right after an edit uses the new values. */
+export async function flushSettings() {
+  if (!saveTimer) return;
+  clearTimeout(saveTimer);
+  saveTimer = null;
+  const saved = await invoke('settings_save', { settings: state.settings });
+  setState({ settings: { ui: saved.ui, sender: saved.sender, receiver: saved.receiver }, tools: saved.tools || state.tools });
+}
+
+// ---- sheets and toasts ---------------------------------------------------------------------------------------
+
+export function openSheet(name, props) {
+  setState({ sheet: { name, props: props || {} } });
+}
+
+export function closeSheet() {
+  setState({ sheet: null });
+}
+
+let toastId = 0;
+
+export function toast(text, opts) {
+  const id = ++toastId;
+  const t = { id, text, kind: opts?.kind || 'info', actions: opts?.actions || null };
+  setState({ toasts: state.toasts.concat(t).slice(-3) });
+  const ms = opts?.ms ?? (t.actions ? 0 : 3600);
+  if (ms > 0) setTimeout(() => dismissToast(id), ms);
+  return id;
+}
+
+export function dismissToast(id) {
+  setState({ toasts: state.toasts.filter((t) => t.id !== id) });
+}
+
+export function go(page) {
+  setState({ page });
+}

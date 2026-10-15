@@ -8,9 +8,9 @@
   <https://test-ipv6.com> 可以自查。手机热点通常自带 IPv6，可以先用热点试一下。
 - **"Both sides have IPv6 but the path is blocked"**：关掉 VPN / 加速器；路由器里有"IPv6 防火墙：阻止所有入站"之类的严格选项就改回默认。
 - **"…the host's PC only takes IPv4 from routers that keep ports…"**：观众的路由器每个目的地换端口，主播那边没打开：主播在
-  Firewall 一栏点 **Allow…**，并确认路由器开着 UPnP（主播状态栏会写缺什么）。**"…although the host takes IPv4 from any port…"**：
+  **防火墙** 一栏点 **放行…**，并确认路由器开着 UPnP（开播页的面板会写缺什么）。**"…although the host takes IPv4 from any port…"**：
   观众这边的 VPN / 代理 / 加速器截走了 UDP。
-- **"Not live right now"**：主播还没开播，列表每 10 s 刷新。**"… is full"**：主播的 Max viewers 满了。
+- **"Not live right now"**：主播还没开播，列表每 10 s 刷新。**"… is full"**：主播的"同时观看人数"满了。
 - **"The signaling server cannot be reached"**：本机断网或信令服务器挂了；已经在看的人不受影响。
 - 能连上但**画面一直不出来**：mpv 在等第一个关键帧（最多一个 GOP，默认 2 s）；超过 10 s 看日志里 `[remux …]` 的报错（在主播那边）。
 
@@ -18,7 +18,7 @@
 
 点对点靠 IPv6 打洞：IPv6 没有 NAT，双方同时发包就能穿过两边的有状态防火墙，不用任何设置。
 没有 IPv6 时 app 走 IPv4（经信令服务器的 UDP 回显拿到公网映射再打洞）。只要**一方**的路由器有公网 IPv4 并且"开着"
-（程序自动做的 UPnP 转发 + Firewall 一栏的 Allow…），另一方就算是国内常见的对称型 NAT 也能连（2026-09-25 实测：江苏电信的朋友
+（程序自动做的 UPnP 转发 + **防火墙** 一栏的 **放行…**），另一方就算是国内常见的对称型 NAT 也能连（2026-09-25 实测：江苏电信的朋友
 连日本的主播）。双方都在运营商级 NAT 后面（国内部分家宽、日本 v6プラス / DS-Lite、澳洲部分 ISP 的 IPv4）就打不通，要开 IPv6。
 你选了"不走腾讯云中转"，所以这种情况会明确提示，不会偷偷绕路。同一局域网里的人不需要 IPv6（走局域网 IPv4）。
 
@@ -73,7 +73,7 @@ HEVC 10-bit、60 fps、桌面/游戏混合内容的经验值：
 
 - 40 Mbps × 2 人 = 100 Mbps；40 Mbps × 3 人（含一位中国）≈ 160 Mbps。
 - 先 speedtest 看上行，留 30 % 余量。上行不够就降码率或减少人数，不要把 oheadbw 调低（Haivision 的原话：太低时线路一有丢包"流就会立刻卡死"）。
-- 发送端界面按 Max viewers 估算上行，填了 *my upload* 会在超过 80 % 时标红；状态栏 **Viewers** 显示当前实际需要的上行。
+- 开播页按"同时观看人数"估算上行，填了"我的上行带宽"会在超过 80 % 时标红；"正在观看"列表上方显示当前实际需要的上行。
 - 国内家宽上行常见 30~100 Mbps、澳洲 NBN 常见 20~50 Mbps：朋友开播给两三个人看时，码率一般要降到 10~20 Mbps。
 
 ## 画面卡顿 / 断线，按什么顺序排查？
@@ -90,7 +90,7 @@ HEVC 10-bit、60 fps、桌面/游戏混合内容的经验值：
 
 ## 大家在同一个语音里，观众会听到自己的回声？
 
-在主播端 *Desktop audio → Leave out* 里选语音软件（例如 `Discord.exe`，下拉列表列出正在出声的程序，也可以手打），它和它启动的子进程的声音就不会进流，
+在主播端 **开播 → 声音 → 排除程序** 里选语音软件（例如 `Discord.exe`，下拉列表列出正在出声的程序，也可以手打），它和它启动的子进程的声音就不会进流，
 和 Parsec 的 Echo Cancelling 是同一个 Windows 接口（Windows 10 21H1 或更新）。一次只能排除一个程序。
 
 ## 为什么采集不用 ffmpeg 自带的 ddagrab？

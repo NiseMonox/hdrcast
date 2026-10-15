@@ -38,7 +38,7 @@
 | IPv6 | 双方都有最省事，下面几行都不用管 | 同左 |
 | 公网 IPv4 | 没有 IPv6 时，至少一方的路由器要拿到公网 IPv4（不是 10.x / 100.64~127.x / 172.16~31.x / 192.168.x） | 同左 |
 | 路由器端口转发 | 不用手动做：开播时程序自动用 UPnP 转发自己的 IPv4 端口，下播删除（路由器要开着 UPnP，大多默认开） | 同左（观看期间） |
-| Windows 防火墙 | 界面 **Firewall** 一栏是橙色时点 **Allow…**（Windows 要管理员确认一次；换了新版本的目录要再点一次） | 同左（只有主播是对称型 NAT 时才用得上） |
+| Windows 防火墙 | 界面 **防火墙** 一栏出现 **放行…** 按钮时点它（Windows 要管理员确认一次；换了新版本的目录要再点一次；macOS 不需要） | 同左（只有主播是对称型 NAT 时才用得上） |
 | 上行带宽 | 码率 × 观众数 × 1.25~1.5（§7） | 很少（只有 ACK） |
 | 下行带宽 | 很少 | 码率 × 1.3 |
 
@@ -51,7 +51,7 @@
      路由器和 Windows 防火墙都放行回包，什么都不用开。
    - **对称型 NAT**（每个目的地换一个公网端口：国内运营商、运营商级 NAT 常见）：它发来的包来自一个对方没见过的端口，
      对方的路由器和 Windows 防火墙会当成"没请求过的包"丢掉。这时**另一方**必须收得下这种包：路由器 UPnP 转发（程序自动做）
-     加 Windows 防火墙规则（点 Allow…）。收到之后程序记下真实端口反过来打洞（design.md §8.6），所以谁当主播都行，
+     加 Windows 防火墙规则（点 **放行…**）。收到之后程序记下真实端口反过来打洞（design.md §8.6），所以谁当主播都行，
      只要另一方是开着的。**双方都是对称型 NAT 时 IPv4 过不去**，至少一方要开 IPv6。
    - 实例（2026-09-25）：朋友（江苏电信，没有 IPv6）公布的端口是 :20833，发给主播时变成 :20834。主播这边只有防火墙规则时，
      网卡上一个包都没收到（XG-100NE 丢掉了）；路由器 UPnP 转发一加上，不到一秒就连上。
@@ -62,9 +62,9 @@
 |---|---|
 | This PC has no IPv6 internet connection, and the host offered no public IPv4 address… | 本机没有 IPv6，主播也没公布公网 IPv4（主播那边的 UDP 回显没回复，见 §1.1 第 1 条），IPv4 根本没试：本机按 §2 打开 IPv6，或者先把 UDP 18651 放行 |
 | This PC has no IPv6 internet connection, and the IPv4 attempt did not get through… | 本机没有 IPv6，IPv4 打洞也没成（至少一方 NAT 不配合，§1.1 第 2 条；后面注明 *could not be found* 的是本机自己的公网 IPv4 也没拿到）：按 §2 打开 IPv6 |
-| …did not get through: the host's PC only takes IPv4 from routers that keep ports… | 主播的 IPv4 没打开（路由器没转发或防火墙没放行），而本机路由器多半是对称型 NAT：让主播点 Allow…、确认路由器开着 UPnP；或者本机开 IPv6 |
-| …did not get through although the host takes IPv4 from any port… | 主播那边是开着的，包还是没到：本机的 VPN / 代理 / 加速器（Clash TUN、UU 之类）截走了 UDP，关掉或让 HdrCastReceiver 直连 |
-| 主播状态栏 `IPv4 closed to routers that change ports: …` | 主播的 IPv4 没打开，冒号后面写了缺什么：`no router forward (UPnP)` → 路由器里打开 UPnP；`no firewall rule (click Allow)` → 点 Allow…；`router behind another NAT` → 路由器外面还有一层 NAT（光猫路由模式或运营商级 NAT），转发帮不上 |
+| …did not get through: the host's PC only takes IPv4 from routers that keep ports… | 主播的 IPv4 没打开（路由器没转发或防火墙没放行），而本机路由器多半是对称型 NAT：让主播点 **放行…**、确认路由器开着 UPnP；或者本机开 IPv6 |
+| …did not get through although the host takes IPv4 from any port… | 主播那边是开着的，包还是没到：本机的 VPN / 代理 / 加速器（Clash TUN、UU 之类）截走了 UDP，关掉或让 HdrCast 直连 |
+| 开播页面板 `IPv4 closed to routers that change ports: …` | 主播的 IPv4 没打开，冒号后面写了缺什么：`no router forward (UPnP)` → 路由器里打开 UPnP；`no firewall rule (click Allow)` → 点 **放行…**；`router behind another NAT` → 路由器外面还有一层 NAT（光猫路由模式或运营商级 NAT），转发帮不上 |
 | 日志 `[p2p] router: could not forward UDP …` | 路由器没开 UPnP、或拒绝了转发（括号里是路由器的错误码）。每分钟起重试，开了之后不用重开程序 |
 | 日志 `connected via IPv4 … (a port their router picked for this PC …)` | 对方是对称型 NAT，靠这边打开的 IPv4 连上的：正常 |
 | 主播日志 `left (could not connect: no candidate answered; …)` | 对方的包一个都没到。分号后面是判断：这边 IPv4 已打开 → 对方那边有东西截走了 UDP；没打开 → 先按提示打开 |
@@ -73,7 +73,7 @@
 | 主播状态栏 `no public IPv4 found` / 日志 `public IPv4 check: no answer…` | 信令服务器的 UDP 18651 没回复：在腾讯云安全组放行（§6）。主播端每分钟重试、观众端每次加入前重试，放行后不用重开 |
 | Both sides have IPv6 but the path is blocked… | 都有 IPv6 但包过不去：多半是 VPN（关掉）或路由器"IPv6 防火墙：阻止所有入站"之类的严格设置（改成默认 / 标准） |
 | Not live right now / Nobody in the group is live | 主播还没点 Start；列表每 10 s 自动刷新 |
-| … is full | 达到主播设的 Max viewers |
+| … is full | 达到主播设的"同时观看人数" |
 | The signaling server cannot be reached | 本机断网，或信令服务器挂了；已经在看的人不受影响 |
 
 ## 2. IPv6 自查与开启
@@ -141,8 +141,8 @@ recv_buffer_size = 8000000                                    # UDP socket 缓�
 - **有一方是对称型 NAT**（§1.1 第 2 条）：另一方要收得下"没请求过的"UDP，两样都要：
   - **路由器**：程序自己用 UPnP 把当前 IPv4 端口转发到本机。租期 1 小时，直播 / 观看期间每 20 分钟续一次，停止时删除；
     程序崩溃的话最多 1 小时后自动失效。日志里是 `[p2p] router: …` 几行。路由器设置里 UPnP 要开着（大多默认开）。
-  - **Windows 防火墙**：界面 **Firewall** 一栏是橙色时点 **Allow…**。Windows 弹 UAC 确认后加一条入站规则
-    "HdrCast Sender"（观众端是 "HdrCast Receiver"）：只对这个 exe、只 UDP、所有网络类型；以前在 Windows 弹窗里点"取消"
+  - **Windows 防火墙**：界面 **防火墙** 一栏出现 **放行…** 时点它。Windows 弹 UAC 确认后加一条入站规则
+    "HdrCast"（0.2 的两个程序各有一条 "HdrCast Sender" / "HdrCast Receiver"，可以留着）：只对这个 exe、只 UDP、所有网络类型；以前在 Windows 弹窗里点"取消"
     留下的阻止规则会被停用（不删除）。主播开播时如果还没放行，程序会问一次。
   - 规则认 exe 的完整路径：换到新版本的目录（比如 `D:\HdrCast-0.2.4\`）要再点一次。撤销：Windows 安全中心 → 防火墙和网络保护
     → 高级设置 → 入站规则，删掉这条。
@@ -170,4 +170,4 @@ recv_buffer_size = 8000000                                    # UDP socket 缓�
 
 例：40 Mbps，日本 1 人 + 澳洲 1 人 + 中国 1 人 ≈ 40 × (1.25 + 1.25 + 1.5) = 160 Mbps 上行。
 日本的光纤上行一般够；国内家宽上行常见 30~100 Mbps、澳洲 NBN 常见 20~50 Mbps，朋友开播时要降码率或限人数。
-发送端界面会按 Max viewers 估算，填了 *my upload* 就会在超过 80 % 时标红提醒。
+开播页会按"同时观看人数"估算，填了"我的上行带宽"就会在超过 80 % 时标红提醒。

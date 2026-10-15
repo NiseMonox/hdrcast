@@ -1,4 +1,4 @@
-# HdrCast 设计定稿（v0.2：点对点）
+# HdrCast 设计定稿（v0.3：Rust 重写，点对点）
 
 > 本文是实装的唯一规格来源。所有参数都有来源：`docs/research/` 下的调研报告（读源码 + 本机实测）。
 > 与本文冲突的实现以本文为准；本文有错就改本文。
@@ -12,6 +12,10 @@
   v0.1 的 MediaMTX 中继模式和手动直连模式已删除（AV1 只能走直连，所以一起去掉，只剩 HEVC）。
   腾讯云服务器只做信令（几百字节的签名元数据），**不转视频**；连不上时不中转，只提示原因。
 - 很多人没有公网 IPv4，但大多有 IPv6：点对点优先走 IPv6 打洞，IPv4 打洞只是额外尝试。配对用邀请码，不手输地址。
+- v0.3（2026-10）：**用 Rust 重写**。0.2 的 `HdrCastSender.exe` / `HdrCastReceiver.exe`（C#、WinForms）合并成一个应用 `HdrCast`
+  （Tauri 2，界面见 §2.7）；支持 **macOS**（观看和开播，§10）；新增**远程控制**（§9）。架构不变：ffmpeg 编码、mpv 播放仍是外部进程。
+  **线上协议仍是 v1**（§8）：0.3 与 0.2.4 互相能看，信令服务器没有改动；设置文件也沿用（`group.json`、`sender.json`、`receiver.json`）。
+  下文凡是写 Windows 机制的地方（DXGI、WASAPI、命名管道、防火墙），macOS 的对应做法都在 §10。
 
 ## 1. 架构
 
@@ -24,15 +28,16 @@
         └──── 签名的 live / join / answer ──── 腾讯云 hdrcast-signal ────────┘
 ```
 
-主播端 `HdrCastSender.exe` 的采集部分（子进程 A：同一个 exe 的 `capture` 模式，DXGI 桌面复制 → D3D11 shader → P010/NV12 →
-命名管道；WASAPI loopback → 音频管道）和编码 ffmpeg（子进程 B，只做编码 + 封装）见 §2；观众端 `HdrCastReceiver.exe` 启动 mpv，见 §3。
+主播端的采集部分（子进程 A：`HdrCast` 自己的 `capture` 模式，DXGI 桌面复制 → D3D11 shader → P010/NV12 →
+命名管道；WASAPI loopback → 音频管道）和编码 ffmpeg（子进程 B，只做编码 + 封装）见 §2；观众端由同一个应用启动 mpv，见 §3。
 
 - 为什么这样分：SRT 本身端到端不变（AES、重传、按观众的 latency），HdrCast 只在两端各加一个透明 UDP 转发器负责打洞；
   ffmpeg 的 SRT listener 只接受一个连接，所以每位观众一个 remux 子进程，一路编码喂给所有子进程。
 - 编码器 stdout 直接进分发器（`-progress` 改到 stderr，按"key=value"行过滤）：比让 ffmpeg 往 Windows 命名管道写输出更稳
   （后者要 `-y` 且依赖 CreateFile 对管道的处理，无法在 Linux 上验证）。编码器自动重启时新 stdout 接进同一个 SwitchableStream，观众不掉线。
-- 实现：`shared/Group`（邀请码、密钥、签名消息、group.json）、`shared/P2p`（打洞、链路、分发、信令客户端、P2pHost、ViewerSession）、
-  `signal/`（信令服务器）。协议与格式见 §8。
+- 实现：`crates/core`（邀请码、密钥、签名消息、group.json，以及地址 / SRT URL / 进程 / 防火墙这些基础件）、
+  `crates/p2p`（打洞、链路、分发、信令客户端、P2pHost、ViewerSession）、`signal/`（信令服务器，Python，0.3 未改）。协议与格式见 §8。
+  0.2 的 C# 源码（`shared/`、`sender/`、`receiver/`、`tests/`）留在仓库里当对照：Rust 的测试拿它的真实输出逐字节比过。
 
 ### 1.1 为什么采集不用 ffmpeg 的 ddagrab
 
@@ -49,13 +54,19 @@ ffmpeg（7.1 与 master）的 mpegts 封装器**不支持 AV1-in-MPEG-TS**（本
 
 ## 2. 发送端
 
-### 2.1 exe 的三种运行模式
+### 2.1 一个可执行文件的几种运行模式
 
 | 命令行 | 作用 |
 |---|---|
-| `HdrCastSender.exe` | WinForms GUI |
-| `HdrCastSender.exe list-outputs [--json]` | 枚举 DXGI 输出：索引、`\\.\DISPLAYn`、友好名、分辨率、刷新率、HDR 是否开启（`DXGI_OUTPUT_DESC1.ColorSpace == RGB_FULL_G2084_NONE_P2020`）、MaxLuminance |
-| `HdrCastSender.exe capture <参数>` | 采集引擎（无窗口，stdout 写 JSON 统计，stderr 写日志） |
+| `HdrCast` | 应用本身（§2.7） |
+| `HdrCast hdrcast:…` | 应用，启动后提示加入这条邀请 |
+| `HdrCast list-outputs [--json]` | 枚举显示器：索引、设备名（Windows `\\.\DISPLAYn`，macOS 是 `CGDirectDisplayID`）、友好名、分辨率、刷新率、HDR 是否开启（Windows：`DXGI_OUTPUT_DESC1.ColorSpace == RGB_FULL_G2084_NONE_P2020`）、MaxLuminance |
+| `HdrCast audio-devices` | 列出音频输出端点（Windows） |
+| `HdrCast capture <参数>` | 采集引擎（无窗口，stdout 写 JSON 统计，stderr 写日志）。应用把自己当子进程这样启动 |
+| `HdrCast firewall-allow` | 加 Windows 防火墙入站规则后退出；由界面的 **放行…** 以管理员身份启动（§8.7） |
+
+`main` 先把参数交给 `hdrcast_capture::cli_main`，是引擎模式就直接跑完退出，不创建窗口。Windows 的发行版是窗口子系统程序：
+被应用带管道启动时 stdout / stderr 照常工作；在终端里手动跑时会附着到父控制台，但交互式终端不等它结束（用 `| more` 或写进 .cmd）。
 
 采集引擎参数：
 
@@ -117,10 +128,10 @@ uint cr10 = (uint)round(512.0 + 896.0 * Cr);
 
 ### 2.4 音频
 
-- `NAudio.Wasapi` 2.2.1（netstandard2.0）：`WasapiLoopbackCapture` 抓默认渲染设备；同时开一路 `WasapiOut` 播放静音，保证渲染引擎不进入空闲（否则 loopback 停止吐数据）。
-- 输出格式统一重采样/转换为 **f32le 48000 Hz 2ch**（设备 mix format 若不同则用 NAudio 的 `MediaFoundationResampler` 或简单线性重采样）。
+- 直接用 WASAPI（`windows` crate；0.2 用的是 NAudio）：loopback 抓默认渲染设备，每 10 ms 取一次；同时开一路渲染流播放静音，保证渲染引擎不进入空闲（否则 loopback 停止吐数据）。
+- 输出格式统一转换为 **f32le 48000 Hz 2ch**（设备 mix format 不是 48 kHz 时做跨缓冲连续的线性重采样）。
 - **与视频锁同一时钟**：以 QPC 为准计算「应已输出的采样数」= elapsed × 48000；实际写入落后超过 150 ms 则补零，超前超过 150 ms 则丢弃多余采样。这样 ffmpeg 两路都用理想时间戳也不会漂。
-  容差必须远大于 loopback 的交付粒度：NAudio 轮询取数，音频一批几十毫秒、还略有延迟。v0.2.1 用 20 ms 时，写管道的线程在两批之间就补零，
+  容差必须远大于 loopback 的交付粒度：0.2 的 NAudio 轮询取数，音频一批约 62 ms、还略有延迟。v0.2.1 用 20 ms 时，写管道的线程在两批之间就补零，
   下一批又被当成"超前"砍掉开头，每秒几十次（引擎统计 `audio_underrun` ≈ 38/s），观众听到的是低沉的嗡嗡声。容差只用来吸收时钟漂移和真正的卡顿。
 - **排除某个程序的声音**（`--audio-exclude <app.exe>`，GUI 的 *Leave out*，类似 Parsec 的 Echo Cancelling）：用 Windows 的进程 loopback
   （`ActivateAudioInterfaceAsync(VAD\Process_Loopback)`，`PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE`，Windows 10 21H1+ / 11）
@@ -166,18 +177,30 @@ ffmpeg -hide_banner -loglevel warning -nostdin -stats_period 1 -progress pipe:2
 - listener 只能绑具体地址：libsrt 绑 `[::]` 必须显式设 SRTO_IPV6ONLY，而 ffmpeg 没有这个选项（实测 "Operation not supported"）。这里只绑 127.0.0.1，不受影响。
 - 不用 ffmpeg 的 `mode=rendezvous`（它会 bind 到远端地址）；打洞由 HdrCast 自己做。
 
-### 2.7 GUI（WinForms，代码生成 UI，不用设计器 resx）
+### 2.7 应用（Tauri 2）
 
-区块：
-1. 显示器：下拉列表（来自 `list-outputs`），显示 HDR 状态；刷新按钮。模式：自动 / 强制 SDR。
-2. 画质：编码器（探测结果）、码率 Mbps（数字框 + 预设 20/40/80）、帧率（30/60/120）、输出分辨率（原生 / 2560×1440 / 1920×1080）、质量档（速度优先 / 均衡 / 画质优先 → 映射到各编码器 preset）、GOP 秒（默认 2）、B 帧开关、lookahead 开关。
-3. 音频：开关、设备、编码（AAC 192k / Opus 128k）。
-4. 组（Share with your group）：组名、Create group… / Paste invite / Copy invite、Max viewers、本机上行（用于"需要多少上行"的提示）。
-5. 控制：Start / Stop、Open logs；状态栏：采集 fps / 重复帧 / 编码 fps / 码率 / speed / 丢帧 / 已运行时间 / 观众（名字、IPv6/IPv4、RTT、所需上行）。
-6. ffmpeg 路径：自动查找（exe 同目录 `ffmpeg.exe`、`tools\ffmpeg.exe`、PATH），可浏览；缺失时提示下载 gyan.dev **full** 版。
-- 配置文件：`%APPDATA%\HdrCast\sender.json`（`DataContractJsonSerializer`）。
+一个窗口，Rust 后端（`app/`）+ 网页前端（`ui/`：原生 ES 模块 + vendored preact/htm，不需要 Node 构建，直接嵌进可执行文件）。
+外观是系统风格的侧边栏 + 分组卡片，**黑白灰**为主，颜色只留给"直播中"的红点和报错文字；跟随系统浅色 / 深色；
+Windows 11 用 Mica、macOS 用侧边栏毛玻璃作窗口背景（没有时退回不透明）；Windows 上自绘标题栏按钮，macOS 用系统的红黄绿。
+界面文字有英 / 中 / 日三套（`ui/i18n.js`），默认跟随系统；引擎给出的状态句子和日志保持英文（它们是排障时互相发的东西）。
+
+页面：
+1. **开播**：显示器卡片（带 HDR 徽标、分辨率、刷新率、峰值亮度）；画面（码率滑块、帧率、分辨率、HDR 自动 / 始终 SDR、编码器 + **检测**，
+   更多选项里是编码预设、关键帧间隔、B 帧、Lookahead、指针）；声音（开关、设备、AAC / Opus、排除程序）；观众（同时观看人数、上行带宽与估算、
+   远程控制 关闭 / 询问我 / 允许、防火墙 **放行…**）。底部固定一条：将要发送的格式 + **开始直播**。
+   直播中顶部换成面板：码率 / 编码 fps / 采集 fps / 丢帧，下面是正在观看的人（IPv6 / IPv4、ping、延迟、远程控制状态与 允许 / 拒绝 / 收回）。
+2. **观看**：正在直播的朋友（每 10 s 向信令服务器要一次；不要更快，服务器按 IP 限流每秒 10 次）；延迟预设（快速 300 ms / 日本 / 澳大利亚 / 中国 / 自定义）；
+   是否请求远程控制；输出（自动 / HDR / SDR）。观看中顶部是面板：缓冲、帧率、码率、丢帧、是否 HDR 直通，以及 **全屏** / **停止**。
+3. **设置**：语言、外观；群组（邀请码复制 / 粘贴 / 新建、改名）；ffmpeg / mpv 路径；播放器细项（硬解、缓冲、接收缓冲按多大码率算、峰值亮度、全屏用哪块屏、追赶、ffmpeg 管道兜底）；防火墙；关于。
+4. **日志**：全部日志行（已脱敏），可筛选、复制、打开文件夹。
+
+前后端之间：前端调命令（`app/src/commands.rs`），后端每 400 ms 推一份完整的状态快照（`status` 事件）和成批的日志行（`log` 事件），界面只按快照重画。
+第一次运行（没有组）是欢迎页：**我有邀请码** / **新建群组**。Windows 上窗口回到前台时看一眼剪贴板（序号变了才读），有邀请就问要不要加入。
+
+- 配置文件：`%APPDATA%\HdrCast\` 下的 `sender.json`、`receiver.json`（字段名和整数枚举与 0.2 的 DataContract 文件相同，旧文件直接可读）、
+  `app.json`（界面语言 / 外观 / 远程控制的两个开关）、`group.json`。环境变量 `HDRCAST_DATA_ROOT` 可以把整个目录换到别处（并行跑第二份配置用）。
 - 崩溃保护：ffmpeg 或采集进程意外退出 → 停止另一方，3 s 后自动重启；新编码器的 stdout 接进同一个分发器，观众不用重新加入。
-- 进程树：两个 GUI 都创建 **Job Object（KILL_ON_JOB_CLOSE）** 并把每个子进程加入，任务管理器强杀 GUI 或 GUI 崩溃时子进程一起死。采集引擎另有 `--parent-pid`（用一个 `OpenProcess(SYNCHRONIZE)` 句柄轮询，不是每帧扫全系统进程表）。
+- 进程树：应用创建 **Job Object（KILL_ON_JOB_CLOSE）** 并把每个子进程加入，任务管理器强杀应用或应用崩溃时子进程一起死（macOS：退出时逐个杀进程组）。采集引擎另有 `--parent-pid`（用一个 `OpenProcess(SYNCHRONIZE)` 句柄轮询，不是每帧扫全系统进程表）。
 - **启动顺序**：采集引擎必须先把**两个**管道都建好，GUI 轮询到管道出现后才启动 ffmpeg（固定 sleep 不够：引擎要先建 D3D11 设备并编译 shader）。音频管道必须在等待视频管道客户端**之前**创建，否则两边互等。
   轮询**只能用 `WaitNamedPipe`**，不能用 `File.Exists` / `GetFileAttributes`：对 `\\.\pipe\<name>` 查属性本身就是一次客户端连接，会占掉唯一的实例，ffmpeg 随后得到 ERROR_PIPE_BUSY（CRT 译成 `Error opening input: Invalid argument`），引擎写端报 `Pipe is broken`，无限重启（v0.2.0 在 Windows 上的实际故障，`NamedPipeProbeTests` 防回归）。
 - 音频端点打不开时**不终止会话**：管道照建，写静音，日志说明原因（ffmpeg 已经被告知有音频输入，缺管道会直接退出）。
@@ -205,7 +228,8 @@ mpv --vo=gpu-next --gpu-api=d3d11 --hwdec=d3d11va
 - HDR 直通只在 `--wid` 嵌入或独立窗口下都以「窗口化 HDR」工作，静态元数据只在全屏时下发 → 提供全屏按钮（`--fs`，不用 `--d3d11-exclusive-fs`）。
 - **不嵌入 libmpv**，独立启动 mpv.exe；用 JSON IPC 命名管道读 `demuxer-cache-duration`、`frame-drop-count`、`video-params`、`video-target-params`、`hwdec-current`、`estimated-vf-fps`、`paused-for-cache` 显示状态。
 - 兜底：「用 ffmpeg 拉流」模式 = `ffmpeg -i srt://127.0.0.1:<L>?... -c copy -f mpegts - | mpv -`（万一 mpv 构建没带 libsrt）。
-- mpv 路径：同目录 `mpv.exe` / `tools\mpv.exe` / PATH；缺失时提示下载 shinchiro 或 zhongfly 构建（均带 libsrt）。
+- mpv 路径：同目录 `mpv.exe` / `tools\mpv.exe` / PATH；缺失时提示下载 shinchiro 或 zhongfly 构建（均带 libsrt）。macOS 见 §10。
+- 远程控制开着时，应用另外观察 mpv 的 `mouse-pos` 和 `osd-dimensions`，并让 mpv 把按键转给自己（§9）。
 - 配置：`%APPDATA%\HdrCast\receiver.json`。
 
 ## 4. 信令服务器（signal/）
@@ -227,16 +251,37 @@ mpv --vo=gpu-next --gpu-api=d3d11 --hwdec=d3d11va
 
 ## 6. 工程与构建
 
-- `sender/`、`receiver/`：net48 WinForms，`Microsoft.NETFramework.ReferenceAssemblies`，`ILRepack.Lib.MSBuild.Task` 把 SharpDX(.DXGI/.Direct3D11/.D3DCompiler 4.2.0)、NAudio.Core/NAudio.Wasapi 2.2.1 合并成单 exe；合并失败则退回「exe + DLL 目录」。
-- `shared/`：平台无关逻辑（命令行构造、SRT URL / 缓冲计算、`-progress` 与 mpv IPC 解析、设置模型、编码器档位表），以源码链接方式编进两个 exe 与 `tests/`（net10 + xunit，本机运行）。
-- `build.sh`：`dotnet build -c Release` 两个工程 → `dotnet test` + 信令服务器的 Python 测试 → `dist/HdrCast-<ver>/`（exe、`signal/`、`scripts/`、`docs/`、README）。
-- 配置存 `%APPDATA%\HdrCast\`；日志存 `%APPDATA%\HdrCast\logs\`。
+Cargo workspace（Rust 1.85+，edition 2021）。全部用普通线程和阻塞 I/O，没有异步运行时（Tauri 自己的除外）。
 
-## 7. 验证计划
+| crate | 内容 |
+|---|---|
+| `crates/core`（hdrcast-core） | 地址解析、SRT URL / 缓冲计算、参数引用、日志脱敏、工具查找、路径、`LineProcess` / `ProcessJob`、Windows 防火墙；群组（密钥、邀请码、签名消息、`group.json`） |
+| `crates/p2p`（hdrcast-p2p） | UDP 通道、打洞状态机、HostLink / ViewerLink、回显、UPnP、信令客户端、分发、P2pHost / ViewerSession、旁路通道 |
+| `crates/capture`（hdrcast-capture） | 采集引擎：平台无关的主循环（节拍、重复帧、统计、音频对齐、管道写线程）+ 后端（`win/`：DXGI / D3D11 / WASAPI；`mac/`：ScreenCaptureKit；其余：桩） |
+| `crates/media`（hdrcast-media） | 编码器档位、ffmpeg 命令、`-progress` 解析、编码器探测、`sender.json`；mpv 命令、IPC 消息、日志分类、`receiver.json` |
+| `crates/control`（hdrcast-control） | 远程控制：报文、按键名、输入注入（§9） |
+| `app`（hdrcast，产物 `HdrCast`） | Tauri 2 应用：窗口、命令、采集 + ffmpeg 的编排（`sender_runner`）、mpv 的编排（`mpv_runner`、`mpv_ipc`）、远程控制两端的粘合 |
 
-Linux 本机：`dotnet build` 0 警告；`dotnet test` 覆盖命令行构造 / URL / 缓冲计算 / 解析器 / 邀请码与签名（golden 向量）/ 打洞（模拟有状态防火墙）/
-全栈端到端（真 Python 信令服务器 + 真 libx265 HDR10 编码 + P2pHost + 两个 ViewerSession + ffprobe）；`python3 -m unittest discover -s signal/tests`。
-Windows（只能由用户做）：`list-outputs` 正确识别 HDR；`capture` 单独跑 10 s 落盘为 `.p010` 用 ffmpeg 转 PNG 检查亮度；完整推流；朋友端 mpv HDR 直通 / SDR 色调映射；4K60 下采集 fps 与 GPU 占用。
+- `build.sh`：`cargo test --workspace` + 信令服务器的 Python 测试 → Windows：`cargo build --release -p hdrcast`，装配 `dist/HdrCast-<版本>/`
+  （`HdrCast.exe`、`tools/`、`scripts/`、`docs/`、`signal/`、README）并出 zip；macOS：`cargo tauri build` 出 `HdrCast.app` 和 dmg。
+- 配置存 `%APPDATA%\HdrCast\`（macOS：`~/Library/Application Support/HdrCast/`）；日志存其下的 `logs/hdrcast-yyyyMMdd.log`。
+- 界面不经打包器：`node scripts/ui-preview.mjs` 可以在浏览器里单独打开它（`ui/mock.js` 扮演后端）。
+- 调试用的环境变量：`HDRCAST_DATA_ROOT`（另一份配置）、`HDRCAST_NO_ROUTER=1`（不做 UPnP）、`HDRCAST_CONTROL_DRY_RUN=1`（远程控制只写日志）、
+  调试构建里的 `HDRCAST_DEVTOOLS_PORT`（把界面暴露给 DevTools 协议，脚本驱动真实窗口用）。
+
+## 7. 验证
+
+- 自动（`cargo test --workspace`，Windows 上跑）：
+  - 协议 golden 向量（`tests/vectors/group-v1.json`，Python 测试也读它）；与 **C# 0.2.4 的真实输出**逐字节对照（core：1359 个刁钻输入；
+    media：946 个向量，覆盖全部编码器参数表、ffmpeg / mpv 命令行、设置文件）；`group.json` 经真实的 .NET `DataContractJsonSerializer` 往返。
+  - 打洞（模拟有状态防火墙、对称型 NAT 两个方向）、假路由器上的 UPnP、真 Python 信令服务器上的全栈（真 libx265 HDR10 编码 + P2pHost + 两个 ViewerSession + ffprobe）。
+  - 把发行版 0.2.4 的 exe 加载起来与 Rust 版**互相观看**（两个方向都出 HEVC Main10 / PQ 画面）。
+  - 每一组生成的编码器参数都让真 ffmpeg 编一次；mpv 的每个选项名和取值都问过真 mpv。
+  - 采集引擎：假后端上的主循环契约；真显示器上的 `list-outputs` / selftest / P010 与 NV12 落盘，与 0.2.4 的 exe 对比。
+  - 远程控制：报文、丢包重传、收回时松键；真实注入单独有一个默认忽略的测试（把指针"移"到原地、点一下 Shift）。
+- 需要缺的工具时（Python、ffmpeg、mpv、0.2.4 的发行目录）测试会在 stderr 打印 `SKIPPED` 后通过；`HDRCAST_TOOLS` 指向工具目录。
+- 真机清单：`docs/windows-checklist.md`（含"单机回环"的做法）、`docs/macos-checklist.md`。**macOS 的全部代码只在 Windows 上做过类型检查**
+  （`cargo check --target aarch64-apple-darwin`；整个应用还需要给构建脚本一个假的 C 编译器），没有运行过。
 
 ## 8. 点对点模式协议（v1）
 
@@ -386,3 +431,111 @@ ffmpeg -hide_banner -loglevel warning -probesize 65536 -analyzeduration 500000 -
 `HostLink` 为每个会话开一个 `127.0.0.1` 本地 socket 连到 `<Y>`，在 WAN 与子进程之间原样搬运数据报。
 观众端 `ViewerLink` 在 `127.0.0.1:<L>` 上等 mpv（`srt://127.0.0.1:<L>`，caller），搬到主播的已确认地址。
 本机已实测：SRT（含 AES）穿过这种透明转发器正常；一路编码分给两个 remux 子进程，中途加入的观众也能读到 HEVC Main10 / PQ。
+
+### 8.9 旁路通道（side channel，0.3.0 起）
+
+远程控制（观众的鼠标 / 键盘，由 `hdrcast-control` 处理）不另开连接，借打洞出来的同一条 UDP 路径传自己的小数据报。
+P2P 层**只搬运、不解释**：不看载荷，也不替它加密或认证。线上协议仍是 v1：不用旁路通道时，每一个字节都与 0.2.4 相同。
+
+```
+偏移 长度
+ 0   8        magic    "HDRCSIDE"（ASCII）
+ 8   16       sid      （原始 16 字节，与控制包相同）
+24   1..1200  payload  使用者自己的内容
+```
+
+- **接收判定顺序**（§8.6 的补充）：先看是不是控制包，再看是不是 UDP 回显的回复（§8.7），然后看是不是旁路数据报，剩下的才按 SRT 数据处理。
+  以 `HDRCSIDE` 开头的数据报**永远不会**当作 SRT 转给 ffmpeg / mpv：格式不对（没有载荷、载荷超过 1200 字节、头不完整）也是直接丢弃。
+- **接受条件**：`sid` 是一个在用的会话，**并且**来源地址是该会话已确认的地址（即收到过 punchKey MAC 正确的控制包的地址）。
+  两条都满足才把载荷交给使用者注册的处理函数；其他情况一律丢弃。主播按 `sid` 找会话，观众只认当前会话的 `sid`（重新加入后旧 `sid` 作废）。
+- **记账与 SRT 数据相同**：收到一个被接受的旁路数据报会刷新 15 s 的静默计时，主播也会把数据路径跟到它的来源地址；
+  发出一个旁路数据报算作"发过包"，2 s 内不再补 KEEPALIVE。发送走会话当前选定的路径；会话没连上、或载荷不在 1..1200 字节内 → 不发（返回 false）。
+- **大小**：24 + 1200 = 1224 字节，小于 SRT 数据报（1316 字节载荷 + 16 字节头），所以 SRT 走得通的路径它也走得通。不分片、不重传、不保序，
+  这些由使用者自己处理（远程控制：指针位置取最新，按键重发到对方确认为止）。
+- **安全**：链路只保证"来自本会话已确认过的地址"，与 SRT 数据同等（SRT 自己有 AES，旁路通道没有）。载荷的保密、防伪造、防重放由使用者负责：
+  远程控制用 `controlKey(sid) = sub("ctl/" + sid)`（派生方式同 §8.3，每个会话一把）做 AEAD。
+
+**能力标志**。0.2.4 不认识这种数据报，会把它当 SRT 塞给 ffmpeg / mpv，所以只能发给明确说过"我懂"的对端：
+
+| 消息 | 可选字段 | 含义 |
+|---|---|---|
+| `live` | `"rc":true` | 这个主播会说旁路通道，并且现在提供远程控制。主播每次心跳读一次当前设置；不提供时不写 |
+| `join` | `"rc":true` | 这个观众会说旁路通道，并请求控制。不请求时不写 |
+
+- 只在为 true 时写，写在已有字段之后（`live`：`…,"viewers":1[,"open4":…][,"rc":true]`；`join`：`…,"overhead":50[,"rc":true]`）；缺省 = 否。
+  不带 `rc` 的消息与 0.2.4 逐字节相同，`tests/vectors/group-v1.json` 的 golden 信封不变。
+- **发送规则**：主播只向 `join` 带 `rc` 的会话发；观众只在所看主播的 `live` 记录带 `rc` 时发（以本次加入时读到的记录为准，主播中途打开开关要到下次加入才生效）。
+  接收一侧不看标志（没声明的对端本来就不会发）。
+- 旧版本不受影响：C# 0.2.4 读消息时按字段名取值，未知字段忽略；信令服务器只存取 `p` / `m` 两个串，不解析载荷。
+  已实测（`crates/p2p/tests/csharp_interop_tests.rs`，把发行版里的 `HdrCastReceiver.exe` / `HdrCastSender.exe` 加载进 PowerShell 5.1 直接驱动它们的
+  `ViewerSession` / `P2pHost`）：带 `rc` 的 `live` 记录，0.2.4 观众照常加入并出画面；带 `rc` 的 `join`，0.2.4 主播照常接受并出画面；两个方向都没有任何旁路数据报发出。
+
+接口（Rust，`hdrcast-p2p`）：`HostLink::set_side_handler(fn(sid, payload))` / `send_side(sid, payload)`，`ViewerLink::set_side_handler(fn(payload))` / `send_side(payload)`；
+`P2pHost` 与 `ViewerSession` 原样透传（处理函数在 `start()` 前后设置都可以），并负责上面的发送规则：`P2pHostOptions.offer_remote_control`（→ `live` 的 `rc`）、
+`ViewerInfo.wants_control`（← `join` 的 `rc`）、`ViewerSessionOptions.request_control`（→ `join` 的 `rc`）、`ViewerSession::host_offers_control()`（← `live` 的 `rc`）、
+`ViewerSession::sid()`（当前会话 id，用来派生 `controlKey`）。处理函数在网络线程上被调用，要短，不能阻塞。
+
+## 9. 远程控制（0.3.0 起）
+
+观众可以请求使用主播的鼠标和键盘。输入走 §8.9 的旁路通道，所以只有双方都是 0.3+ 才有；画面延迟还是 SRT 延迟 + 播放器缓冲，
+这是"帮忙点一下"的功能，不是远程桌面（建议配合 300 ms 的"快速"预设）。
+
+**谁说了算**。主播的设置 `remoteControl`：关闭（`live` 不带 `rc`，谁也控制不了）/ 询问我（每个请求弹一次，默认拒绝直到点允许）/ 允许（请求即允许）。
+观众在开始观看前勾"远程控制"（→ `join` 带 `rc`）。主播随时可以对某个观众**收回**；改成"关闭"立即收回所有人。
+
+**观众端不碰操作系统**：画面本来就在 mpv 的窗口里，mpv 的 JSON IPC 能给出一切。
+
+- 指针：观察属性 `mouse-pos`（`x, y, hover`）和 `osd-dimensions`（窗口大小与画面四周的黑边），换算成"画面内的比例坐标"；在黑边上或窗口外时不发位置。
+- 按键 / 鼠标键 / 滚轮：应用先问 mpv 自己的客户端名（`client_name`，形如 `ipc_0`），再 `define-section` 一个输入段，把**每个键名 × 16 种修饰键组合**
+  都绑定到 `script-binding <客户端名>/hdrcast-input`（mpv 对修饰键是精确匹配，所以要全列出来；约 2600 行）。之后每次按键 mpv 发来
+  `client-message ["key-binding","hdrcast-input","d-|u-|r-|p-…","Ctrl+c",…]`，带按下 / 抬起 / 重复和键名。非 ASCII 字符由 `any_unicode` 兜住。
+  这个段只在主播允许期间启用（同时把 `window-dragging` 关掉，否则拖拽会拖动播放器窗口）；`Ctrl+Alt+ENTER` 留给本地切全屏。
+- mpv 报的字符已经带了 Shift（`A`、`!`），修饰键只作为别的键的前缀出现（`Ctrl+c`），单独按 Shift / Ctrl 不会上报。
+
+**报文**（旁路通道的载荷）：
+
+```
+ 0  1   dir      1 观众→主播   2 主播→观众
+ 1  8   counter  大端，每个方向严格递增（既是 AEAD 的 nonce，也用来防重放 / 丢弃迟到的包）
+ 9  ..  ChaCha20-Poly1305(key = controlKey(sid), nonce = dir || 0 0 0 || counter, aad = "HDRCCTL1")
+```
+
+- 观众→主播明文：版本 1、标志（bit0 = 想要控制）、指针 x / y（0..65535，跨画面）、指针是否在画面内、第一个事件的序号、事件数（≤ 32）、
+  事件 ×N（各 8 字节：类型 1 键下 / 2 键上 / 3 鼠标键下 / 4 鼠标键上 / 5 滚轮 / 6 文本，修饰键位 Shift=1 Ctrl=2 Alt=4 Meta=8，键码，参数）。
+- 主播→观众明文：版本 1、授权状态（0 拒绝 / 1 等待主播回答 / 2 已允许）、已执行到的事件序号。
+- 指针位置取最新；按键、鼠标键、滚轮在收到确认前每 40 ms 重发，主播按序号**只执行一次**。指针移动最多每 8 ms 发一次；没事可说时每 500 ms 发一个心跳
+  （让主播知道请求还在，也拿回授权状态）。5 s 没有任何回答 → 界面显示"这位主播没有开放"。
+- 键码：字符键就是 Unicode 码点；命名键（Enter、方向键、F1–F12、小键盘…）排在 0x110000 之后（`crates/control/src/keys.rs`，只增不改）。
+
+**主播端执行**（`HostControl` + `Injector`）：
+
+- 修饰键：每个事件带着它发生时的修饰键位，执行前把"我们按下的修饰键"同步成它（缺的按下、多的抬起），所有键和鼠标键都抬起后把修饰键全松开。
+- 字符键：Windows 用 `VkKeyScanW` 找到当前键盘布局里打出这个字符的键和所需的 Shift / Ctrl / Alt，缺的修饰键只在这一下按键周围点一下；
+  布局里打不出的字符（中文等）用 `KEYEVENTF_UNICODE` 当文本输入。虚拟键都带上扫描码（有的游戏只认它）。指针用 `SendInput` 的虚拟桌面绝对坐标，
+  限制在正在分享的那块显示器的矩形里。macOS 用 Quartz 事件（§10）。
+- **不留按住的键**：收回、观众离开、会话结束时全部松开；1.5 s 没收到这位观众的任何报文也全部松开；序号出现缺口（观众的队列溢出过）时先全部松开再继续。
+- 局限：Windows 上以管理员身份运行的窗口不接受注入；Win 键、`Alt+Tab`、`Ctrl+Alt+Del` 在观众自己的系统里就被拦下了；没有相对鼠标（不适合 FPS）。
+- 主播和观众在同一台电脑上试的时候，真注入会让播放窗口里的指针反过来驱动自己：设 `HDRCAST_CONTROL_DRY_RUN=1`，主播端只把收到的动作写进日志
+  （不写是哪个字符键，日志是要发给别人看的）。
+
+## 10. macOS（0.3.0 起，尚未在真机上运行）
+
+| Windows | macOS |
+|---|---|
+| DXGI 桌面复制 + D3D11 shader | ScreenCaptureKit（`SCStream`）。色彩转换由系统做：SDR 取 `420v`（NV12），HDR 取 10 bit 双平面（先试 `x420`，不给就取 `xf44` 在 CPU 上降成 4:2:0），PQ / BT.2020，需要 macOS 15 + Apple 芯片 |
+| WASAPI loopback | 同一条 `SCStream` 的系统音频（macOS 13+，`excludesCurrentProcessAudio`）。没有"排除某个程序" |
+| 命名管道 `\\.\pipe\<name>` | 临时目录下的 FIFO（`mkfifo`，0600，写端非阻塞 + `poll`）。4K60 P010 是 1.5 GB/s，FIFO 的吞吐是否够要实测 |
+| `--format p010` 总能给出 | 系统给不了 HDR 采集时引擎**报错退出**而不是悄悄改成 nv12（ffmpeg 已经按 p010 开始读了）；显示器列表里的 `hdr` 因此表示"这块屏现在有 EDR 余量，并且这台 Mac 能采 HDR" |
+| NVENC / AMF / QSV / x265 | `hevc_videotoolbox`（HDR：`-profile:v main10`、`p010le`；`-realtime 1 -allow_sw 0`）或 x265 |
+| mpv `--gpu-api=d3d11 --hwdec=d3d11va` | `--vo=gpu-next --hwdec=videotoolbox`（其余选项相同；HDR 直通是否还需要别的选项要在 XDR 屏上看） |
+| mpv IPC 命名管道 | 临时目录下的 Unix 套接字 |
+| 工具在 `tools\` | Homebrew：`/opt/homebrew/bin`、`/usr/local/bin`（`brew install ffmpeg mpv`），或应用包里的 `Resources/tools` |
+| `%APPDATA%\HdrCast` | `~/Library/Application Support/HdrCast` |
+| Windows 防火墙规则 + **放行…** | 没有对应物（界面不显示这一栏）；UPnP 照做 |
+| 稳定 IPv6 地址：`GetAdaptersAddresses` 的 SuffixOrigin / DAD 状态 | `getifaddrs` + `SIOCGIFAFLAG_IN6`（跳过 temporary / deprecated） |
+| `SendInput` | Quartz 事件（`CGEventPost`），需要"辅助功能"授权；字符键按 US 键位表给键码，表里没有的当 Unicode 文本；双击靠自己数点击次数 |
+| 剪贴板里有邀请时自动提示 | 不做（macOS 会向用户报告每一次读剪贴板）；用 **我有邀请码** / **粘贴邀请码** |
+| Mica | 侧边栏毛玻璃（`NSVisualEffectView`），系统的红黄绿按钮 |
+
+权限：开播要"屏幕与系统音频录制"（第一次开播时系统弹框，允许后要重开应用）；当主播被远程控制要"辅助功能"。
+

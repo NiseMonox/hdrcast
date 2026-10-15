@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# HdrCast build script (run from the repo root, on Linux or in Git Bash on Windows, with the .NET 10 SDK):
-#   builds sender + receiver (net48 WinForms, Release), runs the test project and the signaling server's
-#   Python tests, assembles dist/HdrCast-<version>/ with ffmpeg, ffprobe and mpv in tools/, and zips it
-#   to dist/HdrCast-<version>.zip.
-# A failing sender/receiver build is reported but does not abort the script (the rest is still packaged);
-# the exit code is non-zero if anything failed.
+# HdrCast build script (run from the repo root: Git Bash on Windows, a terminal on macOS; needs Rust, see README):
+#   runs the tests (cargo test, plus the signaling server's Python tests), builds the app in release mode and
+#   packages it.
+#     Windows  dist/HdrCast-<version>/ with HdrCast.exe and ffmpeg / ffprobe / mpv in tools/, zipped to
+#              dist/HdrCast-<version>.zip
+#     macOS    dist/HdrCast.app and a .dmg, made by the Tauri CLI (cargo install tauri-cli --version "^2" --locked);
+#              ffmpeg and mpv come from Homebrew there and are not bundled
 #   ./build.sh              full run
-#   ./build.sh --no-test    skip dotnet test
+#   ./build.sh --no-test    skip the tests
 #   ./build.sh --no-tools   leave ffmpeg / mpv out (a small zip: users run scripts\get-tools.cmd)
 #   ./build.sh --tools DIR  take ffmpeg.exe, ffprobe.exe and mpv.exe from DIR instead of ./tools
 #                           (./tools is filled by scripts/get-tools.ps1 on Windows when it is empty)
 #   ./build.sh --clean      remove dist/ first
 set -uo pipefail
-export DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT" || exit 1
@@ -26,20 +26,28 @@ while [ $# -gt 0 ]; do
     --no-tools) WITH_TOOLS=0 ;;
     --tools) shift; [ $# -gt 0 ] || { echo "--tools needs a directory" >&2; exit 2; }; TOOLS_DIR="$1" ;;
     --clean) rm -rf "$ROOT/dist" ;;
-    -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
   shift
 done
 
-command -v dotnet >/dev/null 2>&1 || { echo "dotnet SDK not found" >&2; exit 1; }
+command -v cargo >/dev/null 2>&1 || { echo "cargo not found: install Rust from https://rustup.rs" >&2; exit 1; }
 # A Python that really runs: on Windows "python3" can be the Microsoft Store stub, which only prints a hint.
 PYTHON=""
 for c in python3 python; do
   if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import zipfile' >/dev/null 2>&1; then PYTHON="$c"; break; fi
 done
-VERSION="$(sed -n 's:.*<Version>\([^<]*\)</Version>.*:\1:p' "$ROOT/Directory.Build.props" | head -1)"
+case "$(uname -s)" in
+  Darwin) OS=macos ;;
+  MINGW*|MSYS*|CYGWIN*) OS=windows ;;
+  *) OS=other ;;
+esac
+VERSION="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version *= *"\([^"]*\)".*/\1/p' "$ROOT/Cargo.toml" | head -1)"
 VERSION="${VERSION:-0.0.0}"
+# Where cargo puts its output (a .cargo/config.toml may move it off this checkout).
+TARGET="$(cargo metadata --format-version 1 --no-deps 2>/dev/null | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p' | sed 's/\\\\/\//g')"
+TARGET="${TARGET:-$ROOT/target}"
 DIST="$ROOT/dist/HdrCast-$VERSION"
 LOGDIR="$ROOT/dist/logs"
 mkdir -p "$LOGDIR"
@@ -47,26 +55,14 @@ mkdir -p "$LOGDIR"
 FAILED=()
 step() { printf '\n==== %s ====\n' "$*"; }
 
-build_proj() { # $1 = label, $2 = csproj
-  step "build $1 ($2, Release)"
-  if dotnet build "$2" -c Release 2>&1 | tee "$LOGDIR/build-$1.log" | grep -E 'error|warning|Build succeeded|Time Elapsed|Warning\(s\)|Error\(s\)' | grep -vE '^\s*$' | tail -n 20; then :; fi
-  if grep -qE '^\s*[0-9]+ Error\(s\)' "$LOGDIR/build-$1.log" && ! grep -qE '^\s*0 Error\(s\)' "$LOGDIR/build-$1.log"; then
-    echo "!! $1 build FAILED (see $LOGDIR/build-$1.log)"; FAILED+=("$1"); return 1
-  fi
-  if ! grep -q 'Build succeeded' "$LOGDIR/build-$1.log"; then
-    echo "!! $1 build FAILED (no 'Build succeeded' in $LOGDIR/build-$1.log)"; FAILED+=("$1"); return 1
-  fi
-  return 0
-}
-
-SENDER_OK=0; RECEIVER_OK=0
-build_proj sender   "$ROOT/sender/HdrCast.Sender.csproj"     && SENDER_OK=1
-build_proj receiver "$ROOT/receiver/HdrCast.Receiver.csproj" && RECEIVER_OK=1
-
 if [ "$RUN_TESTS" = 1 ]; then
-  step "test (tests/HdrCast.Tests.csproj, net10.0)"
-  if dotnet test "$ROOT/tests/HdrCast.Tests.csproj" -c Release 2>&1 | tee "$LOGDIR/test.log" | grep -E 'Passed!|Failed!|error|Total tests|Passed:|Failed:|Skipped:|Duration' | tail -n 12; then :; fi
-  if ! grep -qE 'Passed!|Test Run Successful|Passed: *[0-9]+, *Failed: *0' "$LOGDIR/test.log" || grep -qE 'Failed!|error [A-Z]+[0-9]+' "$LOGDIR/test.log"; then
+  step "test (cargo test --workspace)"
+  # The media tests need ffmpeg / ffprobe / mpv: they look in $HDRCAST_TOOLS, then on PATH, and say when they skip.
+  [ -z "${HDRCAST_TOOLS:-}" ] && [ -d "$TOOLS_DIR" ] && export HDRCAST_TOOLS="$TOOLS_DIR"
+  if cargo test --workspace > "$LOGDIR/test.log" 2>&1; then
+    grep -E '^test result' "$LOGDIR/test.log" | awk '{p+=$4; f+=$6; i+=$8} END {printf "  %d passed, %d failed, %d ignored\n", p, f, i}'
+  else
+    grep -E '^test .* FAILED|^error|panicked' "$LOGDIR/test.log" | tail -n 20
     echo "!! tests FAILED (see $LOGDIR/test.log)"; FAILED+=("tests")
   fi
 
@@ -82,25 +78,54 @@ if [ "$RUN_TESTS" = 1 ]; then
   fi
 fi
 
+# ---------------------------------------------------------------------------------------------- macOS
+if [ "$OS" = macos ]; then
+  step "build HdrCast.app (cargo tauri build)"
+  if ! cargo tauri --version >/dev/null 2>&1; then
+    echo '!! the Tauri CLI is missing: cargo install tauri-cli --version "^2" --locked'
+    exit 1
+  fi
+  if (cd "$ROOT/app" && cargo tauri build) > "$LOGDIR/build.log" 2>&1; then
+    mkdir -p "$ROOT/dist"
+    rm -rf "$ROOT/dist/HdrCast.app"
+    cp -R "$TARGET/release/bundle/macos/HdrCast.app" "$ROOT/dist/"
+    cp "$TARGET"/release/bundle/dmg/*.dmg "$ROOT/dist/" 2>/dev/null || true
+    echo "  dist/HdrCast.app $(du -sh "$ROOT/dist/HdrCast.app" | cut -f1)"
+    ls "$ROOT"/dist/*.dmg 2>/dev/null | sed 's/^/  /'
+    echo "  ffmpeg and mpv are not inside: brew install ffmpeg mpv"
+  else
+    tail -n 30 "$LOGDIR/build.log"; echo "!! build FAILED (see $LOGDIR/build.log)"; FAILED+=("app")
+  fi
+  if [ "${#FAILED[@]}" -gt 0 ]; then
+    echo; echo "BUILD FINISHED WITH FAILURES: ${FAILED[*]}  (logs in $LOGDIR)"; exit 1
+  fi
+  echo; echo "BUILD OK: $ROOT/dist/HdrCast.app"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------------------------- Windows
+step "build HdrCast.exe (cargo build --release -p hdrcast)"
+APP_OK=0
+if cargo build --release -p hdrcast > "$LOGDIR/build.log" 2>&1; then
+  APP_OK=1
+  tail -n 1 "$LOGDIR/build.log"
+else
+  grep -E '^(error|warning: unused)' -A 6 "$LOGDIR/build.log" | tail -n 40
+  echo "!! build FAILED (see $LOGDIR/build.log)"; FAILED+=("app")
+fi
+
 step "assemble $DIST"
 rm -rf "$DIST"
 mkdir -p "$DIST"
-
-copy_exe_dir() { # $1 = label, $2 = bin dir, $3 = exe name
-  if [ ! -f "$2/$3" ]; then echo "  (skip $1: $2/$3 not built)"; return; fi
-  cp "$2/$3" "$DIST/"
-  [ -f "$2/${3%.exe}.exe.config" ] && cp "$2/${3%.exe}.exe.config" "$DIST/"
-  # DLLs next to the exe (ILRepack merged builds leave none; unmerged builds need them)
-  shopt -s nullglob
-  for dll in "$2"/*.dll; do cp "$dll" "$DIST/"; done
-  shopt -u nullglob
-  echo "  $3 $(du -h "$2/$3" | cut -f1)"
-}
-[ "$SENDER_OK" = 1 ]   && copy_exe_dir sender   "$ROOT/sender/bin/Release/net48"   HdrCastSender.exe
-[ "$RECEIVER_OK" = 1 ] && copy_exe_dir receiver "$ROOT/receiver/bin/Release/net48" HdrCastReceiver.exe
+if [ "$APP_OK" = 1 ] && [ -f "$TARGET/release/HdrCast.exe" ]; then
+  cp "$TARGET/release/HdrCast.exe" "$DIST/"
+  echo "  HdrCast.exe $(du -h "$DIST/HdrCast.exe" | cut -f1)"
+else
+  echo "  (no HdrCast.exe: not built)"
+fi
 
 mkdir -p "$DIST/scripts" "$DIST/docs"
-# signaling server for P2P mode (deployed once on a small server; never video) - no state, no tests
+# signaling server (deployed once on a small server; never video) - no state, no tests
 mkdir -p "$DIST/signal"
 for f in hdrcast_signal.py hdrcast-signal.service deploy.sh README.md; do
   [ -f "$ROOT/signal/$f" ] && cp "$ROOT/signal/$f" "$DIST/signal/"
@@ -112,7 +137,7 @@ cp "$ROOT"/docs/*.md "$DIST/docs/" 2>/dev/null || true
 for f in README.md README.en.md LICENSE; do [ -f "$ROOT/$f" ] && cp "$ROOT/$f" "$DIST/"; done
 mkdir -p "$DIST/tools"
 
-# ffmpeg / ffprobe (sender) and mpv (viewer) ship in tools/ so nobody has to download anything first.
+# ffmpeg / ffprobe (sharing) and mpv (watching) ship in tools/ so nobody has to download anything first.
 TOOLS=(ffmpeg.exe ffprobe.exe mpv.exe)
 tools_missing() { for t in "${TOOLS[@]}"; do [ -s "$TOOLS_DIR/$t" ] || return 0; done; return 1; }
 winpath() { cygpath -w "$1" 2>/dev/null || wslpath -w "$1" 2>/dev/null || echo "$1"; }
@@ -130,7 +155,7 @@ if [ "$WITH_TOOLS" = 1 ]; then
     echo "!! ${TOOLS[*]} must be in $TOOLS_DIR (scripts/get-tools.ps1 fills ./tools on Windows), or build with --no-tools"
     FAILED+=("tools")
   elif ! "$TOOLS_DIR/ffmpeg.exe" -hide_banner -version >/dev/null 2>&1; then
-    # Linux without Wine: they cannot be tried here, only copied.
+    # Not on Windows: they cannot be tried here, only copied.
     for t in "${TOOLS[@]}"; do cp "$TOOLS_DIR/$t" "$DIST/tools/"; done
     FFMPEG_VERSION="(not checked on this system)"; MPV_VERSION="(not checked on this system)"; BUNDLED=1
     echo "  copied without checking them (cannot run Windows programs here)"
@@ -149,7 +174,7 @@ fi
 
 if [ "$BUNDLED" = 1 ]; then
   cat > "$DIST/tools/README.txt" <<TXT
-ffmpeg.exe + ffprobe.exe (the sender) and mpv.exe (the viewer) are included:
+ffmpeg.exe + ffprobe.exe (for sharing) and mpv.exe (for watching) are included:
 
   ffmpeg / ffprobe  $FFMPEG_VERSION
                     BtbN FFmpeg-Builds, win64-gpl     https://github.com/BtbN/FFmpeg-Builds
@@ -166,7 +191,7 @@ Anything on PATH works too. See README.md.
 TXT
 else
   cat > "$DIST/tools/README.txt" <<'TXT'
-Put ffmpeg.exe + ffprobe.exe (sender) and/or mpv.exe (viewer) here.
+Put ffmpeg.exe + ffprobe.exe (for sharing) and/or mpv.exe (for watching) here.
 
 Easiest: double-click ..\scripts\get-tools.cmd - it downloads both into this folder and verifies them.
   get-tools.cmd sender    only ffmpeg + ffprobe

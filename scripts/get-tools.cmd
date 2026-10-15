@@ -6,7 +6,7 @@ rem   get-tools.cmd              both tools
 rem   get-tools.cmd sender       ffmpeg + ffprobe only
 rem   get-tools.cmd viewer       mpv only
 rem   get-tools.cmd force        re-download even when the tools are already there
-rem Everything lands in tools\ next to HdrCastSender.exe / HdrCastReceiver.exe; nothing is installed
+rem Everything lands in tools\ next to HdrCast.exe; nothing is installed
 rem system-wide and nothing is written outside this folder.
 
 set "ROLE=both"

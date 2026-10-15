@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Writes tests/vectors/csharp-0.2.4.json: what the C# 0.2.4 code in shared/Sender and shared/Receiver produces
+    for a matrix of inputs, on the runtime the product runs on (.NET Framework 4.8). The Rust tests in
+    tests/csharp_vectors.rs must produce the same.
+
+    Run it from a copy outside the repository, so that no bin/obj folders appear in it. Copy this folder to
+    SCRATCH\generator, then (the output file is the program's only argument):
+      dotnet build SCRATCH\generator\Generator.csproj -c Release -p:SharedDir=REPO\shared\
+      SCRATCH\generator\bin\Release\net48\Generator.exe REPO\crates\media\tests\vectors\csharp-0.2.4.json
+  -->
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <NoWarn>$(NoWarn);CS1574;CS1591;CS8632</NoWarn>
+    <RootNamespace>HdrCast.Vectors</RootNamespace>
+    <SharedDir Condition="'$(SharedDir)' == ''">$(MSBuildThisFileDirectory)..\..\..\..\..\shared\</SharedDir>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+    <Reference Include="System.Runtime.Serialization" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="$(SharedDir)Sender\*.cs" LinkBase="Shared\Sender" />
+    <Compile Include="$(SharedDir)Receiver\*.cs" LinkBase="Shared\Receiver" />
+    <Compile Include="$(SharedDir)Capture\*.cs" LinkBase="Shared\Capture" />
+    <Compile Include="$(SharedDir)Common\*.cs" LinkBase="Shared\Common" />
+    <Compile Remove="$(SharedDir)Common\WindowsFirewall.cs" />
+    <Compile Include="$(SharedDir)IsExternalInit.cs" LinkBase="Shared" />
+  </ItemGroup>
+</Project>

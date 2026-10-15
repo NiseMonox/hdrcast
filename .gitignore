@@ -18,3 +18,13 @@ logs/
 # OS
 Thumbs.db
 .DS_Store
+
+# Rust
+target/
+.cargo/config.toml
+
+# ui tooling
+node_modules/
+
+# Tauri generated schemas
+app/gen/
