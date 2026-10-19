@@ -127,14 +127,14 @@ fi
 mkdir -p "$DIST/scripts" "$DIST/docs"
 # signaling server (deployed once on a small server; never video) - no state, no tests
 mkdir -p "$DIST/signal"
-for f in hdrcast_signal.py hdrcast-signal.service deploy.sh README.md; do
+for f in hdrcast_signal.py hdrcast-signal.service deploy.sh README.md README.zh-CN.md; do
   [ -f "$ROOT/signal/$f" ] && cp "$ROOT/signal/$f" "$DIST/signal/"
 done
 # .cmd launchers plus the .ps1 payloads they call (get-tools.cmd is useless without get-tools.ps1)
 cp "$ROOT"/scripts/*.cmd "$ROOT"/scripts/*.ps1 "$DIST/scripts/" 2>/dev/null || true
 # docs: markdown only (research JSON stays in the repo)
 cp "$ROOT"/docs/*.md "$DIST/docs/" 2>/dev/null || true
-for f in README.md README.en.md LICENSE; do [ -f "$ROOT/$f" ] && cp "$ROOT/$f" "$DIST/"; done
+for f in README.md README.zh-CN.md LICENSE; do [ -f "$ROOT/$f" ] && cp "$ROOT/$f" "$DIST/"; done
 mkdir -p "$DIST/tools"
 
 # ffmpeg / ffprobe (sharing) and mpv (watching) ship in tools/ so nobody has to download anything first.

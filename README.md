@@ -1,152 +1,293 @@
 # HdrCast
 
-把桌面（含 HDR10 与电脑声音）以 10~100 Mbps 的高码率"推流式"分享给中国 / 日本 / 澳大利亚的朋友，延迟 1.5~5 s，画面不糊不卡。私人用，**点对点**：谁都能开播，同组的朋友直接从主播的电脑收流，不需要中继、不需要公网 IPv4、不用改路由器。Windows 和 macOS 都能用。
+**English** | [简体中文](README.zh-CN.md)
 
-- **一个应用**：`HdrCast`，左边栏切换「开播 / 观看」，群组和邀请码共用一份。0.3 起用 Rust 重写（Tauri 2 界面），取代 0.2 的 `HdrCastSender.exe` / `HdrCastReceiver.exe`；协议没变，0.2.4 的朋友仍然能互相看。
-- **点对点（IPv6 打洞）**：双方经信令服务器交换地址后同时给对方发包，两边路由器和防火墙都会放行这条流。信令服务器只转几百字节的签名元数据（谁在播、候选地址），**视频从不经过它**。
-- **没有 IPv6 也能连**：IPv4 走公网映射打洞；对方路由器是对称型 NAT（国内常见，每个目的地换端口）时，程序自动在路由器上用 UPnP 转发自己的端口，Windows 上再点一次防火墙的 **放行…**，按对方的真实端口反向打洞（见 [docs/network.md](docs/network.md) §1.1）。
-- **一次邀请码，永久可用**：主播建组后发一段 `hdrcast:…` 给朋友，朋友复制整条消息打开 HdrCast 就会提示加入。
-- **HDR10 全链路**：
-  - Windows：DXGI 桌面复制 → D3D11 compute shader（scRGB → PQ / BT.2020 / P010）→ NVENC / AMF / QSV / x265 HEVC Main10
-  - macOS：ScreenCaptureKit（macOS 15 起可采 HDR）→ VideoToolbox HEVC Main10
-  - → SRT（AES-256，每位观众单独重传）→ mpv HDR 直通。SDR 观众由 mpv 做色调映射。
-- **多人同时看**：一路编码，按观众各起一个只转封装的 ffmpeg（不重编码），每人按自己地区的延迟重传；谁卡了只影响他自己。
-- **电脑声音**：不用虚拟声卡，与视频同一时钟。Windows 上可以排除一个程序的声音（例如语音软件，免得观众听到自己的回声）。
-- **不用开播也能连（0.3.1）**：应用开着就以「在线」出现在组里，别人点「连接」、你同意（或规则允许）后才开始采集屏幕，最后一个人走后自动停。像 Parsec 那样随时连回自己的电脑。
-- **按电脑授权的远程控制（0.3.1）**：每台电脑有自己的设备码，主播给每台电脑定「能不能直接看、能不能控制」：自己的笔记本连上就能控制，朋友只能看，别人每次都要问你。输入走同一条点对点路径，端到端加密，密钥只有那两台电脑算得出来。
+Share your desktop, in HDR10 and with the computer's sound, with friends far away (it was made for friends in China, Japan
+and Australia) at 10-100 Mbps and 1.5-5 s behind live, with a picture that stays sharp and smooth. It is made for a private
+group and works **peer-to-peer**: anyone in the group can share, and the others receive the stream straight from the
+sharer's computer. No relay server, no public IPv4 address, no port forwarding to set up. Runs on Windows and macOS.
 
-> 现状（0.3.1）：Windows 上的采集、编码、点对点、播放和界面已在真机上测过；**macOS 的代码只在 Windows 上做过类型检查，还没有在 Mac 上跑过**，第一次运行请按 [docs/macos-checklist.md](docs/macos-checklist.md) 逐步核对。
+- **One app.** `HdrCast` has a Share page and a Watch page that use the same group and invite. Since 0.3 it is written in
+  Rust (Tauri 2 UI) and replaces the `HdrCastSender.exe` / `HdrCastReceiver.exe` of 0.2. The protocol did not change, so
+  friends still on 0.2.4 can watch and share with you.
+- **Peer-to-peer over IPv6.** The two computers swap addresses through a small signaling server, then send to each other at
+  the same moment, so both routers and firewalls let the stream through (hole punching). The signaling server only passes
+  a few hundred bytes of signed metadata (who is live, candidate addresses); **the video never goes through it**.
+- **Works without IPv6, too.** Over IPv4, HdrCast punches through the public address mapping. When the other side's router
+  is a symmetric NAT (a new port for every destination, common in China), HdrCast forwards its own port on your router with
+  UPnP and, after one click on **Allow…** for Windows Firewall, punches back to the other side's real port (see
+  [docs/network.md](docs/network.md) §1.1).
+- **One invite, good for ever.** Whoever starts the group sends friends a message with an `hdrcast:…` line; a friend copies
+  the whole message, opens HdrCast and is asked to join.
+- **HDR10 all the way:**
+  - Windows: DXGI desktop duplication → D3D11 compute shader (scRGB → PQ / BT.2020 / P010) → NVENC / AMF / QSV / x265 HEVC Main10
+  - macOS: ScreenCaptureKit (HDR capture from macOS 15) → VideoToolbox HEVC Main10
+  - → SRT (AES-256, retransmission per viewer) → mpv with HDR passthrough. On an SDR display mpv tone-maps.
+- **Several viewers at once.** One encode; each viewer gets a remux-only ffmpeg (no re-encoding) that retransmits for that
+  viewer's distance. A viewer with a bad connection only affects themselves.
+- **The computer's sound.** No virtual audio device, on the same clock as the picture. On Windows you can leave one app's
+  sound out (your voice chat, say, so friends do not hear their own echo).
+- **Connect without going live (0.3.1).** While the app runs, the computer shows as **Online** in the group. Somebody clicks
+  **Connect**; once you allow it (or a rule does), capture starts, and it stops after the last viewer leaves. Like Parsec,
+  you can connect back to your own computer at any time.
+- **Remote control by computer (0.3.1).** Every computer has its own device code, and the sharer decides per computer who
+  may watch without asking and who may control: your own laptop gets control as soon as it connects, friends only watch,
+  anybody else has to ask every time. Input takes the same peer-to-peer path, end-to-end encrypted with a key only those
+  two computers can work out.
+- **English, Chinese and Japanese** in the app (**Settings → Language**; Automatic follows the system).
 
-## 架构
+> **Status (0.3.1):** on Windows, capture, encoding, peer-to-peer, playback and the UI have been tested on real machines.
+> **The macOS code has only been type-checked on Windows and has never run on a Mac**: for a first run, go through
+> [docs/macos-checklist.md](docs/macos-checklist.md) step by step.
+
+## What you need
+
+- **Windows 10 or 11** (64-bit), or **macOS 13** or newer. Sharing HDR from a Mac needs macOS 15 and Apple silicon.
+- **IPv6**, ideally. Peer-to-peer works best over IPv6 (it has no NAT, so the two computers can reach each other). Check at
+  <https://test-ipv6.com>: "10/10", or at least "IPv6 address detected", is what you want. No IPv6? It can often be
+  switched on in the router, or your ISP can enable it. Without IPv6 HdrCast uses IPv4, which works as long as the
+  sharer's side is open (next point).
+- **Windows Firewall: one click.** If the **Firewall** line in the app offers **Allow…**, click it once and confirm the
+  Windows prompt. Some routers (common in China) give every destination a new port, and a PC only lets such packets in when
+  Windows Firewall allows HdrCast. The app opens its port on the router by itself (UPnP) while it shares or plays, and
+  closes it again when it stops.
+- **ffmpeg** (to share) and **mpv** (to watch), built with SRT support. Windows: both already come in the `tools\` folder of
+  the release. macOS: `brew install ffmpeg mpv`. See [Tools](#tools).
+- A GPU that decodes 10-bit HEVC in hardware (NVIDIA GTX 10 series or newer, AMD RX 400 or newer, Intel 7th gen or newer,
+  any Apple silicon Mac).
+- Download bandwidth of about 1.3 × the stream's bitrate (a 40 Mbps stream needs about 50 Mbps). Sharing needs one stream's
+  worth of upload per viewer (see [Sharing](#sharing)).
+
+## Getting started
+
+### Install
+
+- **Windows:** unzip `HdrCast-<version>.zip` anywhere and run `HdrCast.exe`. ffmpeg, ffprobe and mpv are already in its
+  `tools\` folder. (Friends usually get the zip from whoever runs the group; to make one, see [Building](#building).)
+- **macOS:** drag `HdrCast.app` to Applications, then install the tools: `brew install ffmpeg mpv`. The first time you share,
+  macOS asks for the Screen & System Audio Recording permission.
+
+### Start or join a group
+
+- **Start a group:** on the first start choose **Start a group**, then a group name and your name. The invite is copied to
+  the clipboard: paste it into your WeChat / LINE / Discord group, and **only send it to people you trust**: anybody who has
+  it can watch.
+- **Join one:** **copy the whole invite message** a friend sent you, then open HdrCast. It asks whether to join: say yes and
+  type the name your friends will see. If it does not ask, choose **I have an invite** (or **Settings → Paste Invite**).
+
+### Watching
+
+1. **Watch** lists the computers in the group that are online (refreshed every 10 s). Pick where you watch from under
+   **Delay**: Japan 1.5 s, Australia 2 s, China 3.5 s.
+2. A computer marked **LIVE** is broadcasting: click **Watch**. One that is only **Online** starts sharing when you click
+   **Connect**, and its owner may have to let you in first (you see **WAITING**).
+3. On an **HDR display**, switch HDR on first (Windows: `Win + Alt + B`). On an SDR display, set **Output** to SDR.
+4. When it does not connect, the panel says why, for example "This PC has no IPv6 internet connection". See
+   [If something is wrong](#if-something-is-wrong).
+
+The delay is there on purpose: this is a broadcast that rides out a bumpy connection, not a remote desktop. For remote
+control, use the **Fast** preset (see below).
+
+### Sharing
+
+1. On **Share**, pick the display, the bitrate and **Viewers at once** (and, if you like, **My upload speed**, to be warned
+   before the stream outgrows your connection), then click **Go Live**.
+   Every viewer costs one full stream of your upload: 3 viewers at 40 Mbps need about 150 Mbps up, retransmission included.
+2. The panel at the top shows the bitrate, frame rate and dropped frames. The list below shows who is watching, over IPv6 or
+   IPv4, their network ping (not the picture delay) and each viewer's delay setting.
+3. In a voice chat with the group? On Windows, pick it under **Sound → Leave out** (for example `Discord.exe`) so
+   your friends do not hear themselves come back through the stream. Needs Windows 10 21H1 or newer; one app at a time.
+4. You do not have to go live at all: see the next section.
+
+## Connect any time, and remote control
+
+**Online or live.** While HdrCast runs and **Share → Who Can Connect → Available to connect** is on (the default), the
+computer shows as **Online** in the group. When somebody clicks **Connect**, the rules below decide; the screen is only
+captured once somebody has been let in, and capture stops 20 s after the last one leaves. **Go Live** opens it to the whole
+group instead: everybody not set to **Never** may watch without asking.
+
+**Closing the window keeps you online.** While Available to connect is on, the window's close button only tucks HdrCast
+into the notification area (the tray; the menu bar on a Mac), and the computer stays online. Click the tray icon (or
+**Open HdrCast** in its menu) to get the window back; **Quit HdrCast** really goes offline, after saying goodbye to viewers
+and the signaling server. With Available to connect off, closing the window quits, as before. A red dot on the tray icon
+means somebody is watching this computer right now. Starting HdrCast again while it runs only brings its window back.
+
+**Online from sign-in.** **Settings → General → Start HdrCast when I sign in** starts HdrCast without a window every time you
+sign in, so the computer is online without you doing anything, like Parsec. On Windows it is a value named `HdrCast` under
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (`"…\HdrCast.exe" --background`), which Task Manager also lists under
+Startup apps; the switch shows the real state, and says so when Task Manager turned it off or when it starts an older
+copy in another folder. On macOS it is `~/Library/LaunchAgents/app.hdrcast.login.plist`.
+When somebody asks to watch (or for control) while the window is closed, the window comes to the front and its taskbar
+button flashes: click **Allow** or **Deny**. It does not take the keyboard away from what you are typing in. A request
+nobody answers is turned down after 50 s.
+
+**Who can connect** (on the Share page):
+
+- **Everyone else in the group:** Watch *Allow / Ask Me / Never*, Control *Off / Ask Me / Automatic*. The default is Ask Me
+  and Off. Friends on HdrCast 0.3.0 or older cannot prove which computer they use, so this rule always applies to them.
+- **One rule per computer.** Computers are recognised by their **device code** (like `7KQ2-M9XD-4TPA`), not by their name.
+  **Add a Computer…** lists the computers in the group that are online or asked to connect lately: choose **My Computer**
+  (connects without asking, gets control at once) or **Trusted Friend** (watches without asking, control only when you say
+  yes). **Always Allow** on a request adds that computer, too.
+- Every computer's code is in **Settings → Group → This computer**. Before you give a computer control, compare the code
+  with the one on that computer.
+
+**Your laptop, able to control your desktop from anywhere:**
+
+1. Install HdrCast 0.3.1 or newer on both and join the same group (copy the same invite). Give them different names
+   (**Settings → My name**, say "Mo – laptop").
+2. On the desktop: **Share → Who Can Connect → Add a Computer…**, find the laptop (check its code), choose **My Computer**.
+3. Later, anywhere: on the laptop open HdrCast → **Watch** → the desktop → **Connect**. Nothing has to be clicked on the
+   desktop, and you have control as soon as you are connected. HdrCast has to be running on the desktop (its window may be
+   closed): turn on **Start HdrCast when I sign in** there, and it is, after every restart.
+
+**As a viewer:** where the sharer gives you control automatically, you are in control as soon as you connect: the player
+window sends your mouse and keyboard to their computer (`Ctrl + Alt + Enter` stays with your player: full screen on/off).
+**Just Watch** hands control back, **Take Control** takes it again. Where the sharer set Ask Me, click **Request Control**
+and wait for them to allow it. The sharer can **Take Back** control or **Disconnect** you at any time (after a disconnect
+you cannot connect again for a minute).
+
+- The picture is still behind by the SRT delay plus the player buffer: for remote control pick the **Fast** preset (300 ms)
+  and lower **Settings → Player buffer**. Good for using a computer and changing settings, not for games (there is no
+  relative mouse).
+- A sharing Mac needs HdrCast allowed under System Settings → Privacy & Security → Accessibility. On Windows, programs
+  running as administrator ignore the injected input unless HdrCast runs as administrator, too.
+- A sharer on 0.2.4 offers no remote control; a sharer on 0.3.0 has no device codes and no Online, and uses its own
+  *Off / Ask Me / Allow* setting.
+
+## If something is wrong
+
+The panel on the Watch page says what happened. The usual ones:
+
+| Message | What to do |
+|---|---|
+| This PC has no IPv6 internet connection | Turn IPv6 on in your router, or ask your ISP; test-ipv6.com shows the state. If it adds *the host offered no public IPv4 address*, IPv4 was never tried: tell whoever runs the signaling server that its UDP port 18651 is closed. |
+| … the host's PC only takes IPv4 from routers that keep ports … | Your router changes ports and the sharer's side is closed: ask them to click **Allow…** next to Firewall and to check that UPnP is on in their router. Or turn IPv6 on. |
+| … although the host takes IPv4 from any port … | Something on your computer grabs UDP: a VPN, proxy or game accelerator (Clash TUN, UU, …). Turn it off, or let HdrCast bypass it. |
+| The host's PC has no IPv6 internet connection | The friend who shares needs IPv6 (same advice, their side). |
+| Neither side has IPv6 … | At least one of you needs IPv6; the rest of the message says why IPv4 did not work. |
+| Both sides have IPv6 but the path is blocked | A VPN or a very strict firewall drops incoming UDP. Turn the VPN off; in the router, look for "IPv6 firewall: block all". |
+| Not live right now / Nobody is online right now | HdrCast is not running on your friend's computer (they quit it, or turned off Available to connect). The list refreshes by itself. |
+| … did not let you in | The sharer said no, or set your computer to Never. Ask them. |
+| Nobody at … answered your request | The sharer was not at their computer to click Allow within 50 seconds. |
+| … is full | The sharer's **Viewers at once** is reached. |
+| The signaling server cannot be reached | Your internet is down, or the signaling server is. People already watching keep watching. |
+| Picture stutters, then recovers every few seconds | Raise the delay (China: try a custom 4000-5000 ms), or ask for a lower bitrate. |
+| Colours look grey and flat on an HDR display | HDR is off in the system (Windows: `Win + Alt + B`). |
+| mpv says it cannot open `srt://` | Your mpv has no libsrt: use the zhongfly / shinchiro build (get-tools.cmd does) or Homebrew's. |
+
+More in [docs/faq.md](docs/faq.md). When you ask a friend for help, send them what **Activity → Copy** gives you:
+passwords and invites are masked in it.
+
+## Privacy and security
+
+- The video is AES-256 encrypted end to end (SRT), with a key derived from the invite. Remote-control input is encrypted,
+  too (ChaCha20-Poly1305); between two 0.3.1 computers with a key only those two can work out.
+- **The invite is the key to the group:** only share it with people you trust. To lock somebody out, start a new group and
+  send the new invite to the others.
+- The signaling server never sees a password or group key, and it cannot forge addresses: every message is signed with
+  the group key. If it goes down, people already watching keep watching; only new connections have to wait.
+- `device.json` in the settings folder is this computer's identity: whoever has it can pretend to be this computer. Do not
+  send it to anybody, and do not copy it to another computer.
+
+## How it works
 
 ```
-┌──────────────── 主播的电脑 ──────────────────────────────────┐
-│ HdrCast（开播）                                               │
-│   采集引擎（同一个程序的 capture 模式）→ 管道                  │
-│   → ffmpeg 编码 HEVC Main10 → MPEG-TS (stdout)                │
-│   → 分发器：每位观众一个 remux ffmpeg（-c copy，SRT，127.0.0.1）│
-│   → HostLink：[本机 IPv6]:端口 ⇄ 打洞 ⇄ 各位观众               │
-└───────────────┬───────────────────────────────┬──────────────┘
-                │ 点对点（打洞）                   │ 点对点（打洞）
-                ▼                               ▼
-      HdrCast（观看）→ mpv（日本）      HdrCast（观看）→ mpv（中国 / 澳洲）
+┌────────────────────── the sharer's computer ─────────────────────┐
+│ HdrCast (Share)                                                  │
+│   capture engine (the same program in capture mode) → pipe       │
+│   → ffmpeg encodes HEVC Main10 → MPEG-TS (stdout)                │
+│   → fan-out: a remux ffmpeg per viewer (-c copy, SRT, 127.0.0.1) │
+│   → HostLink: [own IPv6]:port ⇄ hole punching ⇄ each viewer      │
+└───────────────┬──────────────────────────────────┬───────────────┘
+                │ peer-to-peer (hole punched)      │ peer-to-peer (hole punched)
+                ▼                                  ▼
+     HdrCast (Watch) → mpv (Japan)      HdrCast (Watch) → mpv (China / Australia)
 
-   腾讯云 hdrcast-signal（signal/）：只存"谁在播 + 候选地址"，全部用组密钥签名；不转视频
+   hdrcast-signal on Tencent Cloud (signal/): only "who is live + candidate addresses",
+   all signed with the group key; never any video
 ```
 
-- 只要**双方都有 IPv6** 就能连（IPv6 没有 NAT，打洞几乎总能成功）；IPv4 打洞是额外尝试。
-- 主播要为每位观众各上传一份：3 人 × 40 Mbps ≈ 150 Mbps 上行（含重传余量）。界面会估算并在超过你填的上行带宽时提醒。
+- Whenever **both sides have IPv6**, they connect (IPv6 has no NAT, so hole punching nearly always works); IPv4 is an extra
+  attempt.
+- The sharer uploads a copy for every viewer: 3 viewers × 40 Mbps ≈ 150 Mbps up, with room for retransmission. The app
+  estimates it and warns when it goes over the upload speed you entered.
 
-## 快速开始：开播的人
+## Signaling server (deployed once)
 
-1. **Windows**：解压发行包，ffmpeg / ffprobe / mpv 已经在 `tools\` 里；运行 `HdrCast.exe`。
-   **macOS**：把 `HdrCast.app` 拖进"应用程序"，再装工具：`brew install ffmpeg mpv`。第一次开播时系统会请求"屏幕与系统音频录制"权限。
-2. 第一次打开选 **新建群组**：起个组名和你的名字，邀请码自动复制到剪贴板。把它发到微信 / LINE / Discord 群里（**只发给信得过的人**：有码就能看）。
-   朋友已经发过你邀请码的话，复制那条消息后打开 HdrCast，它会自己提示加入。
-3. 在 **开播** 页选显示器、码率、同时观看人数（可以顺手填上行带宽），点 **开始直播**。
-   上方面板显示码率、帧率和丢帧；下面的列表里是谁在看、走 IPv6 还是 IPv4、网络 ping（不是画面延迟）以及每人的延迟设置。
-   不点开始直播也可以：应用在运行（窗口关掉、留在托盘里也算）就是「在线」，组里的人可以点「连接」来请求观看，你点 **允许** 后才开始采集（见下面的「随时连接与远程控制」）。
+`signal/` is a small service that only needs the Python standard library. The one invites point to runs on Tencent Cloud
+at `http://101.43.23.94:18650`; [signal/README.md](signal/README.md) covers deploying and upgrading it
+(`signal/deploy.sh --ssh ubuntu@101.43.23.94`) and the two ports to open in the cloud's security group: **TCP 18650** (the
+API) and **UDP 18651** (the address echo for IPv4 hole punching: optional, but without it nobody without IPv6 can connect).
+It cannot read or forge anything (see [Privacy and security](#privacy-and-security)). 0.3 did not change it.
 
-## 快速开始：看的人
+## Tools
 
-英文版给朋友看：[README.en.md](README.en.md)。
-
-1. 装好同上（Windows 解压即用；macOS 需要 `brew install mpv`）。
-2. **复制朋友发来的整条邀请消息**，打开 HdrCast：会弹出"要加入这个组吗"，点加入、填你的名字。
-3. **观看** 页列出组里在线的电脑（每 10 秒刷新）：开播中的标 LIVE，点 **观看**；只是在线的点 **连接**，对方可能要先同意（这时会显示「等待同意」）。**延迟** 按你在哪选：日本 1.5 s / 澳洲 2 s / 中国 3.5 s。
-4. 连不上时面板会直接说原因，比如"这台电脑没有 IPv6"或"主播没有 IPv6"。先去 <https://test-ipv6.com> 看看自己的 IPv6，见 [docs/faq.md](docs/faq.md)。
-5. **HDR 显示器**：Windows 先打开 HDR（`Win + Alt + B`）；SDR 显示器把输出选成"SDR"。
-
-## 随时连接与远程控制
-
-**在线 / 开播**：HdrCast 在运行、**开播 → 谁可以连接 → 开放连接** 打开（默认）时，这台电脑在组里显示为「在线」。有人点 **连接** 时按下面的规则处理，被放进来了才开始采集屏幕；最后一个人离开 20 秒后自动停。点 **开始直播** 则是对全组公开：除了设为"禁止"的，谁都可以直接看。
-
-**关掉窗口也在线**：开放连接打开时，点窗口的关闭按钮只是把 HdrCast 收进任务栏右下角的通知区域（托盘；macOS 是菜单栏），这台电脑照样在线。
-单击托盘图标（或右键菜单里的 **打开 HdrCast**）把窗口叫回来；**退出 HdrCast** 才真正下线，会先跟观众和信令服务器道别。开放连接关着时，关窗口就是退出（和以前一样）。
-有人正在看这台电脑时，托盘图标右下角有个红点。已经在运行时再双击 HdrCast，只会把原来的窗口叫出来，不会开第二个。
-
-**登录后自动在线**：**设置 → 通用 → 登录时自动启动 HdrCast**。之后每次登录 Windows，HdrCast 不弹窗口、直接在托盘里运行并在组里在线，像 Parsec 一样不用管。
-它是注册表 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 里的一项 `HdrCast`（`"…\HdrCast.exe" --background`），任务管理器的"启动应用"里也能看到、关掉；
-设置里的开关显示的是系统里的真实状态（在任务管理器里被关掉、或者指向另一个文件夹里的旧版本时会写明）。macOS 上是 `~/Library/LaunchAgents/app.hdrcast.login.plist`。
-窗口没开着的时候有人请求观看（或请求控制），窗口会自己弹到最前面并让任务栏按钮闪烁，你点 **允许** / **拒绝**；正在用别的程序打字时它不会抢走键盘。50 秒没人回答就自动拒绝。
-
-**谁可以连接**（开播页）：
-- **组里其他人**：观看「直接允许 / 询问我 / 禁止」，控制「不允许 / 询问我 / 自动获得」。默认是询问我 + 不允许。0.3.0 及更早版本的朋友证明不了自己是哪台电脑，永远按这一条。
-- **每台电脑一条规则**：按 **设备码**（如 `7KQ2-M9XD-4TPA`）认电脑，不按名字。**添加电脑…** 列出组里在线或最近请求过的电脑，选「我的电脑」（直接连 + 自动控制）或「信任的朋友」（直接看，控制要问你）。有人请求时点 **总是允许** 也会把那台电脑加进来。
-- 每台电脑的设备码在 **设置 → 群组 → 这台电脑** 里。给某台电脑控制权之前，先在那台电脑上核对一下设备码。
-
-**把自己的笔记本设成随时可以远程控制台式机**：
-1. 两台电脑都装 HdrCast 0.3.1，并加入同一个组（复制同一个邀请码）。两台可以用不同的名字（设置 → 我的名字，比如"小明 笔记本"）。
-2. 在台式机上：开播 → 谁可以连接 → **添加电脑…** → 找到笔记本（核对设备码）→ **我的电脑**。
-3. 之后在外面打开笔记本的 HdrCast → 观看 → 台式机 → **连接**：不用台式机那边点任何东西，连上就能控制。台式机上 HdrCast 要在运行（窗口关掉、留在托盘里就行）；
-   在台式机上打开 **设置 → 登录时自动启动 HdrCast**，重启之后也不用管。
-
-**观众这边**：主播允许你自动控制时，连上就是控制状态，播放窗口里的鼠标和键盘会发到主播电脑（`Ctrl + Alt + Enter` 留给本地切全屏），可以点 **只看不控** 交还、再点 **接管控制** 拿回来；主播设成"询问我"时点 **请求控制**，主播同意后才生效。主播随时可以 **收回** 控制或 **断开** 你（被断开后一分钟内连不回去）。
-
-- 画面延迟仍然是 SRT 延迟 + 播放器缓冲，远程控制时建议用「快速」预设（300 ms），并把 **设置 → 播放器缓冲** 调小。适合操作电脑、改设置，不适合打游戏（没有相对鼠标）。
-- macOS 当主播时，需要在"系统设置 → 隐私与安全性 → 辅助功能"里允许 HdrCast。Windows 上，以管理员身份运行的程序窗口不接受注入，除非 HdrCast 也以管理员身份运行。
-- 主播是 0.2.4 时没有远程控制；主播是 0.3.0 时没有设备码和"在线"，用它自己的「关闭 / 询问我 / 允许」。
-
-## 信令服务器（只需部署一次）
-
-`signal/` 是一个只用 Python 标准库的小服务，已部署在腾讯云上（`http://101.43.23.94:18650`，邀请码里写的就是它），部署 / 升级方法见 [signal/README.md](signal/README.md)：
-`signal/deploy.sh --ssh ubuntu@101.43.23.94`，然后在腾讯云安全组放行 **TCP 18650** 和 **UDP 18651**（后者是 IPv4 打洞用的地址回显，可选）。
-它看不到任何密码或组密钥，也伪造不了地址（所有消息用组密钥签名）；挂了的话，已经在看的人不受影响，只是新的人加入不了。0.3 没有改动它。
-
-## 工具
-
-| 工具 | 谁需要 | Windows | macOS |
+| Tool | Who needs it | Windows | macOS |
 |---|---|---|---|
-| ffmpeg | 开播的人 | 发行包 `tools\` 自带（BtbN gpl 构建，带 libsrt 和 NVENC/AMF/QSV） | `brew install ffmpeg`（带 libsrt 和 VideoToolbox） |
-| mpv | 看的人 | 发行包 `tools\` 自带（zhongfly 构建，带 libsrt） | `brew install mpv` |
-| WebView2 | 界面 | Windows 11 自带；Windows 10 一般已随 Edge 装好 | 不需要（系统自带 WebKit） |
-| Python 3 | 信令服务器 | – | Ubuntu 自带，只用标准库 |
+| ffmpeg | whoever shares | in the release's `tools\` (BtbN gpl build, with libsrt and NVENC / AMF / QSV) | `brew install ffmpeg` (with libsrt and VideoToolbox) |
+| mpv | whoever watches | in the release's `tools\` (zhongfly build, with libsrt) | `brew install mpv` |
+| WebView2 | the app's UI | part of Windows 11; on Windows 10 it normally comes with Edge | not needed (the system's WebKit) |
 
-Windows 上 `scripts\get-tools.cmd` 一键下载 / 更新 ffmpeg / mpv（`sender` / `viewer` / `both`，加 `force` 重新下载）；`scripts\check-tools.cmd` 检查编码器和 `srt://` 支持。
-设置和日志在 `%APPDATA%\HdrCast\`（macOS：`~/Library/Application Support/HdrCast/`），与 0.2 共用同一份 `group.json`，升级后不用重新加入。
-0.3.1 起多了 `device.json`（这台电脑的设备私钥：别人拿到它就能冒充这台电脑，不要发出去；换电脑时不要拷贝它）和 `access.json`（谁可以连接）。
+On Windows, `scripts\get-tools.cmd` downloads or updates ffmpeg and mpv (`sender`, `viewer` or `both`; add `force` to
+download again), and `scripts\check-tools.cmd` checks the encoders and `srt://` support.
 
-## 目录结构
+Settings and logs are in `%APPDATA%\HdrCast\` (macOS: `~/Library/Application Support/HdrCast/`). `group.json` is the same
+file 0.2 used, so an upgrade keeps you in your group. 0.3.1 adds `device.json` (this computer's private device key: never
+send it anywhere, never copy it to a new computer) and `access.json` (who can connect).
 
-```
-app/         HdrCast 应用（Tauri 2）：进程编排（采集 + ffmpeg、mpv）、命令、窗口；icons/ 是图标
-ui/          界面（原生 ES 模块 + preact/htm，不需要 Node 构建）；mock.js 可以让它在浏览器里单独预览
-crates/
-  core/      平台无关的基础：地址解析、SRT URL、日志脱敏、进程管理、防火墙；群组、邀请码、密钥、签名消息
-  p2p/       打洞、HostLink / ViewerLink、UPnP、分发、信令客户端、P2pHost / ViewerSession
-  capture/   采集引擎：Windows（DXGI / D3D11 / WASAPI）与 macOS（ScreenCaptureKit）后端，共用同一个主循环
-  media/     ffmpeg / mpv 的参数与输出解析、编码器档位、sender.json / receiver.json
-  control/   远程控制：协议（ChaCha20-Poly1305）、按键映射、输入注入（SendInput / Quartz）
-             （设备密钥、签名和控制密钥的协商在 core/src/group/device.rs，谁可以连接在 app/src/access.rs 和 share.rs）
-signal/      信令服务器（Python 标准库）+ systemd 单元 + deploy.sh
-scripts/     Windows 批处理：get-tools / check-tools / dump-check；ui-preview.mjs 预览界面
-docs/        design.md（规格，§8 是点对点协议）、network.md、faq.md、windows-checklist.md、macos-checklist.md
-build.sh     测试 + 构建 + 打包
-sender/ receiver/ shared/ tests/   0.2 的 C# 源码，作为对照保留（Rust 版的测试逐字节对照过它的输出）
-```
+## Building
 
-## 构建
-
-需要 [Rust](https://rustup.rs)（1.85+）。Windows 另需 Visual Studio 的 C++ 生成工具；macOS 需要 Xcode 命令行工具和 `cargo install tauri-cli --version "^2" --locked`。
+Needs [Rust](https://rustup.rs) 1.85 or newer. Windows also needs the C++ build tools of Visual Studio; macOS needs the
+Xcode command line tools and `cargo install tauri-cli --version "^2" --locked`.
 
 ```bash
-./build.sh              # cargo test + 信令服务器的 Python 测试 → 构建 → 打包到 dist/
-./build.sh --no-test    # 跳过测试
-cargo run -p hdrcast    # 直接运行（调试构建）
-node scripts/ui-preview.mjs   # 只在浏览器里看界面（http://localhost:5179，用模拟数据）
+./build.sh                    # cargo test + the signaling server's Python tests → build → package into dist/
+./build.sh --no-test          # skip the tests
+./build.sh --tools DIR        # take ffmpeg / ffprobe / mpv from DIR (--no-tools: leave them out)
+cargo run -p hdrcast          # run the app (debug build)
+node scripts/ui-preview.mjs   # only the UI, in a browser with mock data (http://localhost:5179)
 ```
 
-产物：Windows 是 `dist/HdrCast-<版本>/`（`HdrCast.exe`、`tools/`、`scripts/`、`docs/`、`signal/`）和同名 zip；macOS 是 `dist/HdrCast.app` 和 dmg。
-想不碰真实的群组和设置试一个构建：设环境变量 `HDRCAST_DATA_ROOT` 指向另一个文件夹。
+The result on Windows is `dist/HdrCast-<version>/` (`HdrCast.exe`, `tools/`, `scripts/`, `docs/`, `signal/`) and a zip of
+the same name; on macOS `dist/HdrCast.app` and a dmg. To try a build without touching your real group and settings, point
+the environment variable `HDRCAST_DATA_ROOT` at another folder.
 
-## 文档
+## Repository layout
 
-- [docs/design.md](docs/design.md) —— 设计定稿；§8 是点对点协议（邀请码、密钥派生、签名、信令 API、打洞包、§8.9 远程控制用的旁路通道）。
-- [docs/network.md](docs/network.md) —— 点对点怎么穿过防火墙、谁需要什么、上行带宽、IPv6 自查。
-- [docs/faq.md](docs/faq.md) —— 连不上怎么办（按面板提示查）、HDR 与 SDR、码率与带宽。
-- [docs/windows-checklist.md](docs/windows-checklist.md)、[docs/macos-checklist.md](docs/macos-checklist.md) —— 在真机上逐步验证及预期输出。
-- [signal/README.md](signal/README.md) —— 信令服务器部署。
+```
+app/         the HdrCast app (Tauri 2): runs capture + ffmpeg and mpv, commands, window, tray; icons/
+ui/          the UI (plain ES modules + preact/htm, no Node build); mock.js lets it run alone in a browser
+crates/
+  core/      platform-neutral basics: address parsing, SRT URLs, log redaction, child processes, firewall;
+             groups, invites, keys, signed messages
+  p2p/       hole punching, HostLink / ViewerLink, UPnP, fan-out, signaling client, P2pHost / ViewerSession
+  capture/   capture engine: Windows (DXGI / D3D11 / WASAPI) and macOS (ScreenCaptureKit) back ends, one main loop
+  media/     ffmpeg / mpv arguments and output parsing, encoder profiles, sender.json / receiver.json
+  control/   remote control: protocol (ChaCha20-Poly1305), key mapping, input injection (SendInput / Quartz)
+             (device keys, signatures and the control key are in core/src/group/device.rs; who can connect is in
+             app/src/access.rs and app/src/share.rs)
+signal/      signaling server (Python standard library) + systemd unit + deploy.sh
+scripts/     Windows batch files: get-tools / check-tools / dump-check; ui-preview.mjs previews the UI
+docs/        design.md (the spec; §8 is the peer-to-peer protocol), network.md, faq.md, windows- and macos-checklist.md
+tests/vectors/                     golden protocol vectors shared by the Rust, Python and C# tests
+sender/ receiver/ shared/ tests/   the C# sources of 0.2, kept as the reference (the Rust tests compare with their output byte for byte)
+build.sh     test + build + package
+```
 
-## 许可
+## Documentation
 
-MIT，见 [LICENSE](LICENSE)。
+The documents under `docs/` are in Chinese for now.
+
+- [docs/design.md](docs/design.md): the design, final; §8 is the peer-to-peer protocol (invites, key derivation, signatures,
+  signaling API, punch packets, and in §8.9 the side channel remote control uses).
+- [docs/network.md](docs/network.md): how peer-to-peer gets through firewalls, who needs what, upload bandwidth, checking
+  IPv6.
+- [docs/faq.md](docs/faq.md): when it does not connect (follow the panel), HDR and SDR, bitrate and bandwidth.
+- [docs/windows-checklist.md](docs/windows-checklist.md), [docs/macos-checklist.md](docs/macos-checklist.md): step-by-step
+  checks on real machines, with the expected output.
+- [signal/README.md](signal/README.md): deploying the signaling server.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

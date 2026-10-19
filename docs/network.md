@@ -151,7 +151,7 @@ recv_buffer_size = 8000000                                    # UDP socket 缓�
 
 ## 6. 腾讯云上的信令服务器做什么
 
-`signal/hdrcast_signal.py`（只用 Python 标准库，systemd 跑，见 `signal/README.md`）：
+`signal/hdrcast_signal.py`（只用 Python 标准库，systemd 跑，见 `signal/README.zh-CN.md`）：
 
 - **存什么**：每个组的"谁在播"（主播名字、候选地址、码率、观众数，30 s 不续期即过期）、加入请求和应答（60 s 过期），
   以及组 id → 鉴权 key 的注册表（唯一写盘的数据）。
