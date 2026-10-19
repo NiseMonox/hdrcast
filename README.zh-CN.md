@@ -6,7 +6,7 @@
 
 - **一个应用**：`HdrCast` 有「开播」和「观看」两页，共用同一个群组和邀请码。0.3 起用 Rust 重写（Tauri 2 界面），取代 0.2 的 `HdrCastSender.exe` / `HdrCastReceiver.exe`；协议没变，还在用 0.2.4 的朋友仍然能和你互相看。
 - **点对点（IPv6 打洞）**：两台电脑经信令服务器交换地址后同时给对方发包，两边的路由器和防火墙都会放行这条流。信令服务器只转几百字节的签名元数据（谁在播、候选地址），**视频从不经过它**。
-- **没有 IPv6 也能连**：IPv4 走公网映射打洞；对方路由器是对称型 NAT（每个目的地换一个端口，国内常见）时，HdrCast 自动在你的路由器上用 UPnP 转发自己的端口，Windows 上再点一次防火墙的 **放行…**，按对方的真实端口反向打洞（见 [docs/network.md](docs/network.md) §1.1）。
+- **没有 IPv6 也能连**：IPv4 走公网映射打洞；对方路由器是对称型 NAT（每个目的地换一个端口，国内常见）时，HdrCast 自动在你的路由器上用 UPnP 转发自己的端口，Windows 上再点一次防火墙的 **放行…**，按对方的真实端口反向打洞（见 [docs/network.zh-CN.md](docs/network.zh-CN.md) §1.1）。
 - **一次邀请码，永久可用**：建组的人把含 `hdrcast:…` 的一段消息发给朋友，朋友复制整条消息、打开 HdrCast 就会提示加入。
 - **HDR10 全链路**：
   - Windows：DXGI 桌面复制 → D3D11 compute shader（scRGB → PQ / BT.2020 / P010）→ NVENC / AMF / QSV / x265 HEVC Main10
@@ -104,7 +104,7 @@
 | HDR 显示器上颜色发灰、发平 | 系统的 HDR 没打开（Windows：`Win + Alt + B`）。 |
 | mpv 说打不开 `srt://` | 你的 mpv 没带 libsrt：用 zhongfly / shinchiro 的构建（get-tools.cmd 下载的就是）或 Homebrew 的。 |
 
-更多见 [docs/faq.md](docs/faq.md)。找朋友帮忙时，把 **日志 → 复制** 的内容发给他：里面的密码和邀请码都已经打码。
+更多见 [docs/faq.zh-CN.md](docs/faq.zh-CN.md)。找朋友帮忙时，把 **日志 → 复制** 的内容发给他：里面的密码和邀请码都已经打码。
 
 ## 隐私与安全
 
@@ -185,8 +185,8 @@ build.sh     测试 + 构建 + 打包
 ## 文档
 
 - [docs/design.md](docs/design.md) —— 设计定稿；§8 是点对点协议（邀请码、密钥派生、签名、信令 API、打洞包、§8.9 远程控制用的旁路通道）。
-- [docs/network.md](docs/network.md) —— 点对点怎么穿过防火墙、谁需要什么、上行带宽、IPv6 自查。
-- [docs/faq.md](docs/faq.md) —— 连不上怎么办（按面板提示查）、HDR 与 SDR、码率与带宽。
+- [docs/network.zh-CN.md](docs/network.zh-CN.md) —— 点对点怎么穿过防火墙、谁需要什么、上行带宽、IPv6 自查。
+- [docs/faq.zh-CN.md](docs/faq.zh-CN.md) —— 连不上怎么办（按面板提示查）、HDR 与 SDR、码率与带宽。
 - [docs/windows-checklist.md](docs/windows-checklist.md)、[docs/macos-checklist.md](docs/macos-checklist.md) —— 在真机上逐步验证及预期输出。
 - [signal/README.zh-CN.md](signal/README.zh-CN.md) —— 信令服务器部署。
 

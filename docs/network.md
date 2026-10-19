@@ -1,173 +1,251 @@
-# HdrCast 网络说明
+# HdrCast networking
 
-默认是**点对点（Group / P2P）模式**：主播的电脑直接给每位观众发流，腾讯云上的信令服务器只负责牵线。
-本文说明它怎么穿过路由器和防火墙、谁需要什么、IPv6 怎么自查、各地区的 SRT 延迟预设、缓冲公式和上行带宽。
-协议细节见 `docs/design.md` §8。
+**English** | [简体中文](network.zh-CN.md)
 
-## 1. 点对点模式怎么连上
+HdrCast works **peer-to-peer**: the sharer's computer sends the stream straight to every viewer, and the signaling server
+on Tencent Cloud only introduces them to each other. This page explains how that gets through routers and firewalls, who
+needs what, how to check IPv6, the SRT delay presets for each region, the buffer formula and the upload bandwidth. The
+protocol itself is in [design.md](design.md) §8 (in Chinese).
+
+## 1. How peer-to-peer connects
 
 ```
-            ① 我在播，候选地址是 [2400:…]:51234            ③ 我想看 小明，我的候选是 [240e:…]:40000
-主播 ───────────────────────────────▶ 腾讯云 hdrcast-signal ◀─────────────────────────────── 观众
-     ◀──────────── ④ 有人要看（long-poll 立刻返回）          ⑤ 应答：好，我的候选是…  ─────▶
-                        （只存几百字节的签名元数据，从不转视频）
-
-主播 [2400:…]:51234  ⇄  ⑥ 双方同时每 100 ms 互发 PUNCH，收到就回 ACK  ⇄  观众 [240e:…]:40000
-                         两边的有状态防火墙都看到"自己先发出去了"，放行对方的回包
-主播 remux ffmpeg (127.0.0.1) ⇄ HostLink ⇄ ⑦ SRT（AES-256）原样转发 ⇄ ViewerLink ⇄ mpv (127.0.0.1)
+sharer                                  hdrcast-signal                                   viewer
+                                        (Tencent Cloud)
+  │                                            │                                            │
+  │── 1. online, candidates [IPv6]:51234 ─────►│                                            │
+  │                                            │◄── 2. who is online? (every 10 s) ─────────│
+  │                                            │◄── 3. join, candidates [IPv6]:40000 ───────│
+  │◄── 4. somebody wants to watch ─────────────│                                            │
+  │── 5. answer: OK, candidates … ────────────►│── 5. the answer ──────────────────────────►│
+  │                                            │                                            │
+  │◄═════════════ 6. both send PUNCH every 100 ms, answer each with PUNCH_ACK ═════════════►│
+  │◄═══════════════════════ 7. SRT (AES-256) over the same UDP path ═══════════════════════►│
 ```
 
-- **为什么 IPv6 能打洞**：IPv6 没有 NAT，每台电脑有全球地址和固定端口；家用路由器、光猫和 Windows 防火墙对 IPv6 都是
-  "有状态"的：挡住没人请求过的入站，放行"自己先发出去"那条流的回包。双方同时向对方发包，两边都先有了出站，
-  于是都放行。**谁都不用做端口转发，也不需要公网 IPv4。**
-- **候选地址**：IPv6 用出口网卡上的**稳定**地址（Windows 默认用临时地址发包，但临时地址每天变，而且"从哪个地址发"
-  必须和"公布哪个地址"一致，所以 socket 直接绑在稳定地址上）；IPv4 候选是局域网地址（同一局域网的人直连用）、经
-  信令服务器 UDP 回显得到的公网映射，以及路由器 UPnP 转发出来的端口（§1.1）。
-- **学来的地址**：对方的包从一个它没公布过的地址端口来（对称型 NAT 给每个目的地新开端口），就把这个地址也加进打洞
-  目标：对方 NAT 正是为我们开的这个口子，往这里发的包进得去。
-- **选路**：先收到 ACK 的路径胜出；IPv4 先通的话再等 200 ms，IPv6 也通就用 IPv6。主播跟着观众的选择走。
-- **每位观众一条独立的 SRT 连接**：主播端每个观众一个 remux ffmpeg（`-c copy`，不重编码），按**该观众**选的地区延迟和
-  oheadbw 重传；谁的网络差只影响谁。
-- **断线恢复**：路径 15 s 没有任何包即判定断开，观众端自动重新加入（同一个本地端口，mpv 不用重启就能接上）；
-  主播下播会发 BYE，观众端显示"直播结束，等待重新开播"。
+The server only keeps a few hundred bytes of signed metadata and never passes on any video; step 4 is a long poll that
+returns the moment a join arrives. In step 6 both stateful firewalls see "we sent first" and let the other side's replies
+in. The SRT ends of step 7 are local on both computers: the sharer's remux ffmpeg (127.0.0.1) ⇄ HostLink ⇄ the punched
+path ⇄ ViewerLink ⇄ mpv (127.0.0.1).
 
-### 1.1 谁需要什么
+- **Why IPv6 punches through**: IPv6 has no NAT, so every computer has a global address and a fixed port. Home routers,
+  ONTs and Windows Firewall all handle IPv6 "statefully": they block incoming traffic nobody asked for and let in the
+  replies to a flow that went out first. When both sides send to each other at the same moment, each has sent first, so
+  each lets the other in. **Nobody forwards a port, and nobody needs a public IPv4 address.**
+- **Candidate addresses**: for IPv6, the **stable** address of the network adapter that leads to the internet. Windows
+  sends from a temporary address by default, but temporary addresses change every day, and the address the packets come
+  from has to be the one that was advertised, so the socket is bound to the stable address. For IPv4: the LAN address
+  (for people on the same network), the public mapping learned from the signaling server's UDP echo, and the port the
+  router forwards with UPnP (§1.1).
+- **Learned addresses**: when the other side's packets arrive from an address and port it never advertised (a symmetric
+  NAT opens a new port for every destination), that address becomes a punch target too: the other side's NAT opened
+  exactly that hole for us, so packets sent there get in.
+- **Choosing the path**: the first path to get an ACK wins; if IPv4 gets through first, HdrCast waits another 200 ms and
+  takes IPv6 if that works too. The sharer follows the viewer's choice.
+- **One SRT connection per viewer**: the sharer runs a remux ffmpeg for every viewer (`-c copy`, no re-encoding) that
+  retransmits with **that viewer's** delay and oheadbw, so a bad connection only affects the viewer who has it.
+- **Online or live (0.3.1)**: step 1 is the same either way. While HdrCast runs with **Available to connect** on, the
+  computer announces itself as online, and its screen is only captured once somebody has been let in. The sharer's side
+  then starts capture and the encoder before it answers (usually 1-2 s), so that the viewer's mpv has a picture to pick
+  up straight away, and it stops both 20 s after the last viewer leaves. When the sharer's rule for the viewer is
+  **Ask Me** and the sharer is not live, the answer waits until the sharer clicks **Allow** (at most 50 s). **Go Live**
+  announces the computer as live and keeps the encoder running.
+- **Reconnecting**: a path that carries no packets for 15 s counts as lost, and the viewer joins again by itself (on the
+  same local port, so mpv picks the stream up again without a restart). When the sharer stops, it sends BYE, and the
+  viewer's panel says "The stream ended - waiting for … to go live again" (or "… ended the session - asking again" when
+  the computer was only online).
 
-| | 主播 | 观众 |
+### 1.1 Who needs what
+
+| | Sharer | Viewer |
 |---|---|---|
-| IPv6 | 双方都有最省事，下面几行都不用管 | 同左 |
-| 公网 IPv4 | 没有 IPv6 时，至少一方的路由器要拿到公网 IPv4（不是 10.x / 100.64~127.x / 172.16~31.x / 192.168.x） | 同左 |
-| 路由器端口转发 | 不用手动做：开播时程序自动用 UPnP 转发自己的 IPv4 端口，下播删除（路由器要开着 UPnP，大多默认开） | 同左（观看期间） |
-| Windows 防火墙 | 界面 **防火墙** 一栏出现 **放行…** 按钮时点它（Windows 要管理员确认一次；换了新版本的目录要再点一次；macOS 不需要） | 同左（只有主播是对称型 NAT 时才用得上） |
-| 上行带宽 | 码率 × 观众数 × 1.25~1.5（§7） | 很少（只有 ACK） |
-| 下行带宽 | 很少 | 码率 × 1.3 |
+| IPv6 | Simplest when both sides have it: then nothing below matters | Same |
+| Public IPv4 | Without IPv6, at least one side's router needs a public IPv4 address (not 10.x / 100.64-127.x / 172.16-31.x / 192.168.x) | Same |
+| Port forwarding on the router | Nothing to do by hand: while HdrCast is online or live, it forwards its own IPv4 port with UPnP, and deletes the forward when it stops (the router needs UPnP on, which most have by default) | Same (while watching) |
+| Windows Firewall | Click **Allow…** when the **Firewall** line in the app offers it (Windows asks for administrator approval once; a new version in a new folder needs another click; not needed on macOS) | Same (only matters when the sharer is behind a symmetric NAT) |
+| Upload | bitrate × viewers × 1.25-1.5 (§7) | Very little (only acknowledgements) |
+| Download | Very little | bitrate × 1.3 |
 
-没有 IPv6 的一方只能走 IPv4，条件是：
+A side without IPv6 can only use IPv4, and that needs:
 
-1. **信令服务器的 UDP 18651 放行**（§6）。公网 IPv4 候选只能靠这个回显得到；不通的话主播只公布 IPv6 和局域网地址，
-   观众那边根本没有 IPv4 可试（主播日志：`public IPv4 check: no answer…`，状态栏：`no public IPv4 found`）。
-2. **看路由器怎么给端口**：
-   - **锥形 NAT**（同一个内网端口发往任何目的地都用同一个公网端口，家用路由器大多是）：双方同时往对方的公网映射发包，
-     路由器和 Windows 防火墙都放行回包，什么都不用开。
-   - **对称型 NAT**（每个目的地换一个公网端口：国内运营商、运营商级 NAT 常见）：它发来的包来自一个对方没见过的端口，
-     对方的路由器和 Windows 防火墙会当成"没请求过的包"丢掉。这时**另一方**必须收得下这种包：路由器 UPnP 转发（程序自动做）
-     加 Windows 防火墙规则（点 **放行…**）。收到之后程序记下真实端口反过来打洞（design.md §8.6），所以谁当主播都行，
-     只要另一方是开着的。**双方都是对称型 NAT 时 IPv4 过不去**，至少一方要开 IPv6。
-   - 实例（2026-09-25）：朋友（江苏电信，没有 IPv6）公布的端口是 :20833，发给主播时变成 :20834。主播这边只有防火墙规则时，
-     网卡上一个包都没收到（XG-100NE 丢掉了）；路由器 UPnP 转发一加上，不到一秒就连上。
+1. **UDP 18651 open on the signaling server** (§6). The public IPv4 candidate only comes from that echo. Without it the
+   sharer advertises nothing but IPv6 and LAN addresses, and the viewer has no IPv4 address to try at all (sharer's log:
+   `public IPv4 check: no answer…`; panel on the sharer's **Share** page: `no public IPv4 found`).
+2. **Routers that keep ports, or a side that is open**:
+   - **Cone NAT** (the same inside port goes out on the same public port to every destination; most home routers): both
+     sides send to each other's public mapping at the same moment, the router and Windows Firewall let the replies in, and
+     there is nothing to open.
+   - **Symmetric NAT** (a new public port for every destination; common with Chinese ISPs and carrier-grade NAT): its
+     packets come from a port the other side has never seen, so the other side's router and Windows Firewall drop them
+     as unrequested. Then the **other** side has to accept such packets: a UPnP forward on its router (HdrCast sets it up
+     by itself) plus a Windows Firewall rule (click **Allow…**). Once a packet gets in, HdrCast notes the real port and
+     punches back to it (design.md §8.6), so either side can be the sharer, as long as the other side is open. **When
+     both sides are behind symmetric NATs, IPv4 cannot get through**: at least one side needs IPv6.
+   - An example (2026-09-25): a friend (China Telecom in Jiangsu, no IPv6) advertised port :20833, and their packets
+     reached the sharer from :20834. With only the firewall rule on the sharer's side, not a single packet arrived at the
+     network adapter (the router dropped them all); once the router's UPnP forward was in place, it connected in under a
+     second.
 
-### 1.2 连不上时状态栏说的是什么
+### 1.2 What the messages say when it does not connect
 
-| 提示 | 含义 / 怎么办 |
+These are the messages on the Watch panel unless the first column says where else to look. Most come from the connection
+engine and stay in English whatever language the app is set to (they also end up in the log people send when something
+breaks), and they call the sharer "the host".
+
+| Message | What it means / what to do |
 |---|---|
-| This PC has no IPv6 internet connection, and the host offered no public IPv4 address… | 本机没有 IPv6，主播也没公布公网 IPv4（主播那边的 UDP 回显没回复，见 §1.1 第 1 条），IPv4 根本没试：本机按 §2 打开 IPv6，或者先把 UDP 18651 放行 |
-| This PC has no IPv6 internet connection, and the IPv4 attempt did not get through… | 本机没有 IPv6，IPv4 打洞也没成（至少一方 NAT 不配合，§1.1 第 2 条；后面注明 *could not be found* 的是本机自己的公网 IPv4 也没拿到）：按 §2 打开 IPv6 |
-| …did not get through: the host's PC only takes IPv4 from routers that keep ports… | 主播的 IPv4 没打开（路由器没转发或防火墙没放行），而本机路由器多半是对称型 NAT：让主播点 **放行…**、确认路由器开着 UPnP；或者本机开 IPv6 |
-| …did not get through although the host takes IPv4 from any port… | 主播那边是开着的，包还是没到：本机的 VPN / 代理 / 加速器（Clash TUN、UU 之类）截走了 UDP，关掉或让 HdrCast 直连 |
-| 开播页面板 `IPv4 closed to routers that change ports: …` | 主播的 IPv4 没打开，冒号后面写了缺什么：`no router forward (UPnP)` → 路由器里打开 UPnP；`no firewall rule (click Allow)` → 点 **放行…**；`router behind another NAT` → 路由器外面还有一层 NAT（光猫路由模式或运营商级 NAT），转发帮不上 |
-| 日志 `[p2p] router: could not forward UDP …` | 路由器没开 UPnP、或拒绝了转发（括号里是路由器的错误码）。每分钟起重试，开了之后不用重开程序 |
-| 日志 `connected via IPv4 … (a port their router picked for this PC …)` | 对方是对称型 NAT，靠这边打开的 IPv4 连上的：正常 |
-| 主播日志 `left (could not connect: no candidate answered; …)` | 对方的包一个都没到。分号后面是判断：这边 IPv4 已打开 → 对方那边有东西截走了 UDP；没打开 → 先按提示打开 |
-| The host's PC has no IPv6 internet connection… | 主播那边没有 IPv6：让主播按 §2 打开 |
-| Neither side has IPv6… | 双方都没有 IPv6，IPv4 也没通：至少一方要有 IPv6 |
-| 主播状态栏 `no public IPv4 found` / 日志 `public IPv4 check: no answer…` | 信令服务器的 UDP 18651 没回复：在腾讯云安全组放行（§6）。主播端每分钟重试、观众端每次加入前重试，放行后不用重开 |
-| Both sides have IPv6 but the path is blocked… | 都有 IPv6 但包过不去：多半是 VPN（关掉）或路由器"IPv6 防火墙：阻止所有入站"之类的严格设置（改成默认 / 标准） |
-| Not live right now / Nobody is online right now | 对方没开 HdrCast（或关了"开放连接"）；列表每 10 s 自动刷新 |
-| … is full | 达到主播设的"同时观看人数" |
-| The signaling server cannot be reached | 本机断网，或信令服务器挂了；已经在看的人不受影响 |
+| This PC has no IPv6 internet connection, and the host offered no public IPv4 address… | This computer has no IPv6, and the sharer advertised no public IPv4 address (the sharer's UDP echo got no answer, §1.1 point 1), so IPv4 was never tried: turn IPv6 on here as in §2, or open UDP 18651 on the signaling server first |
+| This PC has no IPv6 internet connection, and the IPv4 attempt did not get through… | No IPv6 here, and IPv4 hole punching failed too (at least one NAT does not play along, §1.1 point 2; when it adds *this PC's public IPv4 address could not be found*, this computer did not even learn its own public IPv4): turn IPv6 on as in §2 |
+| …did not get through: the host's PC only takes IPv4 from routers that keep ports… | The sharer's IPv4 is not open (no router forward, or no firewall rule), and this computer's router most likely is a symmetric NAT: ask the sharer to click **Allow…** and to check that UPnP is on in their router; or turn IPv6 on here |
+| …did not get through although the host takes IPv4 from any port… | The sharer's side is open, yet the packets do not arrive: a VPN / proxy / accelerator on this computer (Clash TUN, UU and the like) takes the UDP. Turn it off, or let HdrCast bypass it |
+| Panel on the sharer's **Share** page: `IPv4 closed to routers that change ports: …` | The sharer's IPv4 is not open, and after the colon it says what is missing: `no router forward (UPnP)` → turn UPnP on in the router; `no firewall rule (click Allow)` → click **Allow…**; `router behind another NAT` → there is another NAT outside the router (an ONT in router mode, or carrier-grade NAT), and forwarding cannot help |
+| Log: `[p2p] router: could not forward UDP …` | UPnP is off in the router, or the router refused the forward: the reason follows the dash (a refusal quotes the router's error code). HdrCast tries again after a minute, then less often; once UPnP is on there is no need to restart HdrCast |
+| Sharer's log: `connected via IPv4 … (a port their router picked for this PC …)` | The other side is behind a symmetric NAT and got in through the IPv4 port this side opened: all is well |
+| Sharer's log: `left (could not connect: no candidate answered; …)` | Not a single packet from the other side arrived. After the semicolon comes the likely reason: if this side's IPv4 is open, something on their side takes the UDP; if not, open it first as the message says |
+| The host's PC has no IPv6 internet connection… | The sharer has no IPv6: they turn it on as in §2 |
+| Neither side has IPv6… | Neither side has IPv6, and IPv4 did not get through either: at least one side needs IPv6 |
+| Panel on the sharer's **Share** page: `no public IPv4 found`; log: `public IPv4 check: no answer…` | The signaling server's UDP 18651 does not answer: open it in the Tencent Cloud security group (§6). The sharer tries again every minute and the viewer before every join, so nobody has to restart once it is open |
+| Both sides have IPv6 but the path is blocked… | Both sides have IPv6, but the packets do not get through: most likely a VPN (turn it off), or a strict router setting such as "IPv6 firewall: block all incoming" (set it back to default / standard) |
+| WAITING: Waiting for … to let you in… | The sharer has to let this computer in first (their rule for it is **Ask Me**, and they see the request with this computer's device code), or their computer is still starting to capture |
+| … did not let you in | The sharer clicked **Deny**, set this computer to **Never**, or disconnected it less than a minute ago. HdrCast stops trying: ask them |
+| Nobody at … answered your request | Nobody clicked **Allow** within 50 s |
+| Not live right now / Nobody is online right now | HdrCast is not running on the other computer (or **Available to connect** is off there); the list refreshes every 10 s |
+| … is full | The sharer's **Viewers at once** is reached |
+| The signaling server cannot be reached | This computer is offline, or the signaling server is down; people already watching are not affected |
 
-## 2. IPv6 自查与开启
+## 2. Checking and turning on IPv6
 
-1. 打开 <https://test-ipv6.com>：看到 "IPv6 address detected"（最好 10/10）就行。
-2. 没有的话一般是路由器 / 光猫没开：
-   - **日本**：NTT フレッツ系 / SoftBank 光 / au ひかり 基本都默认给 IPv6（IPoE）。SoftBank 光BBユニット 默认开着 IPv6。
-   - **中国**：三大运营商家宽基本都已下发 IPv6，但不少光猫 / 路由器默认只开 IPv4。在路由器里找"IPv6 设置 / IPv4/IPv6 双栈 /
-     IPv6 模式"打开（桥接光猫的话在你自己的路由器上开）；手机热点通常自带 IPv6，可以先用热点试。
-   - **澳洲**：看 ISP，一部分 NBN ISP 默认给 IPv6，另一部分不提供；不提供的话只能换 ISP 或让同组有 IPv6 的人开播。
-3. Windows 里 IPv6 默认是开的；装了 VPN / 加速器的话先关掉再试。
+1. Open <https://test-ipv6.com>: "IPv6 address detected" (10/10 at best) means you are fine.
+2. If not, usually the router or the ONT has it off:
+   - **Japan**: lines on NTT FLET'S, SoftBank Hikari and au Hikari all come with IPv6 (IPoE) by default; SoftBank's
+     Hikari BB Unit has IPv6 on by default.
+   - **China**: the three big carriers give home broadband IPv6 almost everywhere, but many ONTs and routers only have
+     IPv4 on by default. Look in the router for "IPv6 settings", "IPv4/IPv6 dual stack" or "IPv6 mode" (with a bridged
+     ONT, set it on your own router); a phone hotspot usually comes with IPv6, so try one first.
+   - **Australia**: it depends on the ISP. Some NBN ISPs give IPv6 by default, others do not offer it; then the only ways
+     are another ISP, or letting somebody in the group who has IPv6 do the sharing.
+3. IPv6 is on in Windows by default; if a VPN or accelerator is installed, turn it off before you test.
 
-## 3. 各地区延迟预设与理由
+## 3. Delay presets per region, and why
 
-观众在接收端选地区预设；点对点模式下这个值随加入请求发给主播，主播为这位观众起的 remux 子进程就用它
-（中国预设同时把 oheadbw 提到 50 %）。所以同一场直播里，日本观众 1.5 s、中国观众 3.5 s 可以同时成立。
+The viewer picks a preset under **Watch → Delay**. It goes with the join request to the sharer, whose remux process for
+that viewer uses it (the China preset also raises oheadbw to 50 %). So in one session a viewer in Japan at 1.5 s and one
+in China at 3.5 s are both served as they should be. The presets were sized for a sharer in Japan:
 
-| 观众 | RTT 估计 | 丢包 | SRT latency | oheadbw |
+| Viewer in | RTT (estimate) | Loss | SRT delay | oheadbw |
 |---|---|---|---|---|
-| 日本国内 | 10~30 ms | ≈0 | **1500 ms** | 25 % |
-| 澳大利亚 | 120~160 ms | 少量 | **2000 ms** | 25 % |
-| 中国大陆（跨境） | 60~120 ms，但抖动和突发丢包多 | 1~5 % 常见 | **3500 ms** | 50 % |
+| Japan | 10-30 ms | ≈0 | **1500 ms** | 25 % |
+| Australia | 120-160 ms | a little | **2000 ms** | 25 % |
+| Mainland China (cross-border) | 60-120 ms, but lots of jitter and bursts of loss | 1-5 % is common | **3500 ms** | 50 % |
 
-理由：
+**Fast** (300 ms, oheadbw 25 %) is for remote control: the picture stays close behind, but there is little time for
+retransmissions, so it wants a clean connection over a short distance. With **Custom**, a delay of 3000 ms or more asks
+for oheadbw 50 % like China, anything shorter 25 %.
 
-1. **Haivision 的 4×RTT 规则**：SRT latency = RTT 乘数 × RTT；在 0.1~0.2 % 丢包、无突发的"还不错"的网络上乘数约为 4。乘数低于 3 基本没意义，高于 20 说明线路已严重拥塞。
-2. **官方保守表**（丢包率 → 乘数 / 带宽开销）：≤1 % → 3 / 1 %；≤3 % → 4 / 4 %；≤7 % → 6 / 9 %；≤10 % → 8 / 15 %；≤12 % → 8 / 20 %；≤21 % → 10 / 38 %；≤25 % → 13 / 46 %；≤30 % → 14 / 61 %；≤40 % → 30 / 97 %。
-3. 按 4×RTT 算，澳洲只要 ~640 ms，中国只要 ~480 ms；但我们的目标是"推流式"而非远程桌面：多留几倍余量能扛住跨境线路的突发丢包（重传要在 latency 内完成），代价只是延迟大一点。中国线路按丢包 3~7 % 取乘数 6~8 并留余量，得到 3500 ms；`oheadbw` 也提高到 50 %，给重传留带宽。
-4. latency 由两端协商取**最大值**（发送端的 `peerlatency` 与接收端的 `rcvlatency`）。两端都用观众的值，所以观众选的就是生效值（实测：API 里 `msReceiveTsbPdDelay` / `msSendTsbPdDelay` 正好等于 URL 里的值）。
-5. 端到端总延迟 ≈ 接收 SRT (1.5~3.5 s) + mpv `cache-pause-wait` (1.5 s) + 编码 (~0.4 s)，即日本约 3.5 s、中国约 5.5 s。
-   实测（2026-09-24，本机回环，NVENC → SRT 1500 ms → mpv 用接收端的原样参数，画面里烧 UTC 时间戳、经 IPC 截图对比）：**3.58 s**，三次一致，
-   mpv 的 `demuxer-cache-duration` 稳定在 1.55 s。界面上的 "ping 38 ms" 是网络往返，不是画面延迟。
-6. latency 决定的是**抗丢包**（重传窗口），不是画质：线路好时 1.5 s 和 3.5 s 画面一样，只是晚两秒；画质只由码率和编码预设决定。
-   跨境（中国）观众应选 China 预设（3500 ms、oheadbw 50 %），不然偶发的丢包重传赶不上就会花屏。
+Why these values:
 
-> 观众可以自己调：卡顿（mpv 反复缓冲）就把 latency 加 500 ms 重新 Play；线路好就往下减。
+1. **Haivision's 4 × RTT rule**: SRT latency = RTT multiplier × RTT; on a "fairly good" network with 0.1-0.2 % loss and
+   no bursts, the multiplier is about 4. Below 3 it makes little sense; above 20 the line is badly congested.
+2. **The official conservative table** (packet loss → multiplier / bandwidth overhead): ≤1 % → 3 / 1 %; ≤3 % → 4 / 4 %;
+   ≤7 % → 6 / 9 %; ≤10 % → 8 / 15 %; ≤12 % → 8 / 20 %; ≤21 % → 10 / 38 %; ≤25 % → 13 / 46 %; ≤30 % → 14 / 61 %;
+   ≤40 % → 30 / 97 %.
+3. By 4 × RTT, Australia would need only about 640 ms and China about 480 ms. But the aim is a broadcast, not a remote
+   desktop: a margin of several times rides out the bursts of loss on cross-border links (a retransmission has to land
+   within the delay), at the price of a little more delay. For China the multiplier for 3-7 % loss is 6-8, plus margin,
+   which gives 3500 ms; `oheadbw` goes up to 50 % as well, to leave bandwidth for the retransmissions.
+4. The two ends negotiate the delay and the **larger** value wins (the sender's `peerlatency` against the receiver's
+   `rcvlatency`). Both ends use the viewer's value, so what the viewer picks is what applies (measured:
+   `msReceiveTsbPdDelay` / `msSendTsbPdDelay` in the API equal the value in the URL).
+5. End-to-end delay ≈ SRT on the receiving side (1.5-3.5 s) + mpv's `cache-pause-wait` (**Settings → Player buffer**,
+   1.5 s) + encoding (about 0.4 s), so about 3.5 s for Japan and 5.5 s for China. Measured on 2026-09-24 on one PC over
+   loopback (NVENC → SRT 1500 ms → mpv with the viewer's exact options; a UTC timestamp burnt into the picture, compared
+   through screenshots over IPC): **3.58 s**, the same three times, with mpv's `demuxer-cache-duration` steady at
+   1.55 s. The "ping 38 ms" in the app is the network round trip, not the picture delay.
+6. The delay decides how much **packet loss** the stream rides out (the retransmission window), not the picture quality:
+   on a good line 1.5 s and 3.5 s look the same, one just runs two seconds later; quality only depends on the bitrate and
+   the encoder preset. Viewers across the border in China should pick the China preset (3500 ms, oheadbw 50 %);
+   otherwise retransmissions of the occasional lost packet arrive too late and the picture breaks up.
 
-## 4. 缓冲大小公式（必须做，否则高码率会断线）
+> Viewers can tune it themselves: if the picture keeps stalling (mpv buffering again and again), stop, add 500 ms under
+> **Watch → Delay → Custom** and connect again; on a good line go down instead.
 
-libsrt 默认的接收缓冲只有 8192 个包（约 10.8 MB）；latency × 码率超过它时，重传窗口里放不下的包会被丢掉，画面花屏甚至断线
-（本机 48 Mbps × 2 s 即复现）。所以两边都按下面的公式把参数写进 URL（实现在 `shared/Common/SrtBufferSizing.cs`）：
+## 4. Buffer size formula (a must, or high bitrates drop)
+
+libsrt's default receive buffer holds only 8192 packets (about 10.8 MB). When delay × bitrate is larger, the packets that
+do not fit into the retransmission window are dropped: the picture breaks up, or the connection drops altogether
+(48 Mbps × 2 s does it on one PC). So both ends put these values into the URL (implemented in
+`crates/core/src/common/srt_buffer_sizing.rs`):
 
 ```
-packets = ceil( latency_s × bitrate_bps / (1316 × 8) )      # 每个 SRT 包 1316 字节载荷
-ffs     = max( 25600, 大于等于 packets × 1.2 的最小 2 的幂 )   # SRTO_FC，流控窗口（单位：包）
-rcvbuf  = ffs × 1472                                          # SRTO_RCVBUF 必须 ≤ ffs × (MSS − 28)
-sndbuf  = 同 rcvbuf（发送端）
-recv_buffer_size = 8000000                                    # UDP socket 缓冲（Linux 上受 net.core.rmem_max 限制，会被静默截断）
+packets = ceil( latency_s × bitrate_bps / (1316 × 8) )      # 1316 bytes of payload per SRT packet
+ffs     = max( 25600, smallest power of 2 ≥ packets × 1.2 )   # SRTO_FC, the flow-control window (in packets)
+rcvbuf  = ffs × 1472                                          # SRTO_RCVBUF must be ≤ ffs × (MSS − 28)
+sndbuf  = same as rcvbuf (sender)
+recv_buffer_size = 8000000                                    # UDP socket buffer (Linux caps it at net.core.rmem_max, silently)
 ```
 
-例子：
+Examples:
 
-| 码率 × latency | packets | ffs | rcvbuf |
+| Bitrate × delay | packets | ffs | rcvbuf |
 |---|---|---|---|
-| 40 Mbps × 1.5 s | 5 700 | 25 600（默认） | 37 683 200 |
-| 50 Mbps × 2 s | 9 500 | 25 600 | 37 683 200 |
-| 100 Mbps × 2 s | 19 000 | 32 768 | 48 234 496 |
-| 100 Mbps × 3.5 s | 33 244 | 65 536 | 96 468 992 |
+| 40 Mbps × 1.5 s | 5 700 | 25 600 (default) | 37 683 200 |
+| 50 Mbps × 2 s | 9 499 | 25 600 | 37 683 200 |
+| 100 Mbps × 2 s | 18 997 | 25 600 | 37 683 200 |
+| 100 Mbps × 3.5 s | 33 245 | 65 536 | 96 468 992 |
 
-接收端不知道主播会用多大码率时，按界面上的 Expected bitrate 算（默认 100 Mbps，宁大勿小，只是内存）。
+The viewer does not know which bitrate the sharer is going to use, so it sizes the buffer for **Settings → Highest
+bitrate to expect** (100 Mbps by default; larger is safer, it only costs memory).
 
-## 5. 防火墙要开什么
+## 5. What to open in the firewall
 
-- **双方都有 IPv6，或双方都是锥形 NAT**：什么都不用开。打洞靠的就是路由器和 Windows 防火墙对"自己先发出去的流"的放行。
-- **有一方是对称型 NAT**（§1.1 第 2 条）：另一方要收得下"没请求过的"UDP，两样都要：
-  - **路由器**：程序自己用 UPnP 把当前 IPv4 端口转发到本机。租期 1 小时，直播 / 观看期间每 20 分钟续一次，停止时删除；
-    程序崩溃的话最多 1 小时后自动失效。日志里是 `[p2p] router: …` 几行。路由器设置里 UPnP 要开着（大多默认开）。
-  - **Windows 防火墙**：界面 **防火墙** 一栏出现 **放行…** 时点它。Windows 弹 UAC 确认后加一条入站规则
-    "HdrCast"（0.2 的两个程序各有一条 "HdrCast Sender" / "HdrCast Receiver"，可以留着）：只对这个 exe、只 UDP、所有网络类型；以前在 Windows 弹窗里点"取消"
-    留下的阻止规则会被停用（不删除）。主播开播时如果还没放行，程序会问一次。
-  - 规则认 exe 的完整路径：换到新版本的目录（比如 `D:\HdrCast-0.2.4\`）要再点一次。撤销：Windows 安全中心 → 防火墙和网络保护
-    → 高级设置 → 入站规则，删掉这条。
-- **安全性**：开的只是 HdrCast 自己的一个 UDP 端口。程序只认用组密钥签名的打洞包和已确认地址来的数据，其余一律丢弃；
-  视频本身是 SRT AES-256 加密的。
+- **Both sides have IPv6, or both are behind cone NATs**: nothing. Hole punching relies on the router and Windows
+  Firewall letting in the replies to "a flow we sent first".
+- **One side is behind a symmetric NAT** (§1.1 point 2): the other side has to accept "unrequested" UDP, which takes both
+  of these:
+  - **Router**: HdrCast forwards its current IPv4 port to this computer with UPnP by itself. The lease is 1 hour,
+    renewed every 20 minutes while HdrCast is online, live or watching, and the forward is deleted when it stops; if
+    HdrCast crashes, the forward runs out by itself within the hour. In the log these are the `[p2p] router: …` lines.
+    UPnP has to be on in the router settings (it is by default on most).
+  - **Windows Firewall**: click **Allow…** when the **Firewall** line offers it (on the **Share** page under
+    **Viewers**, and in **Settings → Network**). After the Windows UAC prompt there is an inbound rule "HdrCast": only
+    for this exe, only UDP, for every network type (the two rules of 0.2, "HdrCast Sender" and "HdrCast Receiver", can
+    stay). Block rules left over from clicking "Cancel" on a Windows prompt are disabled, not deleted. If the rule is
+    missing when you click **Go Live**, HdrCast asks once; a viewer is asked once too, when an IPv4 attempt failed in a
+    way the rule could help with.
+  - The rule is tied to the full path of the exe: a new version in a new folder (say `D:\HdrCast-0.3.1\`) needs another
+    click. To undo it: Windows Security → Firewall & network protection → Advanced settings → Inbound Rules, and delete
+    the rule.
+- **Is that safe?** All it opens is one UDP port of HdrCast itself. HdrCast only accepts punch packets signed with the
+  group key and data from confirmed addresses, and drops everything else; the video itself is encrypted with SRT's
+  AES-256.
 
-## 6. 腾讯云上的信令服务器做什么
+## 6. What the signaling server on Tencent Cloud does
 
-`signal/hdrcast_signal.py`（只用 Python 标准库，systemd 跑，见 `signal/README.zh-CN.md`）：
+`signal/hdrcast_signal.py` (Python standard library only, run by systemd, see [signal/README.md](../signal/README.md)):
 
-- **存什么**：每个组的"谁在播"（主播名字、候选地址、码率、观众数，30 s 不续期即过期）、加入请求和应答（60 s 过期），
-  以及组 id → 鉴权 key 的注册表（唯一写盘的数据）。
-- **看不到什么**：组密钥、SRT passphrase、视频。所有消息都用组密钥派生的 key 签名，服务器不知道这个 key，
-  所以就算服务器被人控制，也只能让人连不上，没法把观众引到别处。
-- **流量**：每个在播的主播每 10 s 一个几百字节的心跳，每个观众每 10 s 一次列表查询。和视频比可以忽略，不影响那台机器上的生产服务。
-- **端口**：TCP 18650（HTTP API）、UDP 18651（IPv4 地址回显）。都要在腾讯云安全组放行。UDP 18651 只有在所有人都有
-  IPv6 时才可以不开：不开的话谁都拿不到公网 IPv4 映射，没有 IPv6 的观众一律连不上（§1.1）。
-- **挂了会怎样**：已经连上的人照常看；新的人加入不了、列表刷不出来，恢复后自动继续。
+- **What it keeps**: for every group, who is online or live (name, device key, candidate addresses, bitrate, viewer
+  count; gone after 30 s without a renewal), join requests and answers (gone after 60 s), and the registry of group id →
+  auth key (the only thing it writes to disk).
+- **What it cannot see**: the group key, the SRT passphrase, the video. Every message is signed with a key derived from
+  the group key, which the server does not know, so even somebody who took over the server could only keep people from
+  connecting, not send viewers anywhere else.
+- **Traffic**: a heartbeat of a few hundred bytes every 10 s from every computer that is online or live, and a list
+  request every 10 s from every HdrCast that is running. Next to the video that is nothing, and it does not get in the way
+  of the production services on that machine.
+- **Ports**: TCP 18650 (HTTP API) and UDP 18651 (IPv4 address echo), both opened in the Tencent Cloud security group. UDP
+  18651 may only stay closed if everybody has IPv6: without it nobody learns a public IPv4 mapping, and viewers without
+  IPv6 cannot connect at all (§1.1).
+- **When it is down**: people already connected keep watching; nobody new can join and the list does not load; it all
+  carries on once the server is back.
 
-## 7. 上传带宽估算
+## 7. Estimating upload bandwidth
 
 ```
-主播需要的上行 ≈ 码率 × 观众数 × (1 + oheadbw)      # oheadbw 25 % → ×1.25，中国观众 50 % → ×1.5
+upload the sharer needs ≈ bitrate × viewers × (1 + oheadbw)      # oheadbw 25 % → ×1.25, viewers in China at 50 % → ×1.5
 ```
 
-例：40 Mbps，日本 1 人 + 澳洲 1 人 + 中国 1 人 ≈ 40 × (1.25 + 1.25 + 1.5) = 160 Mbps 上行。
-日本的光纤上行一般够；国内家宽上行常见 30~100 Mbps、澳洲 NBN 常见 20~50 Mbps，朋友开播时要降码率或限人数。
-开播页会按"同时观看人数"估算，填了"我的上行带宽"就会在超过 80 % 时标红提醒。
+Example: 40 Mbps, one viewer each in Japan, Australia and China ≈ 40 × (1.25 + 1.25 + 1.5) = 160 Mbps of upload. Fibre
+upload in Japan is usually enough; home broadband in China often has 30-100 Mbps of upload and NBN in Australia
+20-50 Mbps, so when a friend there shares, they have to lower the bitrate or the number of viewers. The **Share** page
+estimates the upload for **Viewers at once**, and once **My upload speed** is filled in, it turns the estimate red above
+80 % of it.

@@ -277,7 +277,8 @@ build.sh     test + build + package
 
 ## Documentation
 
-The documents under `docs/` are in Chinese for now.
+design.md and the two checklists are in Chinese for now; network.md and faq.md have a Chinese version next to them
+(`network.zh-CN.md`, `faq.zh-CN.md`).
 
 - [docs/design.md](docs/design.md): the design, final; §8 is the peer-to-peer protocol (invites, key derivation, signatures,
   signaling API, punch packets, and in §8.9 the side channel remote control uses).

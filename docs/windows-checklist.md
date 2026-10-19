@@ -107,7 +107,7 @@ idx  device         name                      size        pos          hz     hd
 - [ ] 主播 **停止**：观众显示 `The stream ended - waiting …`；再开播，观众自动重新接上。
 - [ ] **同时观看人数** 设 1：第二个观众显示 `… is full`。
 - [ ] 上行估算：码率 40、3 人、我的上行带宽 100 → 提示变红。
-- [ ] 朋友（中国 / 澳洲）按 `README.md` 操作，地区预设按 `docs/network.md` §3；连不上时把面板原话和两边 test-ipv6.com 的结果记下来（**日志 → 复制**）。
+- [ ] 朋友（中国 / 澳洲）按 `README.md` 操作，地区预设按 `docs/network.zh-CN.md` §3；连不上时把面板原话和两边 test-ipv6.com 的结果记下来（**日志 → 复制**）。
 
 ## 6. 开播端：画面与统计
 
@@ -188,7 +188,7 @@ shader 里 90° 与 270° 的映射（`desk_to_src`）互为逆运算，DXGI 文
 - 日志：应用里的 **日志** 页（**复制** 得到的内容已打码，可以直接发人），文件在 `%APPDATA%\HdrCast\logs\hdrcast-yyyyMMdd.log`。
   `[p2p]` 开头的行是打洞与信令，`[remux 名字]` 是那位观众的 ffmpeg，`[capture]` 是采集引擎，`[mpv]` / `[ipc]` 是播放器，`[control]` 是远程控制。
 - 配置：`%APPDATA%\HdrCast\sender.json`、`receiver.json`、`app.json`（删掉即恢复默认）、`group.json`（组和密钥，删掉即退出组）。
-- 连不上：先看观看页面板的原话，对照 `docs/network.md` §1.2；画面卡顿 / 断线的排查顺序见 `docs/faq.md`。
+- 连不上：先看观看页面板的原话，对照 `docs/network.zh-CN.md` §1.2；画面卡顿 / 断线的排查顺序见 `docs/faq.zh-CN.md`。
 
 ## 单机回环（不碰真实群组、路由器和朋友）
 

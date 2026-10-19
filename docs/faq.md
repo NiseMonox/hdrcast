@@ -1,118 +1,186 @@
-# HdrCast 常见问题
+# HdrCast FAQ
 
-## 连不上怎么办？
+**English** | [简体中文](faq.zh-CN.md)
 
-点对点（Group）模式下，接收端状态栏会直接说原因，对照 `docs/network.md` §1.2：
+## It does not connect. What now?
 
-- **"This PC has no IPv6…" / "The host's PC has no IPv6…"**：哪一方没 IPv6 就去哪一方的路由器打开 IPv6（`docs/network.md` §2），
-  <https://test-ipv6.com> 可以自查。手机热点通常自带 IPv6，可以先用热点试一下。
-- **"Both sides have IPv6 but the path is blocked"**：关掉 VPN / 加速器；路由器里有"IPv6 防火墙：阻止所有入站"之类的严格选项就改回默认。
-- **"…the host's PC only takes IPv4 from routers that keep ports…"**：观众的路由器每个目的地换端口，主播那边没打开：主播在
-  **防火墙** 一栏点 **放行…**，并确认路由器开着 UPnP（开播页的面板会写缺什么）。**"…although the host takes IPv4 from any port…"**：
-  观众这边的 VPN / 代理 / 加速器截走了 UDP。
-- **"Not live right now"**：对方电脑上 HdrCast 没开（或关了"开放连接"），列表每 10 s 刷新。**"… is full"**：主播的"同时观看人数"满了。
-- **"Waiting for … to answer"**：对方要先同意（"谁可以连接"里你是"询问我"），或正在启动采集。**"… did not let you in"**：对方拒绝了、
-  把你这台电脑设成了"禁止"，或刚把你断开（一分钟内连不回去）。**"Nobody at … answered your request"**：一分钟内没人点允许。
-- **想随时远程用自己的另一台电脑**：在那台电脑上 开播 → 谁可以连接 → 添加电脑… → 选这台 → **我的电脑**（先核对设备码）。之后不用那边点任何东西。
-- **"The signaling server cannot be reached"**：本机断网或信令服务器挂了；已经在看的人不受影响。
-- 能连上但**画面一直不出来**：mpv 在等第一个关键帧（最多一个 GOP，默认 2 s）；超过 10 s 看日志里 `[remux …]` 的报错（在主播那边）。
+The panel on the **Watch** page says why. Most of its messages stay in English whatever language the app is set to, so
+they can be passed on as they are, and they call the sharer "the host". [network.md](network.md) §1.2 goes through each
+one.
 
-## IPv6 是必须的吗？
+- **"This PC has no IPv6…" / "The host's PC has no IPv6…"**: whichever side has no IPv6 turns it on in its router
+  ([network.md](network.md) §2); <https://test-ipv6.com> shows where you stand. A phone hotspot usually comes with IPv6,
+  which makes for a quick test.
+- **"Both sides have IPv6 but the path is blocked"**: turn off VPNs and game accelerators; if the router has a strict
+  option such as "IPv6 firewall: block all incoming", set it back to the default.
+- **"…the host's PC only takes IPv4 from routers that keep ports…"**: the viewer's router uses a new port for every
+  destination, and the sharer's side is not open. The sharer clicks **Allow…** on the **Firewall** line and makes sure
+  UPnP is on in their router (while they share, the panel on their **Share** page says what is missing).
+  **"…although the host takes IPv4 from any port…"**: a VPN, proxy or game accelerator on the viewer's side takes the UDP.
+- **"Not live right now"**: HdrCast is not running on the other computer (or **Available to connect** is off there); the
+  list refreshes every 10 s. **"… is full"**: the sharer's **Viewers at once** is reached.
+- **WAITING, "Waiting for … to let you in…"**: the sharer has to say yes first (under **Who Can Connect** your computer is
+  on **Ask Me**), or their computer is still starting to capture. **"… did not let you in"**: they said no, set your
+  computer to **Never**, or have just disconnected you (then you cannot connect again for a minute). **"Nobody at …
+  answered your request"**: nobody clicked **Allow** within 50 s.
+- **To use another computer of your own from anywhere**: on that computer, **Share → Who Can Connect → Add a Computer…**
+  → pick this one → **My Computer** (compare the device code first). From then on nothing has to be clicked over there;
+  turn on **Settings → General → Start HdrCast when I sign in** there as well, so that it is online after every restart.
+- **"The signaling server cannot be reached"**: this computer is offline, or the signaling server is down; people already
+  watching are not affected.
+- It connects, but **the picture never shows up**: mpv waits for the first keyframe (at most one keyframe interval, 2 s by
+  default). After more than 10 s, look for errors in the `[remux …]` lines on the sharer's **Activity** page.
 
-点对点靠 IPv6 打洞：IPv6 没有 NAT，双方同时发包就能穿过两边的有状态防火墙，不用任何设置。
-没有 IPv6 时 app 走 IPv4（经信令服务器的 UDP 回显拿到公网映射再打洞）。只要**一方**的路由器有公网 IPv4 并且"开着"
-（程序自动做的 UPnP 转发 + **防火墙** 一栏的 **放行…**），另一方就算是国内常见的对称型 NAT 也能连（2026-09-25 实测：江苏电信的朋友
-连日本的主播）。双方都在运营商级 NAT 后面（国内部分家宽、日本 v6プラス / DS-Lite、澳洲部分 ISP 的 IPv4）就打不通，要开 IPv6。
-你选了"不走腾讯云中转"，所以这种情况会明确提示，不会偷偷绕路。同一局域网里的人不需要 IPv6（走局域网 IPv4）。
+## Is IPv6 a must?
 
-## 腾讯云服务器会看到什么？
+Peer-to-peer rests on IPv6 hole punching: IPv6 has no NAT, so when both sides send at the same moment, the packets get
+through the stateful firewalls on both sides, with nothing to set up.
 
-只看到"谁在播"（主播名字、候选地址、码率、观众数）和加入 / 应答消息，全部用组密钥签名；
-看不到组密钥、SRT passphrase，也碰不到视频。服务器被人控制的最坏结果是让人连不上，没法把观众引到别处。详见 `docs/network.md` §6。
+Without IPv6 the app uses IPv4: it learns its public address mapping from a UDP echo on the signaling server and punches
+through that. As long as **one** side's router has a public IPv4 address and is "open" (the UPnP forward the app sets up
+by itself, plus **Allow…** on the **Firewall** line), the other side can connect even from behind a symmetric NAT, the
+kind common in China (tested on 2026-09-25: a friend on China Telecom in Jiangsu connected to a sharer in Japan). When
+both sides sit behind carrier-grade NAT (some home broadband in China, v6プラス / DS-Lite in Japan, the IPv4 of some
+Australian ISPs), it cannot get through, and IPv6 is the way. There is deliberately no relay through Tencent Cloud, so in
+that case HdrCast says so plainly instead of quietly taking a detour. People on the same local network do not need IPv6
+(they connect over the LAN's IPv4).
 
-## 为什么没有 AV1？
+## What does the Tencent Cloud server see?
 
-ffmpeg（7.1 与 master）的 MPEG-TS 封装器不支持 AV1：会写成 private stream (0x06)，读回来变成 `bin_data`。
-点对点的分发是按 MPEG-TS 做的（中途加入的观众靠 TS 的重复头恢复），所以只能 **HEVC Main10**。
-v0.1 的"直连模式"可以用 Matroska 走 AV1，但它要求一方做端口转发，已经随中继模式一起删除。
-哪天 ffmpeg 支持 AV1-in-MPEG-TS 了，测试 `Av1_really_cannot_be_muxed_into_mpegts` 会开始失败，那就是重新考虑的信号。
+Only who is online or live (the name, candidate addresses, bitrate, number of viewers and, from 0.3.1, the computer's
+public device key) and the join and answer messages, all signed with the group key. It sees neither the group key nor the
+SRT passphrase, and never touches the video. The worst somebody who took over the server could do is keep people from
+connecting; they could not send viewers anywhere else. More in [network.md](network.md) §6.
 
-## 观众的 mpv 为什么要先在 Windows 里打开 HDR？
+## Why no AV1?
 
-mpv 的 HDR 直通 (`--vo=gpu-next --gpu-api=d3d11 --target-colorspace-hint=yes`) 只是向 DXGI 交换链声明 "我输出的是 PQ / BT.2020"，**它自己不会切换 Windows 的 HDR 模式**（旧驱动那种"mpv 会自动开 HDR"的说法从 NVIDIA R560 起已失效）。Windows HDR 没开时这个声明会被忽略或得到一个奇怪的画面（发灰/过暗）。
-操作：`Win + Alt + B` 切换 HDR，或 设置 → 系统 → 显示 → 使用 HDR。接收端 GUI 的 "自动" 模式只在检测到 HDR 输出时才启用直通，其余情况走色调映射，所以忘了开也不至于全黑，只是画面不是真 HDR。
+ffmpeg's MPEG-TS muxer (7.1 and master) does not support AV1: it writes it as a private stream (0x06), which reads back as
+`bin_data`. Peer-to-peer delivery is built on MPEG-TS (a viewer who joins midway picks the stream up from the headers TS
+repeats), so it can only be **HEVC Main10**. The "direct mode" of v0.1 could carry AV1 in Matroska, but it needed one
+side to forward a port and was removed together with the relay mode. The day ffmpeg can put AV1 into MPEG-TS, the test
+`av1_really_cannot_be_muxed_into_mpegts` starts failing: that is the signal to think again.
 
-另外静态 HDR 元数据只在**全屏**时才会下发给显示器（Windows 限制），窗口化也是 HDR 但显示器不会切到 HDR 模式指示；想要"真全屏"就用 GUI 的全屏按钮（`--fs`，不要 `--d3d11-exclusive-fs`）。
+## Why does a viewer have to switch HDR on in Windows first?
 
-## 观众是 SDR 显示器怎么办？
+mpv's HDR passthrough (`--vo=gpu-next --gpu-api=d3d11 --target-colorspace-hint=yes`) only tells the DXGI swap chain "what
+I output is PQ / BT.2020"; **it does not switch Windows into HDR mode by itself** (the old advice that mpv turns HDR on
+for you no longer holds since NVIDIA's R560 drivers). With HDR off in Windows, that hint is ignored or gives an odd
+picture (grey, or too dark). Switch HDR with `Win + Alt + B`, or in Settings → System → Display → Use HDR. **Watch →
+Output → Automatic** only uses passthrough when it finds an HDR output and tone-maps otherwise, so forgetting it does not
+give you a black screen, just a picture that is not real HDR.
 
-两个选择：
+Static HDR metadata only reaches the display in **full screen** (a Windows limitation): a window is HDR as well, but the
+display does not switch into its HDR mode. For real full screen use the **Full Screen** button (`--fs`, not
+`--d3d11-exclusive-fs`).
 
-1. **mpv 色调映射（推荐）**：接收端选 "SDR 色调映射"（`--target-colorspace-hint=no --tone-mapping=bt.2390`，可选 `--hdr-compute-peak=yes`），mpv 在 GPU 上把 PQ 映射到 SDR，观感接近发送端的 SDR 桌面，高光被压缩。
-2. 发送端切「强制 SDR」：桌面按 SDR 采集（nv12 / BT.709），所有人看 SDR，但发送端自己的 HDR 桌面在 SDR 采集下亮度会被裁切——只在观众全是 SDR 时用。
+## The viewer has an SDR display
 
-## 码率怎么选？
+Two choices:
 
-HEVC 10-bit、60 fps、桌面/游戏混合内容的经验值：
+1. **Tone mapping in mpv (recommended)**: set **Watch → Output** to **SDR**
+   (`--target-colorspace-hint=no --tone-mapping=bt.2390`; **Tone mapping** offers other curves). mpv maps PQ to SDR on
+   the GPU, which looks close to the sharer's SDR desktop, with the highlights compressed.
+2. The sharer sets **Share → HDR** to **Always SDR**: the desktop is captured as SDR (nv12 / BT.709) and everybody watches
+   SDR, but the brightness of the sharer's own HDR desktop gets clipped when it is captured as SDR. Only use it when every
+   viewer is on SDR.
 
-| 分辨率 | 够用 | 好 | 极致（NVENC 已无收益） |
+## Which bitrate?
+
+Rules of thumb for 10-bit HEVC at 60 fps, a mix of desktop and games:
+
+| Resolution | Enough | Good | Best (beyond this NVENC gains nothing) |
 |---|---|---|---|
 | 1920×1080 | 12 Mbps | 20 Mbps | 30 Mbps |
 | 2560×1440 | 20 Mbps | 35 Mbps | 50 Mbps |
-| 3840×2160 | 40 Mbps | 60 Mbps | 80~100 Mbps |
+| 3840×2160 | 40 Mbps | 60 Mbps | 80-100 Mbps |
 
-- 文字多的桌面比游戏更需要码率（高频细节），快速运动的游戏 + 高码率才不糊。
-- 4K 显示器分享游戏时，在 GUI 里把输出分辨率降到 2560×1440 通常比 4K 低码率更清楚，也少占一半带宽。
-- 码率上限由**主播的上行带宽 ÷ (观众数 × 1.25)** 决定，而不是画质意愿，见下一条。
-- GOP 保持 1~2 s（默认 2 s）：观众加入时要等到下一个 IDR 才有画面，mpv 在此期间会刷 "Could not find ref with POC"，是正常现象。
+- A desktop full of text needs more bitrate than a game (lots of fine detail); fast-moving games only stay sharp with a
+  high bitrate.
+- Sharing a game from a 4K display, setting **Share → Resolution** to 1440p usually looks sharper than 4K at a low
+  bitrate, and takes half the bandwidth.
+- The ceiling is set by **the sharer's upload ÷ (viewers × 1.25)**, not by how good you would like it to look: see the
+  next question.
+- Keep the keyframe interval at 1-2 s (2 s by default, **Share → More options → Keyframe interval**): a viewer who joins
+  sees nothing until the next IDR frame, and mpv prints "Could not find ref with POC" until then, which is normal.
 
-## 上传带宽怎么估？
+## How much upload does sharing take?
 
-主播的电脑给每个观众各发一份，所以：
+The sharer's computer sends every viewer a copy of their own, so:
 
 ```
-上行需求 ≈ 码率 × 观众数 × 1.25（SRT 开销 oheadbw=25 %；中国观众 oheadbw=50 % 时按 ×1.5）
+upload needed ≈ bitrate × viewers × 1.25   (SRT overhead oheadbw=25 %; ×1.5 for a viewer at oheadbw=50 %, the China preset)
 ```
 
-- 40 Mbps × 2 人 = 100 Mbps；40 Mbps × 3 人（含一位中国）≈ 160 Mbps。
-- 先 speedtest 看上行，留 30 % 余量。上行不够就降码率或减少人数，不要把 oheadbw 调低（Haivision 的原话：太低时线路一有丢包"流就会立刻卡死"）。
-- 开播页按"同时观看人数"估算上行，填了"我的上行带宽"会在超过 80 % 时标红；"正在观看"列表上方显示当前实际需要的上行。
-- 国内家宽上行常见 30~100 Mbps、澳洲 NBN 常见 20~50 Mbps：朋友开播给两三个人看时，码率一般要降到 10~20 Mbps。
+- 40 Mbps × 2 viewers = 100 Mbps; 40 Mbps × 3 viewers (one of them in China) ≈ 160 Mbps.
+- Measure your upload with a speed test first and keep 30 % spare. When it is not enough, lower the bitrate or the number
+  of viewers; do not lower oheadbw (Haivision warns that with too little overhead the stream stalls as soon as the line
+  loses packets).
+- The **Share** page works out the upload for **Viewers at once**; fill in **My upload speed** and the estimate turns red
+  above 80 % of it. Above the **Watching** list, "upload ≈ … Mbps" shows what the viewers connected right now need.
+- Home broadband in China often has 30-100 Mbps of upload, NBN in Australia 20-50 Mbps: when a friend there shares with
+  two or three people, the bitrate usually has to come down to 10-20 Mbps.
 
-## 画面卡顿 / 断线，按什么顺序排查？
+## It stutters or drops: what to check, in order
 
-1. 接收端 mpv 日志里有 `No room to store incoming packet` → 接收缓冲不够，GUI 的「码率上限」填大一点（它决定 rcvbuf/ffs），见 `docs/network.md` §4。
-2. 线路丢包：让这位观众把 latency 加 500~1000 ms 再 Play（点对点模式下这个值直接用于主播给他的那条连接）；仍不行就降码率。
-   主播的上行不够时所有观众一起卡：看状态栏 **Viewers** 里的 upload 估算。
-3. 发送端状态栏 `speed` 持续 < 1.0× 或 `drop_frames` 增长 → 编码器跟不上：降分辨率 / 帧率，或质量档改成"速度优先"。
-4. 采集统计 `dropped` 增长而 `captured` 正常 → 管道写入被 ffmpeg 阻塞，一般是上一条的编码器问题。
+1. `No room to store incoming packet` in the viewer's player log (**Activity → Player**) → the receive buffer is too
+   small: raise **Settings → Highest bitrate to expect** (it sizes rcvbuf / ffs), see [network.md](network.md) §4.
+2. Packet loss on the way: the viewer stops, adds 500-1000 ms under **Watch → Delay → Custom** and connects again (the
+   sharer uses this value for the connection to that viewer); if that does not help, lower the bitrate. When the sharer's
+   upload falls short, every viewer stutters at once: check "upload ≈ … Mbps" above the **Watching** list on the sharer's
+   **Share** page.
+3. On the sharer's **Share** page the **Encoder** speed stays below 1.0×, or **Dropped frames** keeps climbing → the
+   encoder cannot keep up: lower the resolution or the frame rate, or set **More options → Encoder preset** to **Speed**.
+   (**Dropped frames** counts the frames the encoder dropped as well as those the capture could not hand over because
+   ffmpeg was not reading, which is usually the same problem.)
 
-## 音频怎么来的？需要虚拟声卡吗？
+## Where does the sound come from? Do I need a virtual audio device?
 
-不需要。采集引擎用 WASAPI loopback 抓默认播放设备的混音（同时播放一路静音防止渲染引擎休眠），重采样成 48 kHz 立体声 f32，与视频用同一个 QPC 时钟对齐后通过命名管道给 ffmpeg，编码为 AAC 192k（或 Opus 128k）。在 GUI 里可以选别的输出设备，或关掉音频。
+No. On Windows the capture engine records the mix of the default playback device with WASAPI loopback (while playing
+silence to it, so that the audio engine does not go to sleep), resamples it to 48 kHz stereo f32, lines it up with the
+video on the same QPC clock and hands it to ffmpeg through a named pipe; ffmpeg encodes AAC at 192 kbps (or Opus). On a
+Mac the system sound comes from ScreenCaptureKit, in the same stream as the picture. **Share → Sound** has a switch for
+**Computer audio**, and on Windows an **Output device** to record another device than the default.
 
-## 大家在同一个语音里，观众会听到自己的回声？
+## We are all in one voice chat: will the viewers hear their own echo?
 
-在主播端 **开播 → 声音 → 排除程序** 里选语音软件（例如 `Discord.exe`，下拉列表列出正在出声的程序，也可以手打），它和它启动的子进程的声音就不会进流，
-和 Parsec 的 Echo Cancelling 是同一个 Windows 接口（Windows 10 21H1 或更新）。一次只能排除一个程序。
+Not if the sharer picks the voice chat app under **Share → Sound → Leave out** (for example `Discord.exe`; the list shows
+the apps playing sound right now, or type the name). Its sound, and that of the processes it starts, stays out of the
+stream. It is the same Windows interface as Parsec's echo cancelling (Windows 10 21H1 or newer), and it leaves out one app
+at a time. A sharing Mac cannot leave an app out.
 
-## 为什么采集不用 ffmpeg 自带的 ddagrab？
+## Why not capture with ffmpeg's own ddagrab?
 
-ddagrab 能拿到正确的 scRGB FP16 帧，但 ffmpeg 内部没有任何无损路径把打包 FP16 交给 zscale / libplacebo：swscale 会把 > 1.0（> 80 nit）的值全部裁掉（三个版本实测），所以 HDR 会被压成 SDR。HdrCast 用自己的 D3D11 compute shader 在 GPU 上做 scRGB → PQ/BT.2020 → P010，再把 P010 喂给 ffmpeg 只做编码，这也是 OBS 的做法。详见 `docs/design.md` §1.1。
+ddagrab gets correct scRGB FP16 frames, but ffmpeg has no lossless way to hand packed FP16 to zscale or libplacebo:
+swscale clips every value above 1.0 (above 80 nits), as tests with three versions showed, so HDR gets squashed into SDR.
+HdrCast converts scRGB → PQ / BT.2020 → P010 in a D3D11 compute shader of its own, on the GPU, and only has ffmpeg encode
+the P010, which is also what OBS does. Details in [design.md](design.md) §1.1 (in Chinese).
 
-## 安全性如何？
+## How safe is it?
 
-- 邀请码里的 32 字节组密钥是一切的根：派生出信令鉴权 key、消息签名 key、SRT passphrase（AES-256，`pbkeylen=32`）和每个会话的打洞 key。
-  **有邀请码就能进组看**，只发给信得过的人；要踢人就新建一个组、把新邀请码发给其余的人。
-- 视频从主播的 remux 子进程到观众的 mpv 端到端 AES-256；打洞包带 HMAC，未通过验证的来源发来的数据一律丢弃，碰不到主播本机的 ffmpeg。
-- 信令服务器只见签名的元数据（见上面"腾讯云服务器会看到什么"）。
+- The 32-byte group key in the invite is the root of everything: the signaling auth key, the message signing key, the SRT
+  passphrase (AES-256, `pbkeylen=32`) and each session's punch key are derived from it. **Whoever has the invite can join
+  the group and watch**, so only send it to people you trust; to lock somebody out, start a new group and send the new
+  invite to everybody else.
+- The video is AES-256 encrypted all the way from the sharer's remux process to the viewer's mpv. Punch packets carry an
+  HMAC; data from any address that has not passed it is dropped, so it never reaches the ffmpeg on the sharer's computer.
+- From 0.3.1 every computer also has a device key of its own (in `device.json`: never send it anywhere, never copy it to
+  another computer). The rules under **Who Can Connect** follow that key rather than a name anybody in the group could
+  type, and remote-control input between two 0.3.1 computers is encrypted with a key only those two can work out.
+- The signaling server only sees signed metadata (see "What does the Tencent Cloud server see?" above).
 
-## 界面上的 "ping 38 ms" 是延迟吗？
+## Is the "ping 38 ms" the delay?
 
-不是。那是打洞路径的往返时间（网络 ping）。画面的延迟 ≈ 观众的 SRT latency + 播放器缓冲（1.5 s）+ 编解码（约 0.5 s）：
-日本预设实测 3.6 s（2026-09-24，本机回环，`docs/network.md` §3），中国预设约 5.6 s。latency 是重传的时间窗口，决定抗丢包能力，**不决定画质**；
-画质只看码率和编码预设。线路好的时候大 latency 和小 latency 看起来一样，只是晚几秒。
+No. That is the round trip of the punched path (a network ping). The delay of the picture ≈ the viewer's SRT delay + the
+player buffer (1.5 s, **Settings → Player buffer**) + encoding and decoding (about 0.5 s): measured at 3.6 s with the
+Japan preset (2026-09-24, one PC over loopback, [network.md](network.md) §3), about 5.6 s with the China preset. The SRT
+delay is the time window for retransmissions: it decides how much packet loss the stream rides out, **not the picture
+quality**, which only depends on the bitrate and the encoder preset. On a good line a long delay and a short one look the
+same; one is just a few seconds later.
 
-## 延迟能再低一点吗？
+## Can the delay be shorter?
 
-可以，但这是"推流式"设计：把观众的 latency 改成 4×RTT（日本 ~200 ms、澳洲 ~700 ms），mpv 的 `cache-pause-wait` 改成 0.5 s，总延迟能到 1.5 s 左右；线路一抖就会卡。不建议低于 3×RTT。远程桌面级的延迟不是这个工具的目标。
+Yes, but HdrCast is built like a broadcast. Pick **Fast** (300 ms) under **Watch → Delay**, or a **Custom** delay of about
+4 × RTT (Japan about 200 ms, Australia about 700 ms), and lower **Settings → Player buffer** (mpv's `cache-pause-wait`) to
+0.5 s: the whole delay comes down to about 1.5 s, but the picture stalls whenever the line hiccups. Going below 3 × RTT
+is not recommended. Remote-desktop latency is not what this tool is for: **Fast** is there for remote control, to help
+out on a computer, not for games.
