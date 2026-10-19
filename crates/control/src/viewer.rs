@@ -19,8 +19,12 @@ const MAX_PENDING: usize = 256;
 /// What to show the viewer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlState {
-    /// Not asked for.
+    /// Not asked for, and the host has not said yet what it would do.
     Off,
+    /// Not asked for; the host would ask its user.
+    Offered,
+    /// Not asked for; the host would allow it at once (this device may control it).
+    Allowed,
     /// Asked; the host's user has not answered (or no answer has arrived yet).
     Requested,
     Granted,
@@ -43,6 +47,8 @@ pub struct ViewerControl {
 
 impl ViewerControl {
     /// `key` is the session's control key; `now_us` any monotonic clock (the same one for every later call).
+    /// Without `wants_control` the viewer still says it is there (every half second), so the host's answer
+    /// tells it whether control would be allowed, asked about, or refused.
     pub fn new(key: &[u8; 32], wants_control: bool, now_us: i64) -> Self {
         Self {
             channel: Channel::viewer(key),
@@ -58,20 +64,38 @@ impl ViewerControl {
     }
 
     pub fn state(&self, now_us: i64) -> ControlState {
-        if !self.wants {
-            return ControlState::Off;
-        }
-        match self.grant {
-            Some(GrantState::Granted) => ControlState::Granted,
-            Some(GrantState::Denied) => ControlState::Denied,
-            Some(GrantState::Pending) => ControlState::Requested,
-            None if now_us - self.started_us > UNSUPPORTED_AFTER_US => ControlState::Unsupported,
-            None => ControlState::Requested,
+        let silent = now_us - self.started_us > UNSUPPORTED_AFTER_US;
+        match (self.wants, self.grant) {
+            (_, Some(GrantState::Denied)) => ControlState::Denied,
+            (true, Some(GrantState::Granted)) => ControlState::Granted,
+            (true, Some(GrantState::Pending)) => ControlState::Requested,
+            (false, Some(GrantState::Granted)) => ControlState::Allowed,
+            (false, Some(GrantState::Pending)) => ControlState::Offered,
+            (_, None) if silent => ControlState::Unsupported,
+            (true, None) => ControlState::Requested,
+            (false, None) => ControlState::Off,
         }
     }
 
     pub fn granted(&self) -> bool {
         self.wants && self.grant == Some(GrantState::Granted)
+    }
+
+    pub fn wants(&self) -> bool {
+        self.wants
+    }
+
+    /// Asks for control (true) or gives it back (false), from the next datagram on. Giving it back drops what
+    /// was not sent yet; the host lets go of anything still held down.
+    pub fn set_wants(&mut self, wants: bool) {
+        if wants == self.wants {
+            return;
+        }
+        self.wants = wants;
+        if !wants {
+            self.pending.clear();
+        }
+        self.dirty = true;
     }
 
     /// The pointer, as fractions of the picture (0,0 = top left). `inside` is false over the black bars or
@@ -145,9 +169,6 @@ impl ViewerControl {
 
     /// The datagram to send now, if one is due. Call every few milliseconds.
     pub fn poll(&mut self, now_us: i64) -> Option<Vec<u8>> {
-        if !self.wants {
-            return None;
-        }
         let since = now_us - self.last_send_us;
         let due = (self.dirty && since >= MOVE_INTERVAL_US)
             || (!self.pending.is_empty() && since >= RESEND_INTERVAL_US)
@@ -159,7 +180,7 @@ impl ViewerControl {
         self.last_send_us = now_us;
         let events: Vec<Event> = self.pending.iter().take(MAX_EVENTS_PER_PACKET).map(|(_, e)| *e).collect();
         let msg = ViewerMessage {
-            wants_control: true,
+            wants_control: self.wants,
             pointer_x: self.pointer.0,
             pointer_y: self.pointer.1,
             pointer_inside: self.pointer.2 && self.granted(),

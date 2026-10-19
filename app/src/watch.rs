@@ -1,5 +1,9 @@
 //! Watching a friend's stream: a [`ViewerSession`] keeps a punched path to the host alive, mpv plays from the
-//! local end of it, and (when asked for) the player window's mouse and keyboard go to the host.
+//! local end of it, and (when the host allows it) the player window's mouse and keyboard go to the host.
+//!
+//! Every join is signed with this computer's device key, so a host can recognise it and agree on a
+//! remote-control key with it (docs/design.md §8.10). Whether remote control is on is the host's rule for this
+//! device: allowed means it is taken at once, "ask" means the user can ask for it from the page.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -47,9 +51,9 @@ pub fn start(app: &Arc<AppState>, host_id: &str) -> Result<(), Vec<String>> {
     if is_active(app) {
         return Err(vec!["Already watching.".to_string()]);
     }
-    let (group, settings, request_control) = {
+    let (group, settings) = {
         let inner = app.inner.lock().unwrap();
-        (inner.group.current().clone(), inner.receiver.clone(), inner.ui.request_control)
+        (inner.group.current().clone(), inner.receiver.clone())
     };
     let mut problems = settings.validate();
     if !group.is_configured() {
@@ -73,7 +77,9 @@ pub fn start(app: &Arc<AppState>, host_id: &str) -> Result<(), Vec<String>> {
             host_id: host_id.to_string(),
             latency_ms: settings.latency_ms,
             overhead_percent: settings.overhead_percent() as i32,
-            request_control,
+            // this viewer speaks the side channel: the host's rules say what remote control it gets
+            request_control: true,
+            device: Some(app.device.clone()),
             map_router_port: state::router_mapping_wanted(),
             ..ViewerSessionOptions::default()
         },
@@ -81,13 +87,13 @@ pub fn start(app: &Arc<AppState>, host_id: &str) -> Result<(), Vec<String>> {
     );
     let runner = MpvRunner::new(app.job.clone(), app.logger());
     let session = Arc::new_cyclic(|weak: &Weak<Session>| {
-        let control = request_control.then(|| {
+        let control = {
             let sender = weak.clone();
-            ViewerControlLink::start(
+            Some(ViewerControlLink::start(
                 Arc::new(move |payload| sender.upgrade().is_some_and(|s| s.viewer.send_side(payload))),
                 app.logger(),
-            )
-        });
+            ))
+        };
         Session {
             viewer,
             runner,
@@ -144,7 +150,11 @@ impl Session {
         if let Some(control) = &self.control {
             match self.viewer.sid().filter(|_| connected) {
                 Some(sid) => {
-                    let key = self.viewer.host_offers_control().then(|| self.keys.control_key(&sid));
+                    // the key agreed with the host's device when it has one (0.3.1 on), else the group's
+                    let key = self
+                        .viewer
+                        .host_offers_control()
+                        .then(|| self.viewer.control_key(&sid).unwrap_or_else(|| self.keys.control_key(&sid)));
                     control.session(&sid, key);
                 }
                 None => control.session_ended(),
@@ -197,6 +207,22 @@ pub fn toggle_fullscreen(app: &AppState) {
     }
 }
 
+/// The live list was read again: a host that has started offering remote control since this session joined it
+/// (its user allowed this computer meanwhile) gets the side channel now rather than at the next reconnect.
+pub fn live_list_updated(app: &AppState, hosts: &[hdrcast_p2p::LiveEntry]) {
+    let Some(session) = current(app) else { return };
+    if hosts.iter().any(|h| h.record.host_id == session.host_id && h.remote_control()) {
+        session.viewer.host_now_offers_control();
+    }
+}
+
+/// Asks the host for remote control (true), or gives it back to just watch (false).
+pub fn want_control(app: &AppState, want: bool) -> Result<(), String> {
+    let session = current(app).ok_or("Not watching.")?;
+    session.control.as_ref().ok_or("This host does not offer remote control.")?.want(want);
+    Ok(())
+}
+
 pub fn status(app: &AppState) -> Value {
     let Some(session) = current(app) else {
         return json!({ "active": false, "hostId": "", "hostName": "", "session": null, "player": null, "control": "off" });
@@ -210,6 +236,8 @@ pub fn status(app: &AppState) -> Value {
         ViewerSessionState::Connected => "connected",
         ViewerSessionState::Waiting => "waiting",
         ViewerSessionState::Stopped => "stopped",
+        ViewerSessionState::Approval => "approval",
+        ViewerSessionState::Refused => "refused",
     };
     let play = session.runner.snapshot();
     let st = &play.status;
@@ -239,17 +267,15 @@ pub fn status(app: &AppState) -> Value {
         })
     });
     let control = match &session.control {
-        None => "off",
-        Some(_) if viewer.state() == ViewerSessionState::Connected && !viewer.host_offers_control() => "unsupported",
-        Some(link) => match link.state() {
-            "off" => "requested",
-            other => other,
-        },
+        Some(link) if viewer.state() == ViewerSessionState::Connected && viewer.host_offers_control() => link.state(),
+        _ => "off",
     };
     json!({
         "active": true,
         "hostId": session.host_id,
         "hostName": if learned.is_empty() { session.host_name.clone() } else { learned },
+        "hostDeviceCode": viewer.host_device_key().as_deref().map(hdrcast_core::group::device::code_of).unwrap_or_default(),
+        "hostOnDemand": viewer.host_on_demand(),
         "session": {
             "state": state_name,
             "status": viewer.status(),

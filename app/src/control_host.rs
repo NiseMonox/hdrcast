@@ -1,5 +1,6 @@
-//! Remote control, host side: one [`HostControl`] per viewer who asked, fed from the P2P side channel, answered
-//! through it, and ticked so that nothing a viewer held down stays down when they vanish.
+//! Remote control, host side: one [`HostControl`] per viewer session, registered when the viewer is let in with
+//! the key and the rule of that session, fed from the P2P side channel, answered through it, and ticked so that
+//! nothing a viewer held down stays down when they vanish.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,13 +10,10 @@ use std::time::{Duration, Instant};
 
 use hdrcast_control::inject::{self, ScreenRect};
 use hdrcast_control::{Button, Grant, HostControl, Injector, Key, Mods, SystemInjector};
-use hdrcast_core::group::keys::GroupKeys;
 
 type LogFn = Arc<dyn Fn(&str) + Send + Sync>;
 /// Sends a side-channel datagram to a viewer's session.
 pub type SendFn = Arc<dyn Fn(&str, &[u8]) -> bool + Send + Sync>;
-/// The display name of a viewer's session, for the log.
-pub type NameFn = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
 /// With this set, what a viewer does is written to the log instead of done: for trying remote control with host
 /// and viewer on the same computer, where real input would feed back into the player window it comes from.
@@ -77,35 +75,24 @@ struct Entry {
 }
 
 struct Inner {
-    policy: Grant,
     sessions: HashMap<String, Entry>,
+    /// The shared display: the viewer's pointer is confined to it.
+    display: ScreenRect,
 }
 
 pub struct ControlHub {
-    keys: GroupKeys,
-    /// The shared display: the viewer's pointer is confined to it.
-    display: ScreenRect,
     inner: Mutex<Inner>,
     send: SendFn,
-    name_of: NameFn,
     log: LogFn,
     started: Instant,
     stopped: AtomicBool,
 }
 
 impl ControlHub {
-    /// `display_name` is the shared display as the capture engine names it.
-    pub fn start(keys: GroupKeys, policy: u8, display_name: &str, send: SendFn, name_of: NameFn, log: LogFn) -> Arc<Self> {
-        let display = inject::display_rect(display_name).unwrap_or_else(|| {
-            log(&format!("[control] cannot find the display {display_name}: the pointer will use the main display"));
-            ScreenRect { x: 0.0, y: 0.0, width: 1920.0, height: 1080.0 }
-        });
+    pub fn start(send: SendFn, log: LogFn) -> Arc<Self> {
         let hub = Arc::new(Self {
-            keys,
-            display,
-            inner: Mutex::new(Inner { policy: grant_of(policy), sessions: HashMap::new() }),
+            inner: Mutex::new(Inner { sessions: HashMap::new(), display: ScreenRect { x: 0.0, y: 0.0, width: 1920.0, height: 1080.0 } }),
             send,
-            name_of,
             log,
             started: Instant::now(),
             stopped: AtomicBool::new(false),
@@ -127,6 +114,29 @@ impl ControlHub {
         self.started.elapsed().as_micros() as i64
     }
 
+    /// The display being shared (as the capture engine names it): pointers of sessions registered from now on are
+    /// confined to it.
+    pub fn set_display(&self, display_name: &str) {
+        let rect = inject::display_rect(display_name).unwrap_or_else(|| {
+            (self.log)(&format!("[control] cannot find the display {display_name}: the pointer will use the main display"));
+            ScreenRect { x: 0.0, y: 0.0, width: 1920.0, height: 1080.0 }
+        });
+        self.inner.lock().unwrap().display = rect;
+    }
+
+    /// A viewer was let in: its datagrams are sealed with `key`, and `policy` (0 off, 1 ask, 2 allow) is what it
+    /// may do. Datagrams of sessions nobody registered are ignored.
+    pub fn register(&self, sid: &str, name: &str, key: &[u8; 32], policy: u8) {
+        let mut inner = self.inner.lock().unwrap();
+        let injector: Box<dyn Injector> = if std::env::var_os(DRY_RUN_ENV).is_some() {
+            Box::new(LoggingInjector { log: self.log.clone(), name: name.to_string(), pointer_logged: None })
+        } else {
+            Box::new(SystemInjector::new(inner.display))
+        };
+        let entry = Entry { control: HostControl::new(key, grant_of(policy), injector), name: name.to_string(), requested: false, granted: false };
+        inner.sessions.insert(sid.to_string(), entry);
+    }
+
     /// A side-channel datagram from the viewer of session `sid` (the link has checked where it came from).
     pub fn on_datagram(&self, sid: &str, payload: &[u8]) {
         if self.stopped.load(Ordering::SeqCst) {
@@ -136,16 +146,7 @@ impl ControlHub {
         let mut notes = Vec::new();
         let reply = {
             let mut inner = self.inner.lock().unwrap();
-            let policy = inner.policy;
-            let entry = inner.sessions.entry(sid.to_string()).or_insert_with(|| {
-                let name = (self.name_of)(sid).unwrap_or_else(|| "A viewer".to_string());
-                let injector: Box<dyn Injector> = if std::env::var_os(DRY_RUN_ENV).is_some() {
-                    Box::new(LoggingInjector { log: self.log.clone(), name: name.clone(), pointer_logged: None })
-                } else {
-                    Box::new(SystemInjector::new(self.display))
-                };
-                Entry { control: HostControl::new(&self.keys.control_key(sid), policy, injector), name, requested: false, granted: false }
-            });
+            let Some(entry) = inner.sessions.get_mut(sid) else { return };
             let reply = entry.control.on_datagram(payload, now);
             Self::note_changes(entry, &mut notes);
             reply
@@ -214,16 +215,14 @@ impl ControlHub {
         Ok(())
     }
 
-    pub fn set_policy(&self, policy: u8) {
+    /// The rule of one session changed (0 off, 1 ask, 2 allow). Turning it off takes control back.
+    pub fn set_policy(&self, sid: &str, policy: u8) {
         let mut notes = Vec::new();
         {
             let mut inner = self.inner.lock().unwrap();
-            inner.policy = grant_of(policy);
-            let policy = inner.policy;
-            for entry in inner.sessions.values_mut() {
-                entry.control.set_policy(policy);
-                Self::note_changes(entry, &mut notes);
-            }
+            let Some(entry) = inner.sessions.get_mut(sid) else { return };
+            entry.control.set_policy(grant_of(policy));
+            Self::note_changes(entry, &mut notes);
         }
         for line in notes {
             (self.log)(&line);

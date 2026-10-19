@@ -33,6 +33,8 @@ struct Osd {
 #[derive(Default)]
 struct Inner {
     control: Option<ViewerControl>,
+    /// The user gave control back ("Just Watch"): not taken again by itself until they ask for it.
+    released: bool,
     sid: String,
     ipc: Option<MpvIpcClient>,
     /// Our client name inside mpv ("ipc_0"), which the input section's bindings address.
@@ -79,15 +81,25 @@ impl ViewerControlLink {
     }
 
     /// The path to the host is up with session `sid` (a reconnect makes a new session, with a new key).
-    /// `key` = None: this host does not offer remote control.
+    /// `key` = None: this host does not offer remote control. Control is not asked for at first: the host's
+    /// answer says whether this computer may have it at once (then it is taken), or would have to ask.
     pub fn session(&self, sid: &str, key: Option<[u8; 32]>) {
         let mut inner = self.inner.lock().unwrap();
         if inner.sid == sid && inner.control.is_some() == key.is_some() {
             return;
         }
         inner.sid = sid.to_string();
-        inner.control = key.map(|k| ViewerControl::new(&k, true, self.now_us()));
+        inner.control = key.map(|k| ViewerControl::new(&k, false, self.now_us()));
         inner.last_state = None;
+    }
+
+    /// The user asks for control (true) or gives it back to just watch (false).
+    pub fn want(&self, want: bool) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.released = !want;
+        if let Some(control) = inner.control.as_mut() {
+            control.set_wants(want);
+        }
     }
 
     /// A side-channel datagram from the host.
@@ -168,7 +180,12 @@ impl ViewerControlLink {
         let mut note = None;
         let datagram = {
             let mut inner = self.inner.lock().unwrap();
+            let released = inner.released;
             let Some(control) = inner.control.as_mut() else { return };
+            // This computer may control the host as soon as it connects: take it, unless the user gave it back.
+            if control.state(now) == ControlState::Allowed && !released {
+                control.set_wants(true);
+            }
             let datagram = control.poll(now);
             let state = control.state(now);
             let granted = control.granted();
@@ -176,11 +193,13 @@ impl ViewerControlLink {
                 inner.last_state = Some(state);
                 note = Some(match state {
                     ControlState::Granted => {
-                        "[control] the host allowed remote control: the player window now sends your mouse and keyboard \
+                        "[control] remote control is on: the player window now sends your mouse and keyboard \
                          (Ctrl+Alt+Enter toggles full screen)"
                     }
                     ControlState::Denied => "[control] the host does not allow remote control",
                     ControlState::Requested => "[control] asked the host for remote control",
+                    ControlState::Offered => "[control] the host would ask its user before you could control it",
+                    ControlState::Allowed => "[control] just watching (you may take control at any time)",
                     ControlState::Unsupported => "[control] the host did not answer the remote control request",
                     ControlState::Off => "[control] off",
                 });
@@ -217,10 +236,12 @@ impl ViewerControlLink {
         inner.section_on = granted;
     }
 
-    /// "off", "requested", "granted", "denied" or "unsupported", for the page.
+    /// "off", "offered", "allowed", "requested", "granted", "denied" or "unsupported", for the page.
     pub fn state(&self) -> &'static str {
         let inner = self.inner.lock().unwrap();
         match inner.control.as_ref().map(|c| c.state(self.now_us())) {
+            Some(ControlState::Offered) => "offered",
+            Some(ControlState::Allowed) => "allowed",
             Some(ControlState::Requested) => "requested",
             Some(ControlState::Granted) => "granted",
             Some(ControlState::Denied) => "denied",

@@ -7,6 +7,8 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# Device keys (docs/design.md §8.10): who a computer is, which the group key cannot say.
+ed25519-dalek = "3.0.0"
 getrandom = "0.4.3"
 hmac = "0.13.0"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -15,6 +17,8 @@ sha2 = "0.11.0"
 subtle = "2.6.1"
 thiserror = "2.0.21"
 unicode-normalization = "0.1.25"
+x25519-dalek = "3.0.0"
+zeroize = "1.9.1"
 
 [target."cfg(windows)".dependencies]
 windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant", "Win32_NetworkManagement_WindowsFirewall", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_SystemInformation", "Win32_System_WindowsProgramming", "Win32_System_Registry"] }

@@ -27,8 +27,9 @@ through it. Anyone in the group can also share to the others. One app, **HdrCast
 1. Windows: unzip the HdrCast folder anywhere and start `HdrCast.exe`. macOS: drag `HdrCast.app` to Applications and open it.
 2. **Copy the whole invite message** from the chat first. HdrCast then asks "Join this group?": say yes and type the name your
    friends will see. If it does not ask, choose **I have an invite** (or **Settings > Paste Invite**).
-3. **Watch** lists who is live right now (refreshed every 10 s). Pick where you are under **Delay**: Japan 1.5 s,
-   Australia 2 s, China 3.5 s. Click **Watch**.
+3. **Watch** lists the computers in the group that are online (refreshed every 10 s). Pick where you are under **Delay**:
+   Japan 1.5 s, Australia 2 s, China 3.5 s. A friend who is **LIVE** is broadcasting: click **Watch**. A friend who is just
+   **Online** starts sharing when you click **Connect**, and may have to let you in first (you see "Waiting").
 4. On an **HDR display**, switch HDR on first (Windows: `Win + Alt + B`). On an SDR display set **Output** to SDR.
 
 The delay is 3-6 seconds by design: it is a broadcast, not a remote desktop.
@@ -40,16 +41,32 @@ The delay is 3-6 seconds by design: it is a broadcast, not a remote desktop.
    get a warning. macOS asks once for the Screen & System Audio Recording permission.
 2. Talking with the group in a voice chat? On Windows pick it under **Sound > Leave out** (for example `Discord.exe`) so your
    friends do not hear themselves coming back through the stream. Needs Windows 10 21H1 or newer.
+3. You do not have to go live: while HdrCast is open your computer is **Online** in the group, and friends can click
+   **Connect**. Under **Share > Who Can Connect** you decide what happens then (next section). Your screen is only captured
+   while somebody you let in is watching, and capture stops by itself 20 s after the last one leaves.
 
-## Remote control (optional)
+## Who can connect, and remote control
 
-A viewer can ask to use the sharer's mouse and keyboard, from the player window.
+Every computer running HdrCast 0.3.1 has its own **device code** (Settings > Group > This computer, e.g. `7KQ2-M9XD-4TPA`).
+Rules follow that code, not the name, and nobody else in the group can pretend to be your computer.
 
-- Viewer: switch **Remote control** on under **Watch > Connection** before clicking Watch, and use the **Fast** delay.
-  `Ctrl + Alt + Enter` stays with your own player (full screen on/off).
-- Sharer: under **Share > Viewers** choose **Off**, **Ask Me** or **Allow**. With Ask Me every request shows a prompt; the
-  viewer list has **Take Back** at any time. On macOS allow HdrCast under System Settings > Privacy & Security > Accessibility.
-- The picture is still a few hundred milliseconds or more behind, so this is for helping with a menu, not for playing.
+- **Everyone else in the group**: Watch *Allow / Ask Me / Never*, Control *Off / Ask Me / Automatic*. Default: Ask Me and
+  Off. Friends on HdrCast 0.3.0 or older always get this rule (their computer cannot be checked).
+- **One rule per computer**: **Add a Computer…** lists computers that are online or asked to connect lately: pick
+  **My Computer** (connects without asking, gets control at once) or **Trusted Friend** (watches without asking, control
+  only when you say yes). **Always Allow** on a request adds that computer too. Compare the code before you give control.
+- While you are **live**, everyone not set to Never may watch without asking.
+
+Your own laptop, able to control your desktop from anywhere: install 0.3.1 on both and join the same group; on the desktop
+use **Add a Computer… > My Computer** for the laptop; later, on the laptop, **Watch > (desktop) > Connect**. Nothing has to
+be clicked on the desktop, but HdrCast has to be running there.
+
+As a viewer: when the sharer allows it, control is on as soon as you connect and the player window sends your mouse and
+keyboard (`Ctrl + Alt + Enter` stays with your own player: full screen on/off). **Just Watch** gives it back, **Take
+Control** takes it again; where the sharer asks first, click **Request Control**. The sharer can **Take Back** control or
+**Disconnect** you at any time (you cannot reconnect for a minute after that). Use the **Fast** delay: the picture is still a
+few hundred milliseconds behind, fine for using a computer, not for games. On macOS the sharer must allow HdrCast under
+System Settings > Privacy & Security > Accessibility.
 
 ## If something is wrong
 
@@ -62,7 +79,9 @@ The panel on the Watch page says what happened. The usual ones:
 | ... although the host takes IPv4 from any port ... | Something on your computer grabs UDP: a VPN, proxy or game accelerator (Clash TUN, UU, ...). Turn it off, or let HdrCast bypass it. |
 | The host's PC has no IPv6 internet connection | The friend sharing needs IPv6 (same advice, their side). |
 | Both sides have IPv6 but the path is blocked | A VPN or a very strict firewall drops incoming UDP. Turn the VPN off; on the router look for "IPv6 firewall: block all". |
-| Not live right now / Nobody is live right now | Your friend has not pressed Go Live yet. The list refreshes by itself. |
+| Not live right now / Nobody is online right now | HdrCast is not open on your friend's computer (or they turned off "Available to connect"). The list refreshes by itself. |
+| ... did not let you in | The sharer said no, or set your computer to Never. Ask them. |
+| Nobody at ... answered your request | The sharer was not at their computer to click Allow within a minute. |
 | ... is full | The sharer's "Viewers at once" is reached. |
 | The signaling server cannot be reached | Your internet is down, or the signaling server is. People already watching keep watching. |
 | Picture stutters, then recovers every few seconds | Raise the delay (China: try a custom 4000-5000 ms) or ask for a lower bitrate. |
@@ -71,9 +90,11 @@ The panel on the Watch page says what happened. The usual ones:
 
 When you ask a friend for help, send them what **Activity > Copy** gives you: passwords and invites are masked in it.
 
-Friends still on HdrCast 0.2 (`HdrCastSender` / `HdrCastReceiver`) can watch and share with you as before; only remote control
-needs 0.3 on both sides.
+Friends still on HdrCast 0.2 (`HdrCastSender` / `HdrCastReceiver`) can watch and share with you as before; remote control
+needs 0.3 on both sides, and rules per computer need 0.3.1 on both sides.
 
-Privacy: the video is AES-256 encrypted end to end with a key derived from the invite, and so is remote-control input. The
-invite itself is the key to the group: only share it with people you trust. To lock someone out, create a new group and send
-the new invite to the others.
+Privacy: the video is AES-256 encrypted end to end with a key derived from the invite. Remote-control input is encrypted too,
+between 0.3.1 computers with a key only those two computers can work out. The invite itself is the key to the group: only
+share it with people you trust. To lock someone out, create a new group and send the new invite to the others. The file
+`device.json` in the settings folder is your computer's identity: do not send it to anyone, and do not copy it to another
+computer.

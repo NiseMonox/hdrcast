@@ -1,6 +1,7 @@
 //! Port of `shared/Group` (protocol v1, docs/design.md §8) and of the logic behind the old invite dialogs.
 
 pub mod config;
+pub mod device;
 pub mod invite;
 pub mod invite_flow;
 pub mod keys;

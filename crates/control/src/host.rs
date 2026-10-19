@@ -360,6 +360,58 @@ mod tests {
     }
 
     #[test]
+    fn a_viewer_that_has_not_asked_learns_what_the_host_would_do_without_bothering_it() {
+        for (policy, expected) in [(Grant::Allow, ControlState::Allowed), (Grant::Ask, ControlState::Offered), (Grant::Off, ControlState::Denied)] {
+            let rec = Recorder::default();
+            let mut host = HostControl::new(&KEY, policy, Box::new(rec.clone()));
+            let mut viewer = ViewerControl::new(&KEY, false, 0);
+            assert_eq!(viewer.state(0), ControlState::Off);
+            let mut now = 0;
+            exchange(&mut viewer, &mut host, &mut now, 3);
+            assert_eq!(viewer.state(now), expected, "{policy:?}");
+            assert!(!host.requested(), "nobody asked: {policy:?}");
+            assert!(!host.granted());
+            viewer.pointer(0.5, 0.5, true);
+            viewer.key_binding("d-", "a");
+            exchange(&mut viewer, &mut host, &mut now, 3);
+            assert!(rec.take().is_empty(), "nothing reaches the host before the viewer takes control: {policy:?}");
+        }
+    }
+
+    #[test]
+    fn control_can_be_asked_for_during_the_session_and_given_back() {
+        let (_, mut host, rec) = pair(Grant::Ask);
+        let mut viewer = ViewerControl::new(&KEY, false, 0);
+        let mut now = 0;
+        exchange(&mut viewer, &mut host, &mut now, 3);
+        assert_eq!(viewer.state(now), ControlState::Offered);
+        viewer.set_wants(true);
+        exchange(&mut viewer, &mut host, &mut now, 3);
+        assert!(host.requested());
+        assert_eq!(viewer.state(now), ControlState::Requested);
+        host.decide(true);
+        exchange(&mut viewer, &mut host, &mut now, 3);
+        assert_eq!(viewer.state(now), ControlState::Granted);
+        viewer.key_binding("d-", "x");
+        exchange(&mut viewer, &mut host, &mut now, 3);
+        assert_eq!(rec.take(), ["x down"]);
+
+        // giving it back lets go of the key, and the host's yes stands for when it is wanted again
+        viewer.set_wants(false);
+        exchange(&mut viewer, &mut host, &mut now, 3);
+        assert_eq!(rec.take(), ["x up"]);
+        assert!(!host.granted());
+        assert_eq!(viewer.state(now), ControlState::Allowed);
+        viewer.key_binding("d-", "y");
+        exchange(&mut viewer, &mut host, &mut now, 3);
+        assert!(rec.take().is_empty());
+        viewer.set_wants(true);
+        exchange(&mut viewer, &mut host, &mut now, 3);
+        assert!(host.granted(), "no second question for the same session");
+        assert_eq!(viewer.state(now), ControlState::Granted);
+    }
+
+    #[test]
     fn lost_datagrams_do_not_lose_or_repeat_keys() {
         let (mut viewer, mut host, rec) = pair(Grant::Allow);
         let mut now = 0;

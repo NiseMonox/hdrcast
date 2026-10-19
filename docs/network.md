@@ -72,7 +72,7 @@
 | Neither side has IPv6… | 双方都没有 IPv6，IPv4 也没通：至少一方要有 IPv6 |
 | 主播状态栏 `no public IPv4 found` / 日志 `public IPv4 check: no answer…` | 信令服务器的 UDP 18651 没回复：在腾讯云安全组放行（§6）。主播端每分钟重试、观众端每次加入前重试，放行后不用重开 |
 | Both sides have IPv6 but the path is blocked… | 都有 IPv6 但包过不去：多半是 VPN（关掉）或路由器"IPv6 防火墙：阻止所有入站"之类的严格设置（改成默认 / 标准） |
-| Not live right now / Nobody in the group is live | 主播还没点 Start；列表每 10 s 自动刷新 |
+| Not live right now / Nobody is online right now | 对方没开 HdrCast（或关了"开放连接"）；列表每 10 s 自动刷新 |
 | … is full | 达到主播设的"同时观看人数" |
 | The signaling server cannot be reached | 本机断网，或信令服务器挂了；已经在看的人不受影响 |
 

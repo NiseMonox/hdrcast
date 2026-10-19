@@ -71,7 +71,10 @@ export function SettingsPage() {
           <button class="btn tinted" onClick=${copyInvite}><${Icon} name="copy" />${t('group.copyInvite')}</button>
         </div>
       </div>
-      <${Row} name=${t('settings.myName')}>
+      <${Row} name=${t('settings.thisDevice')} hint=${t('settings.thisDeviceHint')}>
+        <span class="code" style="font-size:12.5px">${s.init.device}</span>
+      <//>
+      <${Row} name=${t('settings.myName')} hint=${t('settings.myNameHint')}>
         <${TextField} value=${s.group.displayName} maxLength=${24} disabled=${busy} className=""
           onChange=${async (v) => {
             if (!v) return;

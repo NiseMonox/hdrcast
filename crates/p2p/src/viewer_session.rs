@@ -8,10 +8,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use hdrcast_core::group::device::{self, DeviceKey, Exchange};
 use hdrcast_core::group::keys;
 use hdrcast_core::group::now_ms;
 use hdrcast_core::messages::{self, JoinAnswer, JoinRequest};
-use hdrcast_core::{endpoint, GroupConfig, GroupKeys, SignedEnvelope};
+use hdrcast_core::{endpoint, GroupConfig, GroupKeys, LiveRecord, SignedEnvelope};
 
 use crate::cancel::CancelToken;
 use crate::echo_protocol;
@@ -45,6 +46,12 @@ pub struct ViewerSessionOptions {
     /// Ask the host for remote control: the join carries "rc", which also tells the host that this viewer
     /// understands the side channel (docs/design.md §8.9).
     pub request_control: bool,
+    /// This computer's device key: every join is signed with it, so a host can recognise this computer and
+    /// agree on a remote-control key with it (docs/design.md §8.10). `None` = unsigned joins, as before 0.3.1.
+    pub device: Option<Arc<DeviceKey>>,
+    /// How long to wait for the answer of a host that may ask its user first (one that advertises a device
+    /// key). Older hosts answer at once or not at all, and get 20 s as before.
+    pub answer_wait_ms: u64,
 }
 
 impl Default for ViewerSessionOptions {
@@ -61,6 +68,8 @@ impl Default for ViewerSessionOptions {
             map_router_port: true,
             router_mapping: None,
             request_control: false,
+            device: None,
+            answer_wait_ms: 60_000,
         }
     }
 }
@@ -77,6 +86,19 @@ pub enum ViewerSessionState {
     /// Not connected; trying again after a pause (the status says why).
     Waiting = 4,
     Stopped = 5,
+    /// The host has not answered yet: it may be asking its user, or starting its stream (0.3.1 hosts).
+    Approval = 6,
+    /// The host said no, or nobody there answered: not trying again (the status says which).
+    Refused = 7,
+}
+
+/// How one join attempt ended.
+enum Attempt {
+    Connected,
+    /// Not this time (why): try again after a pause.
+    Retry(String),
+    /// The host refused (why): stop.
+    Refused(String),
 }
 
 pub struct ViewerSession {
@@ -90,6 +112,11 @@ struct State {
     echo_candidate: String,
     ever_connected: bool,
     ipv4_only_failure: bool,
+    /// From the host's live record as of the latest join.
+    host_device_key: Option<String>,
+    host_on_demand: bool,
+    /// The remote-control key agreed with the host's device, and the session it belongs to.
+    control: Option<(String, [u8; 32])>,
 }
 
 struct Inner {
@@ -121,6 +148,9 @@ impl ViewerSession {
                     echo_candidate: String::new(),
                     ever_connected: false,
                     ipv4_only_failure: false,
+                    host_device_key: None,
+                    host_on_demand: false,
+                    control: None,
                 }),
                 cancel: CancelToken::new(),
                 started: AtomicBool::new(false),
@@ -191,6 +221,32 @@ impl ViewerSession {
     /// The live record of the host being watched said it offers remote control ("rc"), as of the latest join.
     pub fn host_offers_control(&self) -> bool {
         self.inner.host_offers_control.load(Ordering::Acquire)
+    }
+
+    /// A fresher live record of the host offers remote control: its user allowed it while this session ran.
+    /// From now on the side channel may be used (only a host that speaks it ever offers it). Only ever turns
+    /// the offer on; raises the change event when it did.
+    pub fn host_now_offers_control(&self) {
+        if self.inner.started.load(Ordering::Acquire) && !self.inner.host_offers_control.swap(true, Ordering::AcqRel) {
+            (self.inner.log)("[p2p] the host now offers remote control");
+            self.inner.changed.raise();
+        }
+    }
+
+    /// The remote-control key agreed with the host's device for session `sid` (docs/design.md §8.10). `None`
+    /// when the host is older than 0.3.1, or `sid` is not the current session: use the group-derived key then.
+    pub fn control_key(&self, sid: &str) -> Option<[u8; 32]> {
+        lock(&self.inner.state).control.as_ref().filter(|(current, _)| current == sid).map(|(_, key)| *key)
+    }
+
+    /// The host's device key from its live record (as of the latest join); `None` for hosts older than 0.3.1.
+    pub fn host_device_key(&self) -> Option<String> {
+        lock(&self.inner.state).host_device_key.clone()
+    }
+
+    /// The host streams on request rather than broadcasting (as of the latest join).
+    pub fn host_on_demand(&self) -> bool {
+        lock(&self.inner.state).host_on_demand
     }
 
     /// Who gets what the host sends on the side channel, on a network thread (docs/design.md §8.9). May be set
@@ -299,7 +355,15 @@ impl Inner {
                 }
             }
             let wait_reason = match self.join_once(ct) {
-                Ok(reason) => reason,
+                Ok(Attempt::Connected) => String::new(),
+                Ok(Attempt::Retry(reason)) => reason,
+                Ok(Attempt::Refused(reason)) => {
+                    if !ct.is_cancelled() {
+                        (self.log)(&format!("[p2p] {reason}"));
+                        self.set_state(ViewerSessionState::Refused, reason);
+                    }
+                    return;
+                }
                 Err(SignalingError::Cancelled) => return,
                 Err(e) => {
                     if ct.is_cancelled() {
@@ -329,10 +393,12 @@ impl Inner {
                 let ended = lower.contains("ended") || lower.contains("stopped");
                 let host = self.host_name();
                 (self.log)(&format!("[p2p] path to {host} closed: {reason}"));
-                self.set_state(
-                    ViewerSessionState::Waiting,
-                    if ended { format!("The stream ended - waiting for {host} to go live again") } else { format!("Connection lost ({reason}) - reconnecting") },
-                );
+                let status = match (ended, lock(&self.state).host_on_demand) {
+                    (true, true) => format!("{host} ended the session - asking again"),
+                    (true, false) => format!("The stream ended - waiting for {host} to go live again"),
+                    (false, _) => format!("Connection lost ({reason}) - reconnecting"),
+                };
+                self.set_state(ViewerSessionState::Waiting, status);
                 ct.wait_ms(if ended { 5000 } else { 1000 });
                 continue;
             }
@@ -348,8 +414,8 @@ impl Inner {
         }
     }
 
-    /// One join attempt. Returns "" when connected, otherwise why not.
-    fn join_once(&self, ct: &CancelToken) -> Result<String, SignalingError> {
+    /// One join attempt.
+    fn join_once(&self, ct: &CancelToken) -> Result<Attempt, SignalingError> {
         let g = &self.o.group;
         let (Some(keys), Some(signal), Some(link)) = (self.keys.get(), self.signal.get(), self.link.get()) else {
             return Err(SignalingError::Cancelled);
@@ -357,21 +423,28 @@ impl Inner {
         self.set_state(ViewerSessionState::Joining, "Looking for the host".to_string());
         let Some(entry) = signal.get_live(ct)?.into_iter().find(|entry| entry.record.host_id == self.o.host_id) else {
             self.host_offers_control.store(false, Ordering::Release);
-            return Ok("Not live right now".to_string());
+            return Ok(Attempt::Retry("Not live right now".to_string()));
         };
         let record = entry.record;
-        lock(&self.state).host_name = record.name.clone();
+        {
+            let mut state = lock(&self.state);
+            state.host_name = record.name.clone();
+            state.host_device_key = record.device_key.clone();
+            state.host_on_demand = record.on_demand;
+            state.control = None;
+        }
         self.host_offers_control.store(record.remote_control == Some(true), Ordering::Release);
         if record.max_viewers > 0 && record.viewers >= record.max_viewers {
-            return Ok(format!("{} is full ({} viewers)", record.name, record.max_viewers));
+            return Ok(Attempt::Retry(format!("{} is full ({} viewers)", record.name, record.max_viewers)));
         }
 
         let sid = keys::new_id();
         // punch right away with the advertised candidates
         if link.start_session(&sid, &record.candidates).is_err() {
-            return Ok("Not live right now".to_string()); // cannot happen: the id was just made
+            return Ok(Attempt::Retry("Not live right now".to_string())); // cannot happen: the id was just made
         }
-        let join = JoinRequest {
+        let punching_since = Instant::now();
+        let mut join = JoinRequest {
             session_id: sid.clone(),
             viewer_id: g.peer_id.clone(),
             name: g.display_name.clone(),
@@ -380,36 +453,58 @@ impl Inner {
             latency_ms: self.o.latency_ms,
             overhead_percent: self.o.overhead_percent,
             remote_control: self.o.request_control,
+            device: None,
         };
+        let exchange = self.o.device.as_ref().map(|device| {
+            let exchange = Exchange::new();
+            device::sign_join(device, &exchange, &g.group_id, &self.o.host_id, &mut join);
+            exchange
+        });
         let envelope = SignedEnvelope::seal(keys, messages::KIND_JOIN, &g.group_id, &self.o.host_id, &join.to_payload());
         match signal.post_join(&self.o.host_id, &envelope, ct) {
             Ok(_) => {}
             Err(e) if e.status() == 404 => {
                 link.end_session("host offline");
-                return Ok("Not live right now".to_string());
+                return Ok(Attempt::Retry("Not live right now".to_string()));
             }
             Err(e) if e.status() == 429 => {
                 link.end_session("busy");
-                return Ok(format!("{} is busy, too many people joining at once", record.name));
+                return Ok(Attempt::Retry(format!("{} is busy, too many people joining at once", record.name)));
             }
             Err(e) => return Err(e),
         }
 
         self.set_state(ViewerSessionState::Punching, format!("Connecting to {}", record.name));
-        let answer = signal
-            .wait_answer(&sid, 20, ct)?
-            .and_then(|envelope| envelope.try_open(keys, messages::KIND_ANSWER, &g.group_id, &sid))
-            .and_then(|payload| JoinAnswer::from_payload(&payload, &sid));
-        if let Some(answer) = answer {
+        let my_exchange = exchange.as_ref().map_or("", |e| e.public_key());
+        if let Some(answer) = self.wait_for_answer(&sid, &record, my_exchange, ct)? {
             if !answer.ok {
                 link.end_session("refused");
                 return Ok(match answer.reason.as_str() {
-                    JoinAnswer::REASON_FULL => format!("{} is full", record.name),
-                    JoinAnswer::REASON_STOPPED => format!("{} is stopping", record.name),
-                    _ => format!("{} could not take another viewer", record.name),
+                    JoinAnswer::REASON_FULL => Attempt::Retry(format!("{} is full", record.name)),
+                    JoinAnswer::REASON_STOPPED => Attempt::Retry(format!("{} is stopping", record.name)),
+                    JoinAnswer::REASON_DENIED => Attempt::Refused(format!("{} did not let you in", record.name)),
+                    JoinAnswer::REASON_TIMEOUT => Attempt::Refused(format!("Nobody at {} answered your request", record.name)),
+                    _ => Attempt::Retry(format!("{} could not take another viewer", record.name)),
                 });
             }
-            link.add_host_candidates(&answer.candidates);
+            // the key remote control seals its datagrams with, when both sides exchanged one
+            let theirs = answer.device.as_ref().map(|proof| proof.exchange.as_str()).filter(|e| !e.is_empty());
+            if let (Some(exchange), Some(theirs)) = (&exchange, theirs) {
+                let key = device::parse_exchange_key(theirs)
+                    .and_then(|bytes| exchange.agree(&bytes))
+                    .map(|shared| device::session_control_key(&shared, &sid, exchange.public_key(), theirs));
+                lock(&self.state).control = key.map(|key| (sid.clone(), key));
+            }
+            if punching_since.elapsed() > Duration::from_secs(5) {
+                // A late yes (the host asked its user, or started its stream first): the first punches are about
+                // to give up, so start over now that the host punches too.
+                let mut candidates = record.candidates.clone();
+                candidates.extend(answer.candidates.iter().cloned());
+                let _ = link.start_session(&sid, &candidates);
+            } else {
+                link.add_host_candidates(&answer.candidates);
+            }
+            self.set_state(ViewerSessionState::Punching, format!("Connecting to {}", record.name));
         }
 
         let deadline = Instant::now() + Duration::from_millis(PUNCH_DEADLINE_US as u64 / 1000 + 1000);
@@ -428,7 +523,7 @@ impl Inner {
                         link.describe_path(),
                         if link.path_learned() { " (a port the host's router picked for this PC, not the advertised one: it changes ports per destination)" } else { "" }
                     ));
-                    return Ok(String::new());
+                    return Ok(Attempt::Connected);
                 }
                 LinkState::Failed | LinkState::Closed => break,
                 LinkState::Punching => {}
@@ -456,7 +551,54 @@ impl Inner {
                 None => String::new(),
             }
         ));
-        Ok(why)
+        Ok(Attempt::Retry(why))
+    }
+
+    /// The host's answer to the join of session `sid`; `None` when none came in time.
+    ///
+    /// A host that advertises a device key (0.3.1 on) may ask its user, or start its stream, before it answers,
+    /// so it gets [`answer_wait_ms`](ViewerSessionOptions::answer_wait_ms), and only an answer signed with that key
+    /// counts: anyone in the group can put an answer for a session, and one that is not the host's would hand
+    /// remote control a key its author knows. Older hosts answer at once or not at all and get 20 s, as before.
+    fn wait_for_answer(&self, sid: &str, record: &LiveRecord, my_exchange: &str, ct: &CancelToken) -> Result<Option<JoinAnswer>, SignalingError> {
+        let g = &self.o.group;
+        let (Some(keys), Some(signal)) = (self.keys.get(), self.signal.get()) else { return Err(SignalingError::Cancelled) };
+        let patient = record.device_key.is_some();
+        let limit = Duration::from_millis(if patient { self.o.answer_wait_ms } else { 20_000 });
+        let begun = Instant::now();
+        let mut said_waiting = false;
+        let mut said_ignored = false;
+        loop {
+            let left = limit.saturating_sub(begun.elapsed());
+            if left.is_zero() {
+                return Ok(None);
+            }
+            // A short first poll, so that a host that takes its time can be shown as such after a moment.
+            let seconds = if patient && !said_waiting { 2 } else { left.as_secs().clamp(1, 20) as u32 };
+            let answer = signal
+                .wait_answer(sid, seconds, ct)?
+                .and_then(|envelope| envelope.try_open(keys, messages::KIND_ANSWER, &g.group_id, sid))
+                .and_then(|payload| JoinAnswer::from_payload(&payload, sid));
+            match (answer, &record.device_key) {
+                (Some(answer), Some(host_key)) if !device::verify_answer(&g.group_id, host_key, my_exchange, &answer) => {
+                    if !said_ignored {
+                        said_ignored = true;
+                        (self.log)(&format!("[p2p] ignored an answer for {} that its device did not sign", record.name));
+                    }
+                    // the server keeps one answer per session and hands it out at once: wait for the real one
+                    // to replace it instead of asking in a tight loop
+                    if ct.wait_ms(500) {
+                        return Err(SignalingError::Cancelled);
+                    }
+                }
+                (Some(answer), _) => return Ok(Some(answer)),
+                (None, _) => {}
+            }
+            if patient && !said_waiting {
+                said_waiting = true;
+                self.set_state(ViewerSessionState::Approval, format!("Waiting for {} to answer", record.name));
+            }
+        }
     }
 
     /// This PC's public IPv4 mapping for the IPv4 attempt (IPv6 does not need it). False = no answer yet.

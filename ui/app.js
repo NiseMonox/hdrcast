@@ -4,7 +4,7 @@ import { t } from './i18n.js';
 import { Icon, Caption } from './icons.js';
 import { useStore, boot, go, openSheet, closeSheet, toast, dismissToast, setState, state } from './store.js';
 import { Avatar, Sheet } from './components.js';
-import { SharePage, ShareActionBar, isSharing, copyInvite } from './pages/share.js';
+import { SharePage, ShareActionBar, AddDeviceSheet, isSharing, answerKnock, copyInvite } from './pages/share.js';
 import { WatchPage, isWatching } from './pages/watch.js';
 import { SettingsPage, ActivityPage, pasteInvite, routeInvite } from './pages/settings.js';
 
@@ -36,6 +36,7 @@ function Shell() {
   const sharing = isSharing(s.status);
   const watching = isWatching(s.status);
   const liveCount = s.status.live.hosts.length;
+  const asking = (s.status.share.knocks || []).length;
   const titles = { share: t('share.title'), watch: t('watch.title'), settings: t('settings.title'), activity: t('activity.title') };
 
   useEffect(() => {
@@ -55,7 +56,9 @@ function Shell() {
         <span class="brand-mark"><${Icon} name="play" /></span><span class="brand-name">HdrCast</span>
       </div>
       <nav class="nav">
-        ${nav('share', 'broadcast', t('nav.share'), sharing && html`<span class="dot red pulse"></span>`)}
+        ${nav('share', 'broadcast', t('nav.share'), asking > 0
+          ? html`<span class="nav-badge">${asking}</span>`
+          : sharing && html`<span class="dot red pulse"></span>`)}
         ${nav('watch', 'play', t('nav.watch'), watching
           ? html`<span class="dot green pulse"></span>`
           : liveCount > 0 && html`<span class="nav-badge">${liveCount}</span>`)}
@@ -134,6 +137,7 @@ function Sheets({ sheet }) {
   if (name === 'invite-found') return html`<${InviteFoundSheet} ...${props} />`;
   if (name === 'problems') return html`<${ProblemsSheet} ...${props} />`;
   if (name === 'firewall') return html`<${FirewallSheet} ...${props} />`;
+  if (name === 'add-device') return html`<${AddDeviceSheet} ...${props} />`;
   return null;
 }
 
@@ -326,7 +330,24 @@ function Toasts({ toasts }) {
 
 // Things in the status snapshot that want the user's attention once, wherever they are in the app.
 const announced = new Map();      // session id -> the toast asking about it
+const knocked = new Map();        // session id of a request to watch -> its toast
 function watchStatus() {
+  // somebody asks to watch this computer
+  const knocks = state.status?.share?.knocks || [];
+  for (const k of knocks) {
+    if (knocked.has(k.sid)) continue;
+    knocked.set(k.sid, toast(t('knock.toast', { name: k.name }) + (k.verified ? ` (${k.deviceCode})` : ''), {
+      kind: 'info',
+      actions: [{ label: t('knock.deny'), run: () => answerKnock(k.sid, false) }, { label: t('knock.allow'), primary: true, run: () => answerKnock(k.sid, true) }],
+    }));
+  }
+  for (const [sid, id] of knocked) {
+    if (!knocks.some((k) => k.sid === sid)) {
+      dismissToast(id);
+      knocked.delete(sid);
+    }
+  }
+
   const viewers = state.status?.share?.p2p?.viewers || [];
   for (const v of viewers) {
     if (v.control !== 'requested' || announced.has(v.sid)) continue;

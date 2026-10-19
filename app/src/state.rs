@@ -2,7 +2,7 @@
 //! them the page shows.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use hdrcast_capture::OutputInfo;
 use hdrcast_core::common::firewall::{self, row as firewall_row, FirewallVerdict};
@@ -10,19 +10,24 @@ use hdrcast_core::common::process_job::ProcessJob;
 use hdrcast_core::common::tool_locator::{self, Platform};
 use hdrcast_core::common::{app_paths, json};
 use hdrcast_core::group::config::GroupConfig;
+use hdrcast_core::group::device;
 use hdrcast_core::group::invite_flow::ClipboardInviteWatcher;
+use hdrcast_core::group::now_ms;
 use hdrcast_core::group::shared_file::SharedGroupFile;
+use hdrcast_core::DeviceKey;
 use hdrcast_media::receiver::settings::ReceiverSettings;
 use hdrcast_media::sender::settings::{HdrMode, SenderSettings};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::access::AccessSettings;
 use crate::logs::Logs;
 
 /// The name of the firewall rule and of this program wherever Windows shows one.
 pub const APP_NAME: &str = "HdrCast";
 
-/// Preferences that belong to this app rather than to the sharing or watching side (`app.json`).
+/// Preferences that belong to this app rather than to the sharing or watching side (`app.json`). 0.3.0 kept its
+/// remote-control rule here too ("remoteControl"); `access.json` took it over (see `AccessSettings::load`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiSettings {
@@ -30,16 +35,20 @@ pub struct UiSettings {
     pub language: String,
     /// "auto", "light" or "dark".
     pub theme: String,
-    /// Remote control of this computer by viewers: 0 off, 1 ask each time, 2 allow everyone who asks.
-    pub remote_control: u8,
-    /// Ask the host for remote control when starting to watch.
-    pub request_control: bool,
 }
 
 impl Default for UiSettings {
     fn default() -> Self {
-        Self { language: "auto".into(), theme: "auto".into(), remote_control: 0, request_control: false }
+        Self { language: "auto".into(), theme: "auto".into() }
     }
+}
+
+/// A device that asked to connect lately, for the list of devices one can give a rule to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeenDevice {
+    pub key: String,
+    pub name: String,
+    pub at_ms: i64,
 }
 
 impl UiSettings {
@@ -60,9 +69,6 @@ impl UiSettings {
         if !["auto", "light", "dark"].contains(&self.theme.as_str()) {
             self.theme = "auto".into();
         }
-        if self.remote_control > 2 {
-            self.remote_control = 0;
-        }
         self
     }
 
@@ -79,6 +85,10 @@ pub struct Inner {
     pub outputs: Vec<OutputInfo>,
     pub firewall: FirewallVerdict,
     pub clipboard: ClipboardInviteWatcher,
+    pub access: AccessSettings,
+    /// Counts changes to `access` the page did not make itself (a request answered with "always", a device
+    /// that renamed itself), so the page knows to fetch the rules again.
+    pub access_rev: u64,
 }
 
 pub struct AppState {
@@ -89,6 +99,12 @@ pub struct AppState {
     pub backdrop: bool,
     pub startup_invite: Mutex<Option<String>>,
     pub inner: Mutex<Inner>,
+    /// This computer's device key (docs/design.md §8.10).
+    pub device: Arc<DeviceKey>,
+    /// Devices that asked to connect since the app started, newest first.
+    pub seen: Mutex<Vec<SeenDevice>>,
+    /// The app, for what needs the window (set once the window exists).
+    pub handle: OnceLock<tauri::AppHandle>,
     pub share: crate::share::Share,
     pub watch: crate::watch::Watch,
     pub live: crate::live::Live,
@@ -103,6 +119,10 @@ impl AppState {
         });
         let mut sender = SenderSettings::load(&SenderSettings::default_path());
         adopt_output(&mut sender, &outputs);
+        let (device, error) = DeviceKey::load_or_create(&DeviceKey::default_path());
+        if let Some(e) = error {
+            logs.tagged("app", &format!("could not save this computer's device key ({e}): hosts that trust it will not know it after a restart"));
+        }
         let inner = Inner {
             ui: UiSettings::load(),
             sender,
@@ -111,6 +131,8 @@ impl AppState {
             outputs,
             firewall: firewall::check(&current_exe()),
             clipboard: ClipboardInviteWatcher::new(),
+            access: AccessSettings::load(),
+            access_rev: 0,
         };
         Self {
             logs,
@@ -119,9 +141,30 @@ impl AppState {
             backdrop,
             startup_invite: Mutex::new(startup_invite),
             inner: Mutex::new(inner),
+            device: Arc::new(device),
+            seen: Mutex::new(Vec::new()),
+            handle: OnceLock::new(),
             share: Default::default(),
             watch: Default::default(),
             live: Default::default(),
+        }
+    }
+
+    /// A device asked to connect: remember it for the list of devices one can give a rule to.
+    pub fn note_seen(&self, device_key: &Option<String>, name: &str) {
+        let Some(key) = device_key else { return };
+        let mut seen = self.seen.lock().unwrap();
+        seen.retain(|d| &d.key != key);
+        seen.insert(0, SeenDevice { key: key.clone(), name: name.to_string(), at_ms: now_ms() });
+        seen.truncate(32);
+    }
+
+    /// Something needs the user (a request to connect): flash the window's taskbar button / bounce the dock icon.
+    pub fn request_attention(&self) {
+        use tauri::Manager;
+        let Some(window) = self.handle.get().and_then(|h| h.get_webview_window(crate::window::LABEL)) else { return };
+        if !window.is_focused().unwrap_or(false) {
+            let _ = window.request_user_attention(Some(tauri::UserAttentionType::Informational));
         }
     }
 
@@ -274,6 +317,46 @@ pub fn firewall_view(verdict: FirewallVerdict) -> Value {
         "canFix": status.show_allow_button,
         "text": status.text,
     })
+}
+
+/// The access rules as the page shows them: every device with the code people compare. The page sends the same
+/// shape back (the codes and `rev` are ignored then).
+pub fn access_view(access: &AccessSettings, rev: u64) -> Value {
+    json!({
+        "rev": rev,
+        "available": access.available,
+        "others": access.others,
+        "devices": access.devices.iter().map(|d| json!({
+            "key": d.key,
+            "code": device::code_of(&d.key),
+            "name": d.name,
+            "connect": d.connect,
+            "control": d.control,
+            "lastSeenMs": d.last_seen_ms,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// Devices one could give a rule to: those that asked to connect lately and those online in the group, minus
+/// the ones that have a rule already and this computer itself.
+pub fn device_candidates(app: &AppState, access: &AccessSettings) -> Value {
+    let mut list: Vec<(String, String, &'static str)> = Vec::new();
+    let mut add = |key: &str, name: &str, source: &'static str| {
+        if key != app.device.public_key() && access.device(key).is_none() && !list.iter().any(|(k, _, _)| k == key) {
+            list.push((key.to_string(), name.to_string(), source));
+        }
+    };
+    for seen in app.seen.lock().unwrap().iter() {
+        add(&seen.key, &seen.name, "asked");
+    }
+    for (key, name) in crate::live::device_keys(app) {
+        add(&key, &name, "online");
+    }
+    Value::Array(
+        list.into_iter()
+            .map(|(key, name, source)| json!({ "key": key, "code": device::code_of(&key), "name": name, "source": source }))
+            .collect(),
+    )
 }
 
 pub fn group_view(group: &GroupConfig) -> Value {

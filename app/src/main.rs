@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod access;
 mod clipboard;
 mod commands;
 mod control_host;
@@ -74,10 +75,15 @@ fn run_app(startup_invite: Option<String>) {
             let handle = app.handle().clone();
             let (_, backdrop) = window::create(&handle)?;
             let state = Arc::new(AppState::new(setup_logs.clone(), backdrop, startup_invite.clone()));
+            let _ = state.handle.set(handle.clone());
             window::apply_theme(&handle, &state.inner.lock().unwrap().ui.theme);
             app.manage(state.clone());
             setup_logs.tagged("app", &format!("settings: {}", hdrcast_core::common::app_paths::config_dir().display()));
+            setup_logs.tagged("app", &format!("this computer's device code: {}", state.device.code()));
             live::restart(&state);
+            // available to the group from the start, when the rules say so (it takes a moment: not on this thread)
+            let starting = state.clone();
+            std::thread::Builder::new().name("share-autostart".into()).spawn(move || share::autostart(&starting))?;
 
             // The page redraws from one snapshot; log lines go over in batches.
             std::thread::Builder::new().name("status".into()).spawn(move || {
@@ -93,8 +99,8 @@ fn run_app(startup_invite: Option<String>) {
                         share::housekeeping(&state);
                         let _ = handle.emit("status", status::snapshot(&state));
                     }
-                    // While live or watching, the firewall verdict is part of what peers are told: keep it fresh.
-                    if ticks % 75 == 0 && (share::is_active(&state) || watch::is_active(&state)) {
+                    // While in the group or watching, the firewall verdict is part of what peers are told: keep it fresh.
+                    if ticks % 75 == 0 && (share::is_hosting(&state) || watch::is_active(&state)) {
                         commands::refresh_firewall(&state);
                     }
                 }
@@ -102,17 +108,17 @@ fn run_app(startup_invite: Option<String>) {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Closing while live or watching: say goodbye to the viewers and the signaling server first (a few
-            // seconds), with the window already out of sight.
+            // Closing while in the group or watching: say goodbye to the viewers and the signaling server first (a
+            // few seconds), with the window already out of sight.
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let state = window.state::<Arc<AppState>>().inner().clone();
-                if share::is_active(&state) || watch::is_active(&state) {
+                if share::is_hosting(&state) || watch::is_active(&state) {
                     api.prevent_close();
                     let _ = window.hide();
                     let handle = window.app_handle().clone();
                     std::thread::spawn(move || {
                         watch::stop(&state);
-                        share::stop(&state);
+                        share::shut_down(&state);
                         handle.exit(0);
                     });
                 }
@@ -138,10 +144,15 @@ fn run_app(startup_invite: Option<String>) {
             commands::logs_open,
             commands::share_start,
             commands::share_stop,
+            commands::share_kick,
             commands::control_set,
+            commands::access_get,
+            commands::access_save,
+            commands::knock_answer,
             commands::watch_start,
             commands::watch_stop,
             commands::watch_fullscreen,
+            commands::watch_control,
             commands::live_refresh,
         ])
         .run(tauri::generate_context!())

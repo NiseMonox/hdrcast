@@ -28,3 +28,12 @@ node_modules/
 
 # Tauri generated schemas
 app/gen/
+
+# Rust: the capture tool's src/bin/ (the .NET rule bin/ above would hide it)
+!crates/*/src/bin/
+
+# local tooling and notes that stay on this PC
+.claude/*
+!.claude/launch.json
+WINDOWS-HANDOFF.md
+__pycache__/

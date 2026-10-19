@@ -39,7 +39,7 @@ pub use control_packet::{ControlType, PeerRole};
 pub use host_link::{HostLink, HostSessionInfo, HostSideHandler};
 pub use link_base::{LinkAddresses, SOURCE_ECHO, SOURCE_ROUTER};
 pub use local_addresses::AddressCandidate;
-pub use p2p_host::{P2pHost, P2pHostOptions, ViewerInfo, ViewerState};
+pub use p2p_host::{AdmitFn, JoinTicket, P2pHost, P2pHostOptions, ViewerInfo, ViewerState};
 pub use peer_session::{LinkState, Outgoing, PeerSession};
 pub use remux_child::{RemuxChild, RemuxInput};
 pub use signaling_client::{LiveEntry, SignalingClient, SignalingError};

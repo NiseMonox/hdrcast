@@ -8,6 +8,7 @@
 use serde_json::Value;
 
 use super::config::clean_display_name;
+use super::device;
 use super::keys::{self, GroupKeys};
 use crate::common::{base64url, endpoint, json};
 
@@ -125,6 +126,12 @@ pub struct LiveRecord {
     /// `Some(true)`; absent reads as `None` and means no: nothing may be sent on the side channel to such a host
     /// (0.2.4 would hand the datagrams to SRT).
     pub remote_control: Option<bool>,
+    /// The host's device key ("dk", base64url, docs/design.md §8.10), written by hosts from 0.3.1 on. A viewer
+    /// that read it accepts only answers signed with it. `None` when absent or not a usable key.
+    pub device_key: Option<String>,
+    /// "od": the host is available on request instead of broadcasting. It starts capturing when someone it lets
+    /// in connects (docs/design.md §8.10). Written only when true; absent means a broadcast (as every older host).
+    pub on_demand: bool,
 }
 
 impl Default for LiveRecord {
@@ -141,6 +148,8 @@ impl Default for LiveRecord {
             viewers: 0,
             open_ipv4: None,
             remote_control: None,
+            device_key: None,
+            on_demand: false,
         }
     }
 }
@@ -166,6 +175,12 @@ impl LiveRecord {
         if self.remote_control == Some(true) {
             p.insert("rc".to_string(), Value::from(true));
         }
+        if let Some(key) = &self.device_key {
+            p.insert("dk".to_string(), Value::from(key.as_str()));
+        }
+        if self.on_demand {
+            p.insert("od".to_string(), Value::from(true));
+        }
         p
     }
 
@@ -183,8 +198,43 @@ impl LiveRecord {
             viewers: int32(p, "viewers"),
             open_ipv4: field(p, "open4").and_then(json::as_bool),
             remote_control: field(p, "rc").and_then(json::as_bool),
+            device_key: text(p, "dk").filter(|k| device::parse_public_key(k).is_some()).map(str::to_string),
+            on_demand: field(p, "od").and_then(json::as_bool).unwrap_or(false),
         };
         (r.host_id == expected_host).then_some(r)
+    }
+}
+
+/// Who signed a join or an answer (docs/design.md §8.10): the device key ("dk"), the key for this session's
+/// exchange ("ek") and the signature ("ds"), all base64url as sent. Checked by [`device`], not here.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DeviceProof {
+    pub key: String,
+    /// Empty in an answer that refuses: there is no session to agree on a key for.
+    pub exchange: String,
+    pub signature: String,
+}
+
+impl DeviceProof {
+    fn write(&self, p: &mut Payload) {
+        p.insert("dk".to_string(), Value::from(self.key.as_str()));
+        if !self.exchange.is_empty() {
+            p.insert("ek".to_string(), Value::from(self.exchange.as_str()));
+        }
+        p.insert("ds".to_string(), Value::from(self.signature.as_str()));
+    }
+
+    /// `None` unless "dk" and "ds" are strings, and "ek" too when `exchange_required`.
+    fn read(p: &Payload, exchange_required: bool) -> Option<DeviceProof> {
+        let exchange = text(p, "ek");
+        if exchange_required && exchange.is_none() {
+            return None;
+        }
+        Some(DeviceProof {
+            key: text(p, "dk")?.to_string(),
+            exchange: exchange.unwrap_or("").to_string(),
+            signature: text(p, "ds")?.to_string(),
+        })
     }
 }
 
@@ -203,6 +253,8 @@ pub struct JoinRequest {
     /// This viewer speaks the side channel and asks for remote control (docs/design.md §8.9). Written (as
     /// `"rc":true`) only when true; absent means no.
     pub remote_control: bool,
+    /// The viewer's device and its signature (0.3.1 on); `None` from older viewers.
+    pub device: Option<DeviceProof>,
 }
 
 impl JoinRequest {
@@ -219,6 +271,9 @@ impl JoinRequest {
         if self.remote_control {
             p.insert("rc".to_string(), Value::from(true));
         }
+        if let Some(device) = &self.device {
+            device.write(&mut p);
+        }
         p
     }
 
@@ -234,6 +289,7 @@ impl JoinRequest {
             latency_ms: int32(p, "latency"),
             overhead_percent: int32(p, "overhead"),
             remote_control: field(p, "rc").and_then(json::as_bool).unwrap_or(false),
+            device: DeviceProof::read(p, true),
         };
         if !keys::is_valid_id(&j.session_id) || !keys::is_valid_id(&j.viewer_id) {
             return None;
@@ -256,12 +312,18 @@ pub struct JoinAnswer {
     pub ok: bool,
     pub reason: String,
     pub candidates: Vec<String>,
+    /// The host's device, its exchange key and its signature (0.3.1 on, docs/design.md §8.10).
+    pub device: Option<DeviceProof>,
 }
 
 impl JoinAnswer {
     pub const REASON_FULL: &'static str = "full";
     pub const REASON_STOPPED: &'static str = "stopped";
     pub const REASON_BUSY: &'static str = "busy";
+    /// The host's rules or its user said no (0.3.1 on). Older viewers read it like "busy" and try again later.
+    pub const REASON_DENIED: &'static str = "denied";
+    /// Nobody at the host answered in time (0.3.1 on).
+    pub const REASON_TIMEOUT: &'static str = "timeout";
 
     pub fn to_payload(&self) -> Payload {
         let mut p = Payload::new();
@@ -271,6 +333,9 @@ impl JoinAnswer {
         p.insert("ok".to_string(), Value::from(self.ok));
         p.insert("reason".to_string(), Value::from(self.reason.as_str()));
         p.insert("cands".to_string(), Value::from(self.candidates.clone()));
+        if let Some(device) = &self.device {
+            device.write(&mut p);
+        }
         p
     }
 
@@ -282,6 +347,7 @@ impl JoinAnswer {
             ok: field(p, "ok").and_then(json::as_bool).unwrap_or(false),
             reason: text(p, "reason").unwrap_or("").to_string(),
             candidates: candidates(field(p, "cands")),
+            device: DeviceProof::read(p, false),
         };
         (a.session_id == expected_sid).then_some(a)
     }
@@ -344,10 +410,10 @@ mod tests {
         let open = LiveRecord { open_ipv4: Some(false), ..live };
         assert!(Value::Object(open.to_payload()).to_string().ends_with(r#","viewers":1,"open4":false}"#));
 
-        let join = JoinRequest { session_id: "S".into(), viewer_id: "V".into(), name: "n".into(), time_ms: 3, candidates: vec![], latency_ms: 3500, overhead_percent: 50, remote_control: false };
+        let join = JoinRequest { session_id: "S".into(), viewer_id: "V".into(), name: "n".into(), time_ms: 3, candidates: vec![], latency_ms: 3500, overhead_percent: 50, remote_control: false, device: None };
         assert_eq!(Value::Object(join.to_payload()).to_string(), r#"{"v":1,"t":3,"sid":"S","viewer":"V","name":"n","cands":[],"latency":3500,"overhead":50}"#);
 
-        let answer = JoinAnswer { session_id: "S".into(), time_ms: 4, ok: false, reason: JoinAnswer::REASON_FULL.into(), candidates: vec![] };
+        let answer = JoinAnswer { session_id: "S".into(), time_ms: 4, ok: false, reason: JoinAnswer::REASON_FULL.into(), candidates: vec![], device: None };
         assert_eq!(Value::Object(answer.to_payload()).to_string(), r#"{"v":1,"t":4,"sid":"S","ok":false,"reason":"full","cands":[]}"#);
     }
 
@@ -383,6 +449,27 @@ mod tests {
         let asking = JoinRequest { remote_control: true, ..join };
         assert!(Value::Object(asking.to_payload()).to_string().ends_with(r#","latency":3500,"overhead":50,"rc":true}"#));
         assert_eq!(JoinRequest::from_payload(&asking.to_payload()), Some(asking));
+    }
+
+    #[test]
+    fn the_device_key_and_on_demand_flag_come_last_and_only_when_set() {
+        let host = keys::new_id();
+        let live = LiveRecord { host_id: host.clone(), name: "n".into(), time_ms: 2, since_ms: 1, mbps: 40, max_viewers: 4, viewers: 1, ..LiveRecord::default() };
+        let plain = Value::Object(live.to_payload()).to_string();
+        assert!(!plain.contains(r#""dk""#) && !plain.contains(r#""od""#), "{plain}");
+        let read = LiveRecord::from_payload(&live.to_payload(), &host).unwrap();
+        assert_eq!((read.device_key, read.on_demand), (None, false));
+
+        let dk = device::DeviceKey::generate().public_key().to_string();
+        let full = LiveRecord { open_ipv4: Some(true), remote_control: Some(true), device_key: Some(dk.clone()), on_demand: true, ..live.clone() };
+        let text = Value::Object(full.to_payload()).to_string();
+        assert!(text.ends_with(&format!(r#","viewers":1,"open4":true,"rc":true,"dk":"{dk}","od":true}}"#)), "{text}");
+        assert_eq!(LiveRecord::from_payload(&full.to_payload(), &host).unwrap(), full);
+
+        // a "dk" that is not a usable key reads as none; "od" false is not written
+        let odd = object(&format!(r#"{{"host":"{host}","dk":"AAAA","od":false}}"#));
+        let read = LiveRecord::from_payload(&odd, &host).unwrap();
+        assert_eq!((read.device_key, read.on_demand), (None, false));
     }
 
     #[test]

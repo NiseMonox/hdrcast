@@ -10,7 +10,10 @@
 - **"…the host's PC only takes IPv4 from routers that keep ports…"**：观众的路由器每个目的地换端口，主播那边没打开：主播在
   **防火墙** 一栏点 **放行…**，并确认路由器开着 UPnP（开播页的面板会写缺什么）。**"…although the host takes IPv4 from any port…"**：
   观众这边的 VPN / 代理 / 加速器截走了 UDP。
-- **"Not live right now"**：主播还没开播，列表每 10 s 刷新。**"… is full"**：主播的"同时观看人数"满了。
+- **"Not live right now"**：对方电脑上 HdrCast 没开（或关了"开放连接"），列表每 10 s 刷新。**"… is full"**：主播的"同时观看人数"满了。
+- **"Waiting for … to answer"**：对方要先同意（"谁可以连接"里你是"询问我"），或正在启动采集。**"… did not let you in"**：对方拒绝了、
+  把你这台电脑设成了"禁止"，或刚把你断开（一分钟内连不回去）。**"Nobody at … answered your request"**：一分钟内没人点允许。
+- **想随时远程用自己的另一台电脑**：在那台电脑上 开播 → 谁可以连接 → 添加电脑… → 选这台 → **我的电脑**（先核对设备码）。之后不用那边点任何东西。
 - **"The signaling server cannot be reached"**：本机断网或信令服务器挂了；已经在看的人不受影响。
 - 能连上但**画面一直不出来**：mpv 在等第一个关键帧（最多一个 GOP，默认 2 s）；超过 10 s 看日志里 `[remux …]` 的报错（在主播那边）。
 

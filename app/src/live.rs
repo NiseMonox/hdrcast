@@ -1,9 +1,11 @@
-//! Who in the group is live right now: asked from the signaling server every 10 s while the app is open.
+//! Who in the group is live or available right now: asked from the signaling server every 10 s while the app
+//! is open.
 
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use hdrcast_core::group::device;
 use hdrcast_p2p::{p2p_diagnostics, CancelToken, LiveEntry, SignalingClient};
 use serde_json::{json, Value};
 
@@ -48,11 +50,13 @@ pub fn restart(app: &Arc<AppState>) {
                 if token.is_cancelled() {
                     return;
                 }
+                let mut fresh = None;
                 {
                     let mut shown = app.live.shown.lock().unwrap();
                     match result {
                         Ok(mut hosts) => {
                             hosts.retain(|h| h.record.host_id != me); // not ourselves
+                            fresh = Some(hosts.clone());
                             shown.hosts = hosts;
                             shown.error = None;
                             shown.loaded = true;
@@ -71,6 +75,9 @@ pub fn restart(app: &Arc<AppState>) {
                         }
                     }
                 }
+                if let Some(hosts) = fresh {
+                    crate::watch::live_list_updated(&app, &hosts);
+                }
                 drop(app);
                 token.wait(POLL_INTERVAL);
             }
@@ -86,6 +93,11 @@ pub fn group_changed(app: &Arc<AppState>) {
 
 pub fn name_of(app: &AppState, host_id: &str) -> Option<String> {
     app.live.shown.lock().unwrap().hosts.iter().find(|h| h.record.host_id == host_id).map(|h| h.record.name.clone())
+}
+
+/// (device key, name) of everyone in the list who advertises a device key.
+pub fn device_keys(app: &AppState) -> Vec<(String, String)> {
+    app.live.shown.lock().unwrap().hosts.iter().filter_map(|h| h.record.device_key.clone().map(|key| (key, h.record.name.clone()))).collect()
 }
 
 pub fn status(app: &AppState) -> Value {
@@ -106,6 +118,9 @@ pub fn status(app: &AppState) -> Value {
                 "ipv6": p2p_diagnostics::has_ipv6(&r.candidates),
                 "openIpv4": r.open_ipv4,
                 "control": h.remote_control(),
+                // on request: shown as "online" (connect), not as a broadcast (watch)
+                "onDemand": r.on_demand,
+                "deviceCode": r.device_key.as_deref().map(device::code_of).unwrap_or_default(),
             })
         })
         .collect();

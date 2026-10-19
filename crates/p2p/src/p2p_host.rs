@@ -1,16 +1,21 @@
 //! Streaming to the group (sender side): advertises this host every 10 s, answers join requests, starts one
 //! remux child per viewer fed from the shared encoder output, and lets [`HostLink`] punch through to each
 //! viewer. Viewers come and go without touching the encoder.
+//!
+//! With an admission hook ([`P2pHostOptions::admit`]) a join waits until the app lets it in or refuses it
+//! (docs/design.md §8.10): the app checks its rules for that device, may ask its user, and starts the encoder
+//! first when this host only streams on request.
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::io::{self, Read};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
+use hdrcast_core::group::device::{self, DeviceKey, Exchange, VerifiedDevice};
 use hdrcast_core::group::now_ms;
 use hdrcast_core::messages::{self, JoinAnswer, JoinRequest};
 use hdrcast_core::{endpoint, GroupConfig, GroupKeys, LiveRecord, ProcessJob, SignedEnvelope};
@@ -52,6 +57,35 @@ pub struct P2pHostOptions {
     /// Whether this host offers remote control right now (docs/design.md §8.9). Asked at every heartbeat; the
     /// answer goes into the live record as "rc". `None` = never.
     pub offer_remote_control: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// This computer's device key: advertised in the live record ("dk"), signs every answer, and lets a viewer
+    /// that signed its join agree on a remote-control key with this host (docs/design.md §8.10).
+    pub device: Option<Arc<DeviceKey>>,
+    /// Who decides about each join. `None` = everyone is let in at once (as before 0.3.1). Otherwise every join
+    /// that passes the checks is handed over as a [`JoinTicket`] and waits for [`P2pHost::admit`] or
+    /// [`P2pHost::refuse`] (on a thread of the caller's choosing; the hook itself must return at once).
+    pub admit: Option<AdmitFn>,
+    /// Whether this host streams on request rather than broadcasting ("od" in the live record). Asked at every
+    /// heartbeat. `None` = a broadcast.
+    pub on_demand: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+}
+
+/// Receives each join waiting to be let in (see [`P2pHostOptions::admit`]).
+pub type AdmitFn = Arc<dyn Fn(JoinTicket) + Send + Sync>;
+
+/// A join waiting for the app's decision.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinTicket {
+    pub sid: String,
+    /// The peer id the viewer gave. Anyone in the group could have written it: trust [`device_key`](Self::device_key).
+    pub viewer_id: String,
+    pub name: String,
+    /// The viewer's device key when the join was signed and the signature holds (docs/design.md §8.10); `None`
+    /// for a viewer older than 0.3.1.
+    pub device_key: Option<String>,
+    /// The join asked for remote control ("rc"), which also means the viewer speaks the side channel.
+    pub wants_control: bool,
+    pub latency_ms: i32,
+    pub overhead_percent: i32,
 }
 
 impl Default for P2pHostOptions {
@@ -71,6 +105,9 @@ impl Default for P2pHostOptions {
             router_mapping: None,
             inbound_allowed: None,
             offer_remote_control: None,
+            device: None,
+            admit: None,
+            on_demand: None,
         }
     }
 }
@@ -94,6 +131,9 @@ pub struct ViewerInfo {
     pub overhead_percent: i32,
     /// The viewer's join asked for remote control ("rc"): it speaks the side channel (docs/design.md §8.9).
     pub wants_control: bool,
+    pub viewer_id: String,
+    /// The viewer's device key, when its join was signed (docs/design.md §8.10).
+    pub device_key: Option<String>,
 }
 
 pub struct P2pHost {
@@ -107,6 +147,15 @@ struct Viewer {
     info: Mutex<ViewerInfo>,
     child: Mutex<ChildSlot>,
     ended: AtomicBool,
+    /// The remote-control key agreed with this viewer's device; `None` = the group-derived one.
+    control_key: Option<[u8; 32]>,
+}
+
+/// A join handed to the admission hook and not decided yet.
+struct PendingJoin {
+    join: JoinRequest,
+    device: Option<VerifiedDevice>,
+    since: Instant,
 }
 
 #[derive(Default)]
@@ -138,6 +187,7 @@ impl RestartLimiter {
 
 struct State {
     viewers: HashMap<String, Arc<Viewer>>,
+    pending: HashMap<String, PendingJoin>,
     seen_sids: HashMap<String, Instant>,
     status: String,
 }
@@ -151,8 +201,15 @@ struct Inner {
     started: AtomicBool,
     stopped: AtomicBool,
     announced: AtomicBool,
+    /// Set to send the next heartbeat now instead of at its time.
+    announce_soon: AtomicBool,
     since_ms: AtomicI64,
     next_child: AtomicU64,
+    /// The stream's bitrate and the viewer limit: start from the options, changeable while running.
+    bitrate_bps: AtomicU64,
+    max_viewers: AtomicU32,
+    /// The ffmpeg each viewer's remux child runs: from the options, changeable while running.
+    ffmpeg_path: Mutex<OsString>,
     keys: OnceLock<GroupKeys>,
     signal: OnceLock<SignalingClient>,
     link: OnceLock<HostLink>,
@@ -166,23 +223,35 @@ struct Inner {
 
 impl P2pHost {
     pub const MAX_CHILD_RESTARTS_PER_MINUTE: usize = 6;
+    /// A join the admission hook never decided about is refused after this long (viewers wait a minute).
+    pub const PENDING_LIMIT: Duration = Duration::from_secs(90);
 
     /// `ts_input`: the encoder's MPEG-TS (normally a [`SwitchableStream`](crate::SwitchableStream), so a
     /// restarted encoder is spliced in). [`stop`](Self::stop) cannot close it: whoever owns the other end does
     /// (close the `SwitchableStream` after stopping, as the apps always did).
     pub fn new(options: P2pHostOptions, ts_input: Box<dyn Read + Send>, log: impl Fn(&str) + Send + Sync + 'static) -> P2pHost {
+        let (bitrate_bps, max_viewers, ffmpeg_path) = (options.bitrate_bps, options.max_viewers, options.ffmpeg_path.clone());
         P2pHost {
             inner: Arc::new(Inner {
                 o: options,
                 log: Arc::new(log),
                 ts: Mutex::new(Some(ts_input)),
-                state: Mutex::new(State { viewers: HashMap::new(), seen_sids: HashMap::new(), status: "Starting".to_string() }),
+                state: Mutex::new(State {
+                    viewers: HashMap::new(),
+                    pending: HashMap::new(),
+                    seen_sids: HashMap::new(),
+                    status: "Starting".to_string(),
+                }),
                 cancel: CancelToken::new(),
                 started: AtomicBool::new(false),
                 stopped: AtomicBool::new(false),
                 announced: AtomicBool::new(false),
+                announce_soon: AtomicBool::new(false),
                 since_ms: AtomicI64::new(0),
                 next_child: AtomicU64::new(0),
+                bitrate_bps: AtomicU64::new(bitrate_bps),
+                max_viewers: AtomicU32::new(max_viewers),
+                ffmpeg_path: Mutex::new(ffmpeg_path),
                 keys: OnceLock::new(),
                 signal: OnceLock::new(),
                 link: OnceLock::new(),
@@ -236,8 +305,69 @@ impl P2pHost {
 
     /// Upload this stream needs right now: bitrate × viewers × (1 + each viewer's SRT overhead).
     pub fn upload_mbps(&self) -> f64 {
-        let bitrate = self.inner.o.bitrate_bps as f64 / 1e6;
+        let bitrate = self.inner.bitrate_bps() as f64 / 1e6;
         self.inner.viewers().iter().map(|v| bitrate * (1.0 + f64::from(v.overhead_percent) / 100.0)).sum()
+    }
+
+    /// New settings for the stream: the bitrate (sizes the viewers' SRT buffers and goes into the live record)
+    /// and how many may watch at once. Viewers already watching keep what they started with.
+    pub fn set_stream(&self, bitrate_bps: u64, max_viewers: u32) {
+        let old = (self.inner.bitrate_bps.swap(bitrate_bps, Ordering::AcqRel), self.inner.max_viewers.swap(max_viewers, Ordering::AcqRel));
+        if old != (bitrate_bps, max_viewers) {
+            self.announce_now();
+        }
+    }
+
+    /// Sends the next heartbeat now (the live record changed: on request or broadcasting, remote control).
+    pub fn announce_now(&self) {
+        self.inner.announce_soon.store(true, Ordering::Release);
+    }
+
+    /// The ffmpeg that viewers' remux children run from now on.
+    pub fn set_ffmpeg_path(&self, path: OsString) {
+        *lock(&self.inner.ffmpeg_path) = path;
+    }
+
+    /// Bytes of the encoder's stream read so far (0 before [`start`](Self::start)): it grows while the encoder
+    /// delivers.
+    pub fn stream_bytes(&self) -> u64 {
+        self.inner.fan.get().map_or(0, TsFanOut::bytes_in)
+    }
+
+    /// The joins handed to the admission hook that are not decided yet, oldest first.
+    pub fn pending(&self) -> Vec<JoinTicket> {
+        let state = lock(&self.inner.state);
+        let mut list: Vec<(&PendingJoin, JoinTicket)> = state.pending.values().map(|p| (p, ticket_of(p))).collect();
+        list.sort_by_key(|(p, _)| p.since);
+        list.into_iter().map(|(_, t)| t).collect()
+    }
+
+    /// Lets a waiting join in: starts its remux child, punches towards it and answers yes. Fails (and answers
+    /// no, with why) when this host stopped or is full meanwhile, or the viewer could not be served. Returns
+    /// the remote-control key agreed with the viewer's device, `None` when the session uses the group's.
+    pub fn admit(&self, sid: &str) -> Result<Option<[u8; 32]>, String> {
+        self.inner.admit(sid)
+    }
+
+    /// Refuses a waiting join (`reason`: one of the `JoinAnswer::REASON_*`). False when it was no longer waiting.
+    pub fn refuse(&self, sid: &str, reason: &str) -> bool {
+        let Some(pending) = lock(&self.inner.state).pending.remove(sid) else { return false };
+        let exchange = pending.device.as_ref().map_or("", |d| d.exchange.as_str()).to_string();
+        self.inner.answer(sid, false, reason, &exchange, None);
+        true
+    }
+
+    /// Ends one viewer's session (BYE): "disconnect" in the viewer list.
+    pub fn kick(&self, sid: &str, reason: &str) {
+        if let Some(link) = self.inner.link.get() {
+            link.remove_session(sid, reason);
+        }
+    }
+
+    /// The remote-control key agreed with the device of the viewer in session `sid`; `None` when that viewer
+    /// did not sign its join (use the group-derived `GroupKeys::control_key`) or is gone.
+    pub fn control_key(&self, sid: &str) -> Option<[u8; 32]> {
+        lock(&self.inner.state).viewers.get(sid).and_then(|v| v.control_key)
     }
 
     pub fn upload_mbps_for(bitrate_bps: u64, viewers: u32, overhead_percent: i32) -> f64 {
@@ -428,7 +558,7 @@ impl Inner {
                     failures = 0;
                     self.announced.store(true, Ordering::Release);
                     self.set_status(self.describe_live());
-                    ct.wait_ms(self.o.heartbeat_ms);
+                    self.wait_for_next_beat();
                 }
                 Err(SignalingError::Cancelled) => return,
                 Err(e) => {
@@ -453,6 +583,25 @@ impl Inner {
                 }
             }
         }
+    }
+
+    /// Until the next heartbeat is due, or until [`P2pHost::announce_now`] asks for it (or the host stops).
+    fn wait_for_next_beat(&self) {
+        let due = Instant::now() + Duration::from_millis(self.o.heartbeat_ms);
+        while !self.announce_soon.swap(false, Ordering::AcqRel) {
+            let left = due.saturating_duration_since(Instant::now());
+            if left.is_zero() || self.cancel.wait(left.min(Duration::from_millis(200))) {
+                return;
+            }
+        }
+    }
+
+    fn bitrate_bps(&self) -> u64 {
+        self.bitrate_bps.load(Ordering::Acquire)
+    }
+
+    fn max_viewers(&self) -> u32 {
+        self.max_viewers.load(Ordering::Acquire)
     }
 
     /// This PC's public IPv4 mapping, the only IPv4 candidate a viewer outside this network can use. False = no
@@ -494,6 +643,7 @@ impl Inner {
         let mut after: i64 = 0;
         let mut failures: u32 = 0;
         while !ct.is_cancelled() {
+            self.expire_pending();
             match signal.poll_joins(&self.o.group.peer_id, after, 20, ct) {
                 Ok((joins, next)) => {
                     after = next;
@@ -520,12 +670,14 @@ impl Inner {
 
     fn handle_join(self: &Arc<Self>, envelope: &SignedEnvelope) {
         let g = &self.o.group;
-        let (Some(keys), Some(link)) = (self.keys.get(), self.link.get()) else { return };
+        let Some(keys) = self.keys.get() else { return };
         let Some(payload) = envelope.try_open(keys, messages::KIND_JOIN, &g.group_id, &g.peer_id) else { return };
         let Some(join) = JoinRequest::from_payload(&payload) else { return };
         if (now_ms() - join.time_ms).abs() > 10 * 60 * 1000 {
             return;
         }
+        let device = device::verify_join(&g.group_id, &g.peer_id, &join);
+        let viewer_exchange = device.as_ref().map_or(String::new(), |d| d.exchange.clone());
 
         let refusal = {
             let mut state = lock(&self.state);
@@ -536,18 +688,91 @@ impl Inner {
             state.seen_sids.insert(join.session_id.clone(), Instant::now());
             if self.stopped.load(Ordering::Acquire) {
                 JoinAnswer::REASON_STOPPED
-            } else if state.viewers.values().filter(|v| !v.ended.load(Ordering::Acquire)).count() >= self.o.max_viewers as usize {
+            } else if join.device.is_some() && device.is_none() {
+                // signed, but not by the key it names (or not for this host): somebody posing as another computer
+                JoinAnswer::REASON_DENIED
+            } else if self.watching(&state) >= self.max_viewers() as usize {
                 JoinAnswer::REASON_FULL
             } else {
                 ""
             }
         };
         if !refusal.is_empty() {
-            (self.log)(&format!("[p2p] {} wanted to join: {refusal}", join.name));
-            self.answer(&join.session_id, false, refusal);
+            if refusal == JoinAnswer::REASON_DENIED {
+                (self.log)(&format!("[p2p] {} wanted to join with a device signature that does not hold: refused", join.name));
+            } else {
+                (self.log)(&format!("[p2p] {} wanted to join: {refusal}", join.name));
+            }
+            self.answer(&join.session_id, false, refusal, &viewer_exchange, None);
             return;
         }
 
+        match self.o.admit.clone() {
+            None => {
+                let _ = self.accept(join, device);
+            }
+            Some(admit) => {
+                let pending = PendingJoin { join, device, since: Instant::now() };
+                let ticket = ticket_of(&pending);
+                (self.log)(&format!(
+                    "[p2p] {} asks to join{}",
+                    ticket.name,
+                    match &ticket.device_key {
+                        Some(key) => format!(" from device {}", device::code_of(key)),
+                        None => " (no device signature: an older version)".to_string(),
+                    }
+                ));
+                lock(&self.state).pending.insert(ticket.sid.clone(), pending);
+                admit(ticket);
+            }
+        }
+    }
+
+    /// Viewers being served (not counting joins that wait for a decision).
+    fn watching(&self, state: &State) -> usize {
+        state.viewers.values().filter(|v| !v.ended.load(Ordering::Acquire)).count()
+    }
+
+    fn admit(self: &Arc<Self>, sid: &str) -> Result<Option<[u8; 32]>, String> {
+        let pending = lock(&self.state).pending.remove(sid).ok_or_else(|| "that request is no longer waiting".to_string())?;
+        let refusal = {
+            let state = lock(&self.state);
+            if self.stopped.load(Ordering::Acquire) {
+                JoinAnswer::REASON_STOPPED
+            } else if self.watching(&state) >= self.max_viewers() as usize {
+                JoinAnswer::REASON_FULL
+            } else {
+                ""
+            }
+        };
+        if !refusal.is_empty() {
+            let exchange = pending.device.as_ref().map_or("", |d| d.exchange.as_str()).to_string();
+            self.answer(sid, false, refusal, &exchange, None);
+            return Err(if refusal == JoinAnswer::REASON_FULL {
+                "this computer already has as many viewers as it takes".to_string()
+            } else {
+                "this computer stopped sharing".to_string()
+            });
+        }
+        self.accept(pending.join, pending.device)
+    }
+
+    /// Serves `join`: starts its remux child, punches towards it, answers yes. Returns the remote-control key
+    /// agreed with the viewer's device (`None`: the group-derived one).
+    fn accept(self: &Arc<Self>, join: JoinRequest, device: Option<VerifiedDevice>) -> Result<Option<[u8; 32]>, String> {
+        let Some(link) = self.link.get() else { return Err("the host is not running".to_string()) };
+        let viewer_exchange = device.as_ref().map_or(String::new(), |d| d.exchange.clone());
+        // A viewer that signed its join gets a remote-control key nobody else in the group can work out.
+        let mut exchange = (device.is_some() && self.o.device.is_some()).then(Exchange::new);
+        let control_key = match (&exchange, &device) {
+            (Some(exchange), Some(device)) => device::parse_exchange_key(&device.exchange)
+                .and_then(|theirs| exchange.agree(&theirs))
+                .map(|shared| device::session_control_key(&shared, &join.session_id, &device.exchange, exchange.public_key())),
+            _ => None,
+        };
+        if control_key.is_none() {
+            exchange = None; // their exchange key was unusable: answer without ours, both sides use the group's
+        }
         let viewer = Arc::new(Viewer {
             sid: join.session_id.clone(),
             name: join.name.clone(),
@@ -563,16 +788,19 @@ impl Inner {
                 latency_ms: join.latency_ms,
                 overhead_percent: join.overhead_percent,
                 wants_control: join.remote_control,
+                viewer_id: join.viewer_id.clone(),
+                device_key: device.as_ref().map(|d| d.key.clone()),
             }),
             child: Mutex::new(ChildSlot::default()),
             ended: AtomicBool::new(false),
+            control_key,
         });
         let port = match self.start_child(&viewer) {
             Ok(port) => port,
             Err(e) => {
                 (self.log)(&format!("[p2p] cannot start ffmpeg for {}: {e}", join.name));
-                self.answer(&join.session_id, false, JoinAnswer::REASON_BUSY);
-                return;
+                self.answer(&join.session_id, false, JoinAnswer::REASON_BUSY, &viewer_exchange, None);
+                return Err(format!("cannot start ffmpeg for this viewer: {e}"));
             }
         };
         lock(&self.state).viewers.insert(join.session_id.clone(), viewer.clone());
@@ -580,13 +808,29 @@ impl Inner {
             // no local socket for this viewer: the C# apps would have crashed here; refuse the one viewer instead
             (self.log)(&format!("[p2p] cannot open a local socket for {}: {e}", join.name));
             self.end_viewer(&viewer, "the host could not serve this viewer");
-            self.answer(&join.session_id, false, JoinAnswer::REASON_BUSY);
+            self.answer(&join.session_id, false, JoinAnswer::REASON_BUSY, &viewer_exchange, None);
             self.changed.raise();
-            return;
+            return Err(format!("cannot open a local socket for this viewer: {e}"));
         }
         (self.log)(&format!("[p2p] {} is joining (latency {} ms, candidates {})", join.name, join.latency_ms, join.candidates.join(", ")));
-        self.answer(&join.session_id, true, "");
+        self.answer(&join.session_id, true, "", &viewer_exchange, exchange.as_ref());
         self.changed.raise();
+        Ok(control_key)
+    }
+
+    /// Joins nobody decided about for [`P2pHost::PENDING_LIMIT`] are refused: their viewers gave up long ago.
+    fn expire_pending(&self) {
+        let expired: Vec<(String, String)> = {
+            let mut state = lock(&self.state);
+            let old: Vec<String> =
+                state.pending.iter().filter(|(_, p)| p.since.elapsed() > P2pHost::PENDING_LIMIT).map(|(sid, _)| sid.clone()).collect();
+            old.into_iter()
+                .filter_map(|sid| state.pending.remove(&sid).map(|p| (sid, p.device.map(|d| d.exchange).unwrap_or_default())))
+                .collect()
+        };
+        for (sid, exchange) in expired {
+            self.answer(&sid, false, JoinAnswer::REASON_TIMEOUT, &exchange, None);
+        }
     }
 
     /// Starts a remux child for `viewer` and feeds it; returns the UDP port its SRT listener is on.
@@ -597,9 +841,10 @@ impl Inner {
             (info.latency_ms, info.overhead_percent)
         };
         let port = RemuxChild::free_loopback_udp_port().map_err(|e| e.to_string())?;
-        let url = RemuxChild::build_listener_url(port, keys.srt_passphrase(), latency_ms.max(0) as u32, overhead_percent, self.o.bitrate_bps)
+        let url = RemuxChild::build_listener_url(port, keys.srt_passphrase(), latency_ms.max(0) as u32, overhead_percent, self.bitrate_bps())
             .map_err(|e| e.to_string())?;
-        let mut child = RemuxChild::new(&self.o.ffmpeg_path, &url, self.o.job.clone());
+        let ffmpeg = lock(&self.ffmpeg_path).clone();
+        let mut child = RemuxChild::new(&ffmpeg, &url, self.o.job.clone());
         let (log, tag) = (self.log.clone(), format!("[remux {}] ", viewer.name));
         child.on_log(move |line| log(&format!("{tag}{line}")));
         let id = self.next_child.fetch_add(1, Ordering::Relaxed) + 1;
@@ -621,7 +866,7 @@ impl Inner {
             input
         };
         let fed = match input {
-            Some(input) => fan.add_sink(&viewer.sid, Box::new(input), TsFanOut::queue_bytes_for(self.o.bitrate_bps)).map_err(|e| e.to_string()),
+            Some(input) => fan.add_sink(&viewer.sid, Box::new(input), TsFanOut::queue_bytes_for(self.bitrate_bps())).map_err(|e| e.to_string()),
             None => Err("ffmpeg has no stdin".to_string()),
         };
         if let Err(why) = fed {
@@ -762,15 +1007,21 @@ impl Inner {
         }
     }
 
-    fn answer(&self, sid: &str, ok: bool, reason: &str) {
+    /// Puts the answer for session `sid`, signed with this computer's device key when it has one.
+    /// `viewer_exchange` is the exchange key of the join ("" when it had none); `exchange` is ours, when agreed.
+    fn answer(&self, sid: &str, ok: bool, reason: &str, viewer_exchange: &str, exchange: Option<&Exchange>) {
         let (Some(keys), Some(signal)) = (self.keys.get(), self.signal.get()) else { return };
-        let answer = JoinAnswer {
+        let mut answer = JoinAnswer {
             session_id: sid.to_string(),
             ok,
             reason: reason.to_string(),
             time_ms: now_ms(),
             candidates: if ok { self.link_candidates() } else { Vec::new() },
+            device: None,
         };
+        if let Some(device) = &self.o.device {
+            device::sign_answer(device, exchange, &self.o.group.group_id, viewer_exchange, &mut answer);
+        }
         let envelope = SignedEnvelope::seal(keys, messages::KIND_ANSWER, &self.o.group.group_id, sid, &answer.to_payload());
         for attempt in 0..2 {
             match signal.put_answer(sid, &envelope, &self.cancel) {
@@ -793,11 +1044,13 @@ impl Inner {
             since_ms: self.since_ms.load(Ordering::Relaxed),
             candidates: self.link_candidates(),
             codec: self.o.codec.clone(),
-            mbps: round_half_even(self.o.bitrate_bps as f64 / 1e6) as i32,
-            max_viewers: self.o.max_viewers as i32,
+            mbps: round_half_even(self.bitrate_bps() as f64 / 1e6) as i32,
+            max_viewers: self.max_viewers() as i32,
             viewers: self.viewers().len() as i32,
             open_ipv4: self.ipv4_open(),
             remote_control: self.o.offer_remote_control.as_ref().is_some_and(|offers| offers()).then_some(true),
+            device_key: self.o.device.as_ref().map(|d| d.public_key().to_string()),
+            on_demand: self.on_demand(),
         };
         let keys = self.keys.get().expect("sealed only while running");
         SignedEnvelope::seal(keys, messages::KIND_LIVE, &g.group_id, &g.peer_id, &record.to_payload())
@@ -816,7 +1069,16 @@ impl Inner {
         if public_v4 && self.ipv4_open() == Some(false) {
             reach.push_str(&format!(" (IPv4 closed to routers that change ports: {})", self.closed_ipv4_parts()));
         }
-        format!("Live in \"{}\" - {n}{}{reach}", self.o.group.group_name, if n == 1 { " viewer" } else { " viewers" })
+        format!(
+            "{} in \"{}\" - {n}{}{reach}",
+            if self.on_demand() { "Available" } else { "Live" },
+            self.o.group.group_name,
+            if n == 1 { " viewer" } else { " viewers" }
+        )
+    }
+
+    fn on_demand(&self) -> bool {
+        self.o.on_demand.as_ref().is_some_and(|ask| ask())
     }
 
     fn set_status(&self, status: String) {
@@ -852,6 +1114,8 @@ impl Inner {
         if let Some(router) = self.router.get() {
             router.dispose(); // deletes the router forward (waits for the router, a few seconds at most)
         }
+        // whoever still waits for a decision gives up on its own: the server is told nothing more
+        lock(&self.state).pending.clear();
         let viewers: Vec<Arc<Viewer>> = lock(&self.state).viewers.drain().map(|(_, viewer)| viewer).collect();
         let mut children = Vec::new();
         for viewer in &viewers {
@@ -882,6 +1146,19 @@ impl Inner {
             fan.dispose();
         }
         self.set_status("Offline".to_string());
+    }
+}
+
+fn ticket_of(pending: &PendingJoin) -> JoinTicket {
+    let join = &pending.join;
+    JoinTicket {
+        sid: join.session_id.clone(),
+        viewer_id: join.viewer_id.clone(),
+        name: join.name.clone(),
+        device_key: pending.device.as_ref().map(|d| d.key.clone()),
+        wants_control: join.remote_control,
+        latency_ms: join.latency_ms,
+        overhead_percent: join.overhead_percent,
     }
 }
 

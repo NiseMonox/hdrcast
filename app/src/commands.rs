@@ -15,6 +15,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, State};
 
+use crate::access::AccessSettings;
 use crate::state::{self, AppState, UiSettings};
 use crate::{clipboard, status, window};
 
@@ -50,6 +51,8 @@ pub fn app_init(app: State<'_, Arc<AppState>>) -> Value {
             .map(|m| json!({ "id": m.number(), "name": m.display_name(platform) })).collect::<Vec<_>>(),
         "tools": state::tools_view(&inner.sender, &inner.receiver),
         "firewall": state::firewall_view(inner.firewall),
+        "access": state::access_view(&inner.access, inner.access_rev),
+        "device": app.device.code(),
         "paths": { "config": hdrcast_core::common::app_paths::config_dir().to_string_lossy() },
         "caps": {
             "audioExclude": cfg!(windows),
@@ -83,7 +86,7 @@ pub fn settings_save(app: Shared<'_>, handle: AppHandle, settings: AllSettings) 
     let mut inner = app.inner.lock().unwrap();
     state::adopt_output(&mut sender, &inner.outputs);
     let theme_changed = ui.theme != inner.ui.theme;
-    let policy_changed = ui.remote_control != inner.ui.remote_control;
+    let sender_changed = sender != inner.sender;
     if ui != inner.ui {
         if let Err(e) = ui.save() {
             app.log(&format!("[app] could not save settings: {e}"));
@@ -108,15 +111,63 @@ pub fn settings_save(app: Shared<'_>, handle: AppHandle, settings: AllSettings) 
         "receiver": inner.receiver,
         "tools": state::tools_view(&inner.sender, &inner.receiver),
     });
-    let (theme, policy) = (inner.ui.theme.clone(), inner.ui.remote_control);
+    let theme = inner.ui.theme.clone();
     drop(inner);
     if theme_changed {
         window::apply_theme(&handle, &theme);
     }
-    if policy_changed {
-        crate::share::policy_changed(&app, policy);
+    if sender_changed {
+        crate::share::settings_changed(&app);
     }
     Ok(reply)
+}
+
+// ---- who may connect ---------------------------------------------------------------------------------------------
+
+#[tauri::command(async)]
+pub fn access_get(app: Shared<'_>) -> Value {
+    let inner = app.inner.lock().unwrap();
+    state::access_view(&inner.access, inner.access_rev)
+}
+
+/// Takes the page's rules, repairs them, saves `access.json`, and applies them at once (availability, the
+/// remote control of who is watching, requests waiting for an answer). Hands back what was kept.
+#[tauri::command(async)]
+pub fn access_save(app: Shared<'_>, access: AccessSettings) -> CmdResult {
+    let access = access.normalized();
+    let view = {
+        let mut inner = app.inner.lock().unwrap();
+        if access != inner.access {
+            if let Err(e) = access.save() {
+                app.log(&format!("[app] could not save the access rules: {e}"));
+                return Err(format!("Could not save: {e}"));
+            }
+            inner.access = access;
+        }
+        state::access_view(&inner.access, inner.access_rev)
+    };
+    crate::share::rules_changed(app.inner());
+    Ok(view)
+}
+
+/// The answer to somebody who asks to watch: `remember` lets that device in from now on without asking.
+#[tauri::command(async)]
+pub fn knock_answer(app: Shared<'_>, sid: String, allow: bool, remember: bool) -> CmdResult {
+    crate::share::answer_knock(app.inner(), &sid, allow, remember)?;
+    let inner = app.inner.lock().unwrap();
+    Ok(state::access_view(&inner.access, inner.access_rev))
+}
+
+/// Disconnects one viewer.
+#[tauri::command(async)]
+pub fn share_kick(app: Shared<'_>, sid: String) -> CmdResult<()> {
+    crate::share::kick(&app, &sid)
+}
+
+/// Asks the host being watched for remote control, or gives it back.
+#[tauri::command(async)]
+pub fn watch_control(app: Shared<'_>, want: bool) -> CmdResult<()> {
+    crate::watch::want_control(&app, want)
 }
 
 #[tauri::command(async)]
@@ -216,11 +267,13 @@ fn save_group(app: &Arc<AppState>, config: hdrcast_core::group::config::GroupCon
     let view = state::group_view(inner.group.current());
     drop(inner);
     crate::live::group_changed(app);
+    crate::share::group_changed(app);
     Ok(view)
 }
 
+/// Being available to the group does not count: that moves to the new group by itself.
 fn busy(app: &AppState) -> Result<(), String> {
-    if crate::share::is_active(app) || crate::watch::is_active(app) {
+    if crate::share::is_streaming(app) || crate::watch::is_active(app) {
         Err("Stop sharing and watching first.".to_string())
     } else {
         Ok(())
@@ -409,7 +462,7 @@ fn outcome(result: Result<(), Vec<String>>) -> Value {
 #[tauri::command(async)]
 pub fn share_start(app: Shared<'_>) -> Value {
     refresh_firewall(&app);
-    outcome(crate::share::start(app.inner()))
+    outcome(crate::share::go_live(app.inner()))
 }
 
 #[tauri::command(async)]

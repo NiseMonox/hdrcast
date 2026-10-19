@@ -8,6 +8,7 @@ export const state = {
   ready: false,
   init: null,          // static facts from app_init (platform, version, lists)
   settings: null,      // { ui, sender, receiver }
+  access: null,        // who may connect and control: { rev, available, others, devices }
   status: null,        // the latest runtime snapshot (pushed a few times a second)
   group: null,
   tools: null,
@@ -51,6 +52,7 @@ export async function boot() {
   setState({
     init,
     settings: { ui: init.ui, sender: init.sender, receiver: init.receiver },
+    access: init.access,
     group: init.group,
     tools: init.tools,
     firewall: init.firewall,
@@ -69,6 +71,10 @@ export async function boot() {
     if (status.group) patch.group = status.group;
     if (status.firewall) patch.firewall = status.firewall;
     setState(patch);
+    // the rules changed behind the page's back (a request answered with "always"): fetch them again
+    if (status.accessRev != null && state.access && status.accessRev !== state.access.rev && !accessTimer) {
+      invoke('access_get').then((access) => { if (!accessTimer) setState({ access }); }).catch(() => {});
+    }
   });
   listen('log', (payload) => {
     const logs = state.logs.concat(payload.lines);
@@ -109,6 +115,34 @@ export async function flushSettings() {
   saveTimer = null;
   const saved = await invoke('settings_save', { settings: state.settings });
   setState({ settings: { ui: saved.ui, sender: saved.sender, receiver: saved.receiver }, tools: saved.tools || state.tools });
+}
+
+// ---- access rules: the same, in their own file -------------------------------------------------------------------
+
+let accessTimer = null;
+let accessSeq = 0;
+
+export function editAccess(patch) {
+  setState({ access: { ...state.access, ...patch } });
+  clearTimeout(accessTimer);
+  const seq = ++accessSeq;
+  accessTimer = setTimeout(async () => {
+    try {
+      const saved = await invoke('access_save', { access: state.access });
+      if (seq === accessSeq) setState({ access: saved });
+    } catch (e) {
+      toast(String(e), { kind: 'warn' });
+    }
+    if (seq === accessSeq) accessTimer = null;
+  }, 250);
+}
+
+/** Changes the rule of one device (by key), or removes it with `patch` = null. */
+export function editDevice(key, patch) {
+  const devices = patch === null
+    ? state.access.devices.filter((d) => d.key !== key)
+    : state.access.devices.map((d) => (d.key === key ? { ...d, ...patch } : d));
+  editAccess({ devices });
 }
 
 // ---- sheets and toasts ---------------------------------------------------------------------------------------

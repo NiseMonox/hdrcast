@@ -18,13 +18,15 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use hdrcast_core::group::device::{self, DeviceKey, Exchange};
 use hdrcast_core::group::keys;
 use hdrcast_core::group::now_ms;
 use hdrcast_core::messages::{self, JoinAnswer, JoinRequest};
 use hdrcast_core::{GroupConfig, Invite, LiveRecord, SignedEnvelope};
 use hdrcast_p2p::upnp::PortMappingState;
 use hdrcast_p2p::{
-    CancelToken, LinkAddresses, P2pHost, P2pHostOptions, SignalingClient, SignalingError, SwitchableStream, ViewerLink, ViewerSession, ViewerSessionOptions,
+    CancelToken, JoinTicket, LinkAddresses, P2pHost, P2pHostOptions, SignalingClient, SignalingError, SwitchableStream, ViewerLink, ViewerSession,
+    ViewerSessionOptions,
     ViewerSessionState, ViewerState,
 };
 
@@ -313,6 +315,7 @@ fn the_server_carries_the_remote_control_flag_without_reading_it() {
         latency_ms: 1500,
         overhead_percent: 25,
         remote_control: true,
+        device: None,
     };
     c.post_join(&host.peer_id, &SignedEnvelope::seal(&keys, messages::KIND_JOIN, &host.group_id, &host.peer_id, &asking.to_payload()), &ct).unwrap();
     let (joins, _) = c.poll_joins(&host.peer_id, 0, 0, &ct).unwrap();
@@ -842,4 +845,223 @@ fn nothing_goes_over_the_side_channel_unless_the_other_side_said_it_speaks_it() 
     }
     ts.close();
     assert!(!dump(&log).contains("keeps exiting"), "a remux child without input must simply wait:\n{}", dump(&log));
+}
+
+// ---- device keys and the admission hook (docs/design.md §8.10) ----------------------------------------------------
+
+/// A host that decides about each join, through the real signaling server (no encoder: a remux child without
+/// input simply waits). A viewer whose device signed its join is shown as waiting until the host lets it in,
+/// late, and both sides then agree on a remote-control key nobody else in the group can work out. A join whose
+/// signature does not hold is refused without the hook ever seeing it. A viewer without a device key (what 0.3.0
+/// sends) is refused, says so, and stops trying.
+#[test]
+fn a_host_lets_signed_viewers_in_when_it_decides_and_they_share_a_private_control_key() {
+    const TEST: &str = "a_host_lets_signed_viewers_in_when_it_decides_and_they_share_a_private_control_key";
+    let Some(ffmpeg) = common::find_tool("ffmpeg") else {
+        common::skip(TEST, "needs ffmpeg for the remux children (set HDRCAST_TOOLS to its directory)");
+        return;
+    };
+    let _one_at_a_time = MEDIA.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(server) = SignalServer::try_start(TEST) else { return };
+    let invite = Invite::create("on request", Some(&server.url())).unwrap();
+    let host_group = GroupConfig::default().normalize().adopt(&invite, "desktop");
+    let log: Log = Arc::new(Mutex::new(Vec::new()));
+    let host_device = Arc::new(DeviceKey::generate());
+    let (to_test, tickets) = mpsc::channel::<JoinTicket>();
+    let to_test = Mutex::new(to_test);
+    let ts = SwitchableStream::new();
+    let host = P2pHost::new(
+        P2pHostOptions {
+            group: host_group.clone(),
+            ffmpeg_path: ffmpeg.into_os_string(),
+            bitrate_bps: 1_000_000,
+            addresses: Some(loopback_firewalled()),
+            echo_port: server.echo_port,
+            heartbeat_ms: 500,
+            map_router_port: false, // never the real router
+            offer_remote_control: Some(Arc::new(|| true)),
+            device: Some(host_device.clone()),
+            admit: Some(Arc::new(move |ticket| {
+                let _ = to_test.lock().unwrap().send(ticket);
+            })),
+            on_demand: Some(Arc::new(|| true)),
+            ..P2pHostOptions::default()
+        },
+        Box::new(ts.clone()),
+        logger(&log),
+    );
+    host.start().unwrap();
+    assert!(wait_for(|| host.status().starts_with("Available in \"on request\""), 8000), "{}\n{}", host.status(), dump(&log));
+
+    // the live record names the host's device and says it streams on request
+    let watcher = SignalingClient::for_group(&GroupConfig::default().normalize().adopt(&invite, "list")).unwrap();
+    let live = watcher.get_live(&never()).unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].record.device_key.as_deref(), Some(host_device.public_key()));
+    assert!(live[0].record.on_demand);
+
+    // 1. a signed viewer waits, is let in late, and gets a key of its own
+    let laptop = Arc::new(DeviceKey::generate());
+    let viewer = ViewerSession::new(
+        ViewerSessionOptions {
+            group: GroupConfig::default().normalize().adopt(&invite, "laptop"),
+            host_id: host_group.peer_id.clone(),
+            latency_ms: 300,
+            addresses: Some(loopback_firewalled()),
+            echo_port: server.echo_port,
+            map_router_port: false, // never the real router
+            request_control: true,
+            device: Some(laptop.clone()),
+            ..ViewerSessionOptions::default()
+        },
+        logger(&log),
+    );
+    viewer.start().unwrap();
+    let ticket = tickets.recv_timeout(Duration::from_secs(15)).expect("the hook was asked");
+    assert_eq!(ticket.device_key.as_deref(), Some(laptop.public_key()));
+    assert_eq!(ticket.name, "laptop");
+    assert!(ticket.wants_control);
+    assert_eq!(host.pending(), vec![ticket.clone()]);
+    assert!(wait_for(|| viewer.state() == ViewerSessionState::Approval, 8000), "{}\n{}", viewer.status(), dump(&log));
+    assert_eq!(viewer.status(), "Waiting for desktop to answer");
+    assert!(host.viewers().is_empty(), "nobody is served before the hook decides");
+    // longer than the viewer's first punches stay useful: the yes arrives after they gave up
+    thread::sleep(Duration::from_secs(16));
+    let host_key = host.admit(&ticket.sid).expect("let in");
+    assert!(host_key.is_some(), "a signed viewer gets a key of its own");
+    assert!(host.pending().is_empty());
+    assert!(wait_for(|| viewer.state() == ViewerSessionState::Connected, 20_000), "{}\n{}", viewer.status(), dump(&log));
+    let sid = viewer.sid().unwrap();
+    assert_eq!(sid, ticket.sid);
+    assert_eq!(viewer.control_key(&sid), host_key, "both sides agree");
+    assert_eq!(host.control_key(&sid), host_key);
+    assert_ne!(host_key, Some(host_group.keys().unwrap().control_key(&sid)), "not the key everyone in the group can derive");
+    assert_eq!(viewer.control_key(&keys::new_id()), None, "only for its own session");
+    assert_eq!(viewer.host_device_key().as_deref(), Some(host_device.public_key()));
+    assert!(viewer.host_on_demand());
+    let info = host.viewers().into_iter().find(|v| v.sid == sid).expect("listed");
+    assert_eq!(info.device_key.as_deref(), Some(laptop.public_key()));
+    assert!(host.admit(&sid).is_err(), "let in once");
+
+    // 2. a join signed for another session (somebody posing as the laptop): refused, the hook never sees it
+    let impostor = GroupConfig::default().normalize().adopt(&invite, "laptop");
+    let mut forged = JoinRequest {
+        session_id: keys::new_id(),
+        viewer_id: impostor.peer_id.clone(),
+        name: "laptop".into(),
+        time_ms: now_ms(),
+        candidates: vec!["127.0.0.1:9".into()],
+        latency_ms: 300,
+        overhead_percent: 25,
+        remote_control: true,
+        device: None,
+    };
+    device::sign_join(&laptop, &Exchange::new(), &impostor.group_id, &host_group.peer_id, &mut forged);
+    forged.session_id = keys::new_id();
+    let impostor_keys = impostor.keys().unwrap();
+    let client = SignalingClient::for_group(&impostor).unwrap();
+    let envelope = SignedEnvelope::seal(&impostor_keys, messages::KIND_JOIN, &impostor.group_id, &host_group.peer_id, &forged.to_payload());
+    client.post_join(&host_group.peer_id, &envelope, &never()).unwrap();
+    let answer = client
+        .wait_answer(&forged.session_id, 10, &never())
+        .unwrap()
+        .and_then(|e| e.try_open(&impostor_keys, messages::KIND_ANSWER, &impostor.group_id, &forged.session_id))
+        .and_then(|p| JoinAnswer::from_payload(&p, &forged.session_id))
+        .expect("answered");
+    assert!(!answer.ok);
+    assert_eq!(answer.reason, JoinAnswer::REASON_DENIED);
+    assert!(device::verify_answer(&impostor.group_id, host_device.public_key(), "", &answer), "the refusal is signed by the host's device");
+    assert!(dump(&log).contains("[p2p] laptop wanted to join with a device signature that does not hold: refused"), "{}", dump(&log));
+
+    // 3. an unsigned viewer: no device in its ticket; refused, it says so and stops trying
+    let old = ViewerSession::new(
+        ViewerSessionOptions {
+            group: GroupConfig::default().normalize().adopt(&invite, "old"),
+            host_id: host_group.peer_id.clone(),
+            addresses: Some(loopback_firewalled()),
+            echo_port: server.echo_port,
+            map_router_port: false, // never the real router
+            ..ViewerSessionOptions::default()
+        },
+        logger(&log),
+    );
+    old.start().unwrap();
+    let ticket = tickets.recv_timeout(Duration::from_secs(15)).expect("the hook was asked");
+    assert_eq!((ticket.name.as_str(), ticket.device_key.as_deref(), ticket.wants_control), ("old", None, false));
+    assert!(host.refuse(&ticket.sid, JoinAnswer::REASON_DENIED));
+    assert!(!host.refuse(&ticket.sid, JoinAnswer::REASON_DENIED), "answered once");
+    assert!(wait_for(|| old.state() == ViewerSessionState::Refused, 10_000), "{}\n{}", old.status(), dump(&log));
+    assert_eq!(old.status(), "desktop did not let you in");
+    thread::sleep(Duration::from_secs(4));
+    assert!(tickets.try_recv().is_err(), "a refused viewer does not ask again (and the forged join never asked)");
+    assert_eq!(old.state(), ViewerSessionState::Refused);
+
+    viewer.stop();
+    old.stop();
+    host.stop();
+    ts.close();
+}
+
+/// A viewer that signs its joins, watching a host without a device key or an admission hook (what 0.3.0 is):
+/// the host ignores the extra fields and lets it in at once, its answer carries no device, and the viewer
+/// accepts that answer and falls back to the group's remote-control key, as 0.3.0 expects.
+#[test]
+fn a_signed_viewer_watches_a_host_that_knows_nothing_of_device_keys() {
+    const TEST: &str = "a_signed_viewer_watches_a_host_that_knows_nothing_of_device_keys";
+    let Some(ffmpeg) = common::find_tool("ffmpeg") else {
+        common::skip(TEST, "needs ffmpeg for the remux children (set HDRCAST_TOOLS to its directory)");
+        return;
+    };
+    let _one_at_a_time = MEDIA.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(server) = SignalServer::try_start(TEST) else { return };
+    let invite = Invite::create("older host", Some(&server.url())).unwrap();
+    let host_group = GroupConfig::default().normalize().adopt(&invite, "host");
+    let log: Log = Arc::new(Mutex::new(Vec::new()));
+    let ts = SwitchableStream::new();
+    let host = P2pHost::new(
+        P2pHostOptions {
+            group: host_group.clone(),
+            ffmpeg_path: ffmpeg.into_os_string(),
+            bitrate_bps: 1_000_000,
+            addresses: Some(loopback_firewalled()),
+            echo_port: server.echo_port,
+            heartbeat_ms: 500,
+            map_router_port: false, // never the real router
+            offer_remote_control: Some(Arc::new(|| true)),
+            ..P2pHostOptions::default()
+        },
+        Box::new(ts.clone()),
+        logger(&log),
+    );
+    host.start().unwrap();
+    assert!(wait_for(|| host.status().starts_with("Live"), 8000), "{}\n{}", host.status(), dump(&log));
+    let viewer = ViewerSession::new(
+        ViewerSessionOptions {
+            group: GroupConfig::default().normalize().adopt(&invite, "viewer"),
+            host_id: host_group.peer_id.clone(),
+            latency_ms: 300,
+            addresses: Some(loopback_firewalled()),
+            echo_port: server.echo_port,
+            map_router_port: false, // never the real router
+            request_control: true,
+            device: Some(Arc::new(DeviceKey::generate())),
+            ..ViewerSessionOptions::default()
+        },
+        logger(&log),
+    );
+    viewer.start().unwrap();
+    assert!(wait_for(|| viewer.state() == ViewerSessionState::Connected, 20_000), "{}\n{}", viewer.status(), dump(&log));
+    let sid = viewer.sid().unwrap();
+    assert_eq!(viewer.host_device_key(), None);
+    assert!(!viewer.host_on_demand());
+    assert!(viewer.host_offers_control());
+    assert_eq!(viewer.control_key(&sid), None, "no key of its own: the app uses the group's");
+    assert_eq!(host.control_key(&sid), None);
+    let info = host.viewers().into_iter().find(|v| v.sid == sid).expect("listed");
+    // the signature is still checked (that needs no key of this host's own); only the exchange is left out
+    assert!(info.device_key.is_some(), "the device is known all the same");
+    assert!(info.wants_control);
+    viewer.stop();
+    host.stop();
+    ts.close();
 }
