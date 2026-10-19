@@ -5,15 +5,17 @@ use tauri::{AppHandle, Manager, Theme, WebviewUrl, WebviewWindow, WebviewWindowB
 pub const LABEL: &str = "main";
 
 /// Creates the window. The second value says whether a backdrop material (Mica / vibrancy) is behind it, in which
-/// case the page leaves its sidebar translucent.
-pub fn create(app: &AppHandle) -> tauri::Result<(WebviewWindow, bool)> {
+/// case the page leaves its sidebar translucent. `background`: started at sign-in, the window stays hidden.
+pub fn create(app: &AppHandle, background: bool) -> tauri::Result<(WebviewWindow, bool)> {
     let builder = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("index.html".into()))
         .title("HdrCast")
         .inner_size(1040.0, 720.0)
         .min_inner_size(880.0, 600.0)
         .center()
         // shown by the page once it has drawn itself, so there is no white flash
-        .visible(false);
+        .visible(false)
+        // A hidden window that took the keyboard would swallow what the user types right after signing in.
+        .focused(!background);
     // A separate profile (HDRCAST_DATA_ROOT) keeps its web view's data to itself too, so two profiles can run
     // side by side.
     let builder = match std::env::var_os(hdrcast_core::common::app_paths::ROOT_OVERRIDE_ENV) {
@@ -61,6 +63,34 @@ pub fn create(app: &AppHandle) -> tauri::Result<(WebviewWindow, bool)> {
     let backdrop = false;
 
     Ok((builder.build()?, backdrop))
+}
+
+/// Brings the window back (from the notification area, the taskbar, or from behind other windows) and gives it
+/// the keyboard: for when the user asked for it.
+pub fn reveal(app: &AppHandle) {
+    let Some(window) = app.get_webview_window(LABEL) else { return };
+    let _ = window.show();
+    let _ = window.unminimize();
+    let _ = window.set_focus();
+}
+
+/// Something needs an answer (a request to connect, or for control) while the window may be out of sight: a
+/// hidden or minimized window comes back on top of the others, and its taskbar button flashes (the dock icon
+/// bounces). It is not forced to the front the way `reveal` does it: while the user works in another program,
+/// Windows keeps the keyboard there.
+pub fn surface(app: &AppHandle) {
+    let Some(window) = app.get_webview_window(LABEL) else { return };
+    if window.is_focused().unwrap_or(false) {
+        return;
+    }
+    if !window.is_visible().unwrap_or(true) || window.is_minimized().unwrap_or(false) {
+        let _ = window.show();
+        let _ = window.unminimize();
+        // briefly topmost: above the other windows even when Windows does not let it be activated
+        let _ = window.set_always_on_top(true);
+        let _ = window.set_always_on_top(false);
+    }
+    let _ = window.request_user_attention(Some(tauri::UserAttentionType::Informational));
 }
 
 /// Follows the appearance chosen in Settings ("auto" = the system's), so the backdrop material and the page agree.

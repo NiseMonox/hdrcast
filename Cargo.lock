@@ -1440,6 +1440,7 @@ dependencies = [
  "hdrcast-core",
  "hdrcast-media",
  "hdrcast-p2p",
+ "libc",
  "rfd",
  "serde",
  "serde_json",

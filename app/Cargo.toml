@@ -21,7 +21,7 @@ hdrcast-capture = { path = "../crates/capture" }
 hdrcast-media = { path = "../crates/media" }
 hdrcast-control = { path = "../crates/control" }
 hdrcast-p2p = { path = "../crates/p2p" }
-tauri = { version = "2", features = ["macos-private-api"] }
+tauri = { version = "2", features = ["macos-private-api", "tray-icon"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -30,7 +30,11 @@ rfd = { version = "0.15", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows-version = "0.1"
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading", "Win32_System_DataExchange"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading", "Win32_System_DataExchange", "Win32_System_Registry"] }
+
+# flock for the one-app-per-profile lock (src/instance.rs)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.190"
 
 [features]
 # custom-protocol = a production build: the UI in ../ui is embedded in the executable.

@@ -273,7 +273,8 @@ const en = {
   'knock.toast': '{name} wants to watch this computer.',
   'access.title': 'Who Can Connect',
   'access.available': 'Available to connect',
-  'access.availableHint': 'While HdrCast is open, people you allow can connect without you going live first.',
+  'access.availableHint': 'While HdrCast runs, people you allow can connect without you going live first. Closing the window keeps it running in the notification area.',
+  'access.availableHintMac': 'While HdrCast runs, people you allow can connect without you going live first. Closing the window keeps it running in the menu bar.',
   'access.others': 'Everyone else in “{group}”',
   'access.othersHint': 'Also anyone on HdrCast 0.3.0 or older, whose computer cannot be checked.',
   'access.connect': 'Watch',
@@ -321,6 +322,15 @@ const en = {
   'settings.thisDevice': 'This computer',
   'settings.thisDeviceHint': 'Its code. Other computers show it when this one connects: compare it there before giving this one access.',
   'settings.myNameHint': 'Give each of your computers its own name (say “Mo – laptop”) to tell them apart.',
+  'settings.autostart': 'Start HdrCast when I sign in',
+  'settings.autostartHint': 'It starts without a window, in the notification area, so this computer can be connected to without you opening HdrCast.',
+  'settings.autostartHintMac': 'It starts without a window, in the menu bar, so this Mac can be connected to without you opening HdrCast.',
+  'settings.autostartDisabled': 'Turned off in Task Manager (Startup apps). Switch it on here to start HdrCast again.',
+  'settings.autostartOther': 'Another copy of HdrCast starts now: {path}. Switch on to start this one instead.',
+  'tray.open': 'Open HdrCast',
+  'tray.quit': 'Quit HdrCast',
+  'tray.available': 'Available to connect',
+  'tray.sharing': 'Sharing this screen',
 };
 
 const zh = {
@@ -594,7 +604,8 @@ const zh = {
   'knock.toast': '{name} 想观看这台电脑。',
   'access.title': '谁可以连接',
   'access.available': '开放连接',
-  'access.availableHint': 'HdrCast 开着时，你允许的人不用等你开播就能连接。',
+  'access.availableHint': 'HdrCast 运行时，你允许的人不用等你开播就能连接。关掉窗口后它会留在任务栏通知区域（托盘）继续运行。',
+  'access.availableHintMac': 'HdrCast 运行时，你允许的人不用等你开播就能连接。关掉窗口后它会留在菜单栏继续运行。',
   'access.others': '“{group}”里的其他人',
   'access.othersHint': '也包括用 HdrCast 0.3.0 及更早版本、无法核实是哪台电脑的人。',
   'access.connect': '观看',
@@ -642,6 +653,15 @@ const zh = {
   'settings.thisDevice': '这台电脑',
   'settings.thisDeviceHint': '设备码。这台电脑连接别人时对方会看到它，给权限前请在对方那边核对。',
   'settings.myNameHint': '你的每台电脑可以用不同的名字（比如“小明 笔记本”），方便区分。',
+  'settings.autostart': '登录时自动启动 HdrCast',
+  'settings.autostartHint': '不弹窗口，只在任务栏通知区域（托盘）运行：不用打开 HdrCast，别人也能连接这台电脑。',
+  'settings.autostartHintMac': '不弹窗口，只在菜单栏运行：不用打开 HdrCast，别人也能连接这台 Mac。',
+  'settings.autostartDisabled': '已在任务管理器的“启动应用”里被关闭。在这里打开即可恢复。',
+  'settings.autostartOther': '现在登录时启动的是另一份 HdrCast：{path}。打开开关，改为启动这一份。',
+  'tray.open': '打开 HdrCast',
+  'tray.quit': '退出 HdrCast',
+  'tray.available': '开放连接中',
+  'tray.sharing': '正在分享屏幕',
 };
 
 const ja = {
@@ -915,7 +935,8 @@ const ja = {
   'knock.toast': '{name} さんがこのコンピュータを見たいと言っています。',
   'access.title': '接続できる人',
   'access.available': '接続を受け付ける',
-  'access.availableHint': 'HdrCast を開いている間、許可した人は配信を始めなくても接続できます。',
+  'access.availableHint': 'HdrCast の実行中は、許可した人は配信を始めなくても接続できます。ウィンドウを閉じても通知領域（タスクトレイ）で動き続けます。',
+  'access.availableHintMac': 'HdrCast の実行中は、許可した人は配信を始めなくても接続できます。ウィンドウを閉じてもメニューバーで動き続けます。',
   'access.others': '「{group}」のほかのメンバー',
   'access.othersHint': 'HdrCast 0.3.0 以前を使っていて、どのコンピュータか確認できない人も含みます。',
   'access.connect': '視聴',
@@ -963,6 +984,15 @@ const ja = {
   'settings.thisDevice': 'このコンピュータ',
   'settings.thisDeviceHint': 'デバイスコード。このコンピュータが接続すると相手に表示されます。権限を与える前に相手側で照合してください。',
   'settings.myNameHint': '自分のコンピュータごとに名前を変えると（例：「Mo ノート」）見分けやすくなります。',
+  'settings.autostart': 'サインイン時に HdrCast を起動',
+  'settings.autostartHint': 'ウィンドウを出さずに通知領域（タスクトレイ）で起動します。HdrCast を開かなくても、このコンピュータに接続できます。',
+  'settings.autostartHintMac': 'ウィンドウを出さずにメニューバーで起動します。HdrCast を開かなくても、この Mac に接続できます。',
+  'settings.autostartDisabled': 'タスク マネージャーの「スタートアップ アプリ」でオフになっています。ここでオンにすると元に戻ります。',
+  'settings.autostartOther': '今は別の HdrCast が起動します：{path}。オンにすると、こちらが起動するようになります。',
+  'tray.open': 'HdrCast を開く',
+  'tray.quit': 'HdrCast を終了',
+  'tray.available': '接続を受け付け中',
+  'tray.sharing': '画面を共有中',
 };
 
 const dictionaries = { en, zh, ja };

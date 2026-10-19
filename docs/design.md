@@ -62,11 +62,14 @@ ffmpeg（7.1 与 master）的 mpegts 封装器**不支持 AV1-in-MPEG-TS**（本
 | 命令行 | 作用 |
 |---|---|
 | `HdrCast` | 应用本身（§2.7） |
+| `HdrCast --background` | 应用，但不显示窗口，只在通知区域（托盘）运行；"登录时自动启动"用的就是它（§2.7） |
 | `HdrCast hdrcast:…` | 应用，启动后提示加入这条邀请 |
 | `HdrCast list-outputs [--json]` | 枚举显示器：索引、设备名（Windows `\\.\DISPLAYn`，macOS 是 `CGDirectDisplayID`）、友好名、分辨率、刷新率、HDR 是否开启（Windows：`DXGI_OUTPUT_DESC1.ColorSpace == RGB_FULL_G2084_NONE_P2020`）、MaxLuminance |
 | `HdrCast audio-devices` | 列出音频输出端点（Windows） |
 | `HdrCast capture <参数>` | 采集引擎（无窗口，stdout 先写一行帧格式、再每秒写 JSON 统计，stderr 写日志）。应用把自己当子进程这样启动 |
 | `HdrCast firewall-allow` | 加 Windows 防火墙入站规则后退出；由界面的 **放行…** 以管理员身份启动（§8.7） |
+
+同一份配置（同一个 `%APPDATA%\HdrCast`，或同一个 `HDRCAST_DATA_ROOT`）同时只运行一个应用：已经在运行时再启动（前三种），新进程把参数交给正在运行的那个后自己退出（§2.7）。
 
 `main` 先把参数交给 `hdrcast_capture::cli_main`，是引擎模式就直接跑完退出，不创建窗口。Windows 的发行版是窗口子系统程序：
 被应用带管道启动时 stdout / stderr 照常工作；在终端里手动跑时会附着到父控制台，但交互式终端不等它结束（用 `| more` 或写进 .cmd）。
@@ -195,7 +198,7 @@ Windows 11 用 Mica、macOS 用侧边栏毛玻璃作窗口背景（没有时退�
 
 页面：
 1. **开播**：顶部是状态卡片（"可被连接" / "未开放连接"，以及这台电脑的设备码，§8.10）。有人请求观看时出现"请求观看"列表
-   （设备码或"旧版本"、剩余秒数，**拒绝** / **总是允许** / **允许**；同时弹出提示，窗口不在前台时任务栏闪烁）。
+   （设备码或"旧版本"、剩余秒数，**拒绝** / **总是允许** / **允许**；同时弹出提示，窗口不在前台时任务栏闪烁，收在托盘里或最小化时窗口自己出来，见下）。
    有人在看或开播时状态卡片换成面板：码率 / 编码 fps / 采集 fps / 丢帧；开播时标题"直播中"、按钮 **停止**，按需时标题"按需分享中"、按钮 **全部断开**；
    下面是正在观看的人（设备码、IPv6 / IPv4、ping、延迟、远程控制状态与 允许 / 拒绝 / 收回、**断开**）。
    设置部分：显示器卡片（带 HDR 徽标、分辨率、刷新率、峰值亮度）；画面（码率滑块、帧率、分辨率、HDR 自动 / 始终 SDR、编码器 + **检测**，
@@ -207,7 +210,7 @@ Windows 11 用 Mica、macOS 用侧边栏毛玻璃作窗口背景（没有时退�
    按需的标"在线"、按钮 **连接**，都带设备码；延迟预设（快速 300 ms / 日本 / 澳大利亚 / 中国 / 自定义）；输出（自动 / HDR / SDR）。
    观看中顶部是面板：缓冲、帧率、码率、丢帧、是否 HDR 直通，**全屏** / **停止**，以及远程控制一行（**请求控制** / **接管控制** / **只看不控**）；
    等主播回答时显示"等待同意"，被拒绝时显示原因和 **关闭**。
-3. **设置**：语言、外观；群组（这台电脑的设备码、我的名字、邀请码复制 / 粘贴 / 新建）；ffmpeg / mpv 路径；播放器细项（硬解、缓冲、接收缓冲按多大码率算、峰值亮度、全屏用哪块屏、追赶、ffmpeg 管道兜底）；防火墙；关于。
+3. **设置**：语言、外观、登录时自动启动（见下）；群组（这台电脑的设备码、我的名字、邀请码复制 / 粘贴 / 新建）；ffmpeg / mpv 路径；播放器细项（硬解、缓冲、接收缓冲按多大码率算、峰值亮度、全屏用哪块屏、追赶、ffmpeg 管道兜底）；防火墙；关于。
 4. **日志**：全部日志行（已脱敏），可筛选、复制、打开文件夹。
 
 前后端之间：前端调命令（`app/src/commands.rs`），后端每 400 ms 推一份完整的状态快照（`status` 事件）和成批的日志行（`log` 事件），界面只按快照重画。
@@ -215,14 +218,40 @@ Windows 11 用 Mica、macOS 用侧边栏毛玻璃作窗口背景（没有时退�
 
 - 配置文件：`%APPDATA%\HdrCast\` 下的 `sender.json`、`receiver.json`（字段名和整数枚举与 0.2 的 DataContract 文件相同，旧文件直接可读）、
   `app.json`（界面语言 / 外观）、`access.json`（开放连接、组里其他人和每台电脑的 观看 / 控制 规则，§8.10）、
-  `device.json`（这台电脑的设备私钥，§8.10，与 `group.json` 一样要保密）、`group.json`。环境变量 `HDRCAST_DATA_ROOT` 可以把整个目录换到别处（并行跑第二份配置用）。
-- 应用一启动（有组、开放连接时）就在组里在线；关窗口时先向观众和信令服务器道别再退出。
+  `device.json`（这台电脑的设备私钥，§8.10，与 `group.json` 一样要保密）、`group.json`；`instance.lock` 和一闪而过的 `open-request.json` 见下面的"只运行一个"。
+  环境变量 `HDRCAST_DATA_ROOT` 可以把整个目录换到别处（并行跑第二份配置用）。
+- 应用一启动（有组、开放连接时）就在组里在线；这时关窗口只是把它收进通知区域（见本节末尾）。
 - 崩溃保护：ffmpeg 或采集进程意外退出 → 停止另一方，3 s 后自动重启；新编码器的 stdout 接进同一个分发器，观众不用重新加入。
 - 进程树：应用创建 **Job Object（KILL_ON_JOB_CLOSE）** 并把每个子进程加入，任务管理器强杀应用或应用崩溃时子进程一起死（macOS：退出时逐个杀进程组）。采集引擎另有 `--parent-pid`（用一个 `OpenProcess(SYNCHRONIZE)` 句柄轮询，不是每帧扫全系统进程表）。
 - **启动顺序**：采集引擎必须先把**两个**管道都建好，GUI 轮询到管道出现后才启动 ffmpeg（固定 sleep 不够：引擎要先建 D3D11 设备并编译 shader）。音频管道必须在等待视频管道客户端**之前**创建，否则两边互等。
   轮询**只能用 `WaitNamedPipe`**，不能用 `File.Exists` / `GetFileAttributes`：对 `\\.\pipe\<name>` 查属性本身就是一次客户端连接，会占掉唯一的实例，ffmpeg 随后得到 ERROR_PIPE_BUSY（CRT 译成 `Error opening input: Invalid argument`），引擎写端报 `Pipe is broken`，无限重启（v0.2.0 在 Windows 上的实际故障，`NamedPipeProbeTests` 防回归）。
 - 音频端点打不开时**不终止会话**：管道照建，写静音，日志说明原因（ffmpeg 已经被告知有音频输入，缺管道会直接退出）。
 - 日志与界面里的命令行一律经 `SecretRedactor` 脱敏（passphrase 与邀请码），因为 README 会让用户把日志发出来排障。
+
+**通知区域、登录时启动、只运行一个**（像 Parsec 那样不用管的主播；`app/src/tray.rs`、`autostart.rs`、`instance.rs`）：
+
+- **托盘图标**：应用运行期间一直在通知区域（macOS 菜单栏）。Windows 上左键单击 = 打开窗口，右键菜单 **打开 HdrCast** / **退出 HdrCast**；
+  macOS 上单击出同一个菜单，点程序坞图标（`RunEvent::Reopen`）也打开窗口。菜单和提示文字由页面按界面语言发给后端（`tray_texts`，字符串在 `ui/i18n.js`），
+  页面发来之前是英文。提示文字跟着状态走："HdrCast" / "HdrCast – 开放连接中" / "HdrCast – 正在分享屏幕"；正在采集屏幕时图标右下角加上
+  直播红点（`--live` 的 #ff3b30，外面一圈透明，深浅任务栏上都看得清）：窗口不在眼前时，有人在看这台电脑也一眼可知。
+- **关窗口**：开放连接打开（并且有组）时，`CloseRequested` 只把窗口藏起来（日志 `window closed: still available …`），这台电脑照样在线；
+  托盘图标没建起来时不藏（藏起来就再也打不开了）。否则照旧：在组里或在观看时先 `watch::stop` + `share::shut_down` 道别再退出，什么都没做时直接退出。
+  托盘的 **退出** 走同一条道别的路（图标和窗口先消失）；系统要求的退出（macOS 的 Cmd+Q、程序坞的退出，`ExitRequested` 且不是应用自己发起的）也一样。
+- **登录时自动启动**（设置 → 通用）：Windows 写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 的值 `HdrCast` = `"<exe>" --background`（REG_SZ），关掉时删除。
+  开关显示的是注册表里的真实状态，不记在 `app.json` 里：值不存在 = 关；指向别的文件夹里的 HdrCast（旧版本）= 关，并写明那个路径，打开就改成这一份；
+  任务管理器"启动应用"里关掉的项（`…\Explorer\StartupApproved\Run` 下 12 字节的值，首字节为奇数 = 关）也显示为关并说明，打开时把这个标记删掉。
+  每次打开设置页都重新读一次。macOS 见 §10。
+- **`--background` 启动**：窗口建成不可见、也不拿焦点（`focused(false)`：否则 WebView2 在创建时把键盘焦点移进网页，一个看不见的窗口成了前台窗口，
+  登录后用户打的头几个字就没了）；`app_init` 带 `startHidden: true`（只给第一次），页面画好后不再 `show()`。页面照常加载，从托盘打开时立即可用。
+  托盘图标建不起来时照常显示窗口。
+- **窗口不在眼前时的请求**：有人请求观看（`share.rs` 的 knock）或请求控制（housekeeping 里发现新的 `requested`）时 `AppState::request_attention` →
+  `window::surface`：窗口是隐藏或最小化的就显示出来，用一次短暂的置顶放到所有窗口上面，再让任务栏按钮闪烁。不像托盘的"打开"那样强行切到前台：
+  用户正在别的程序里打字时，Windows 不让后台程序拿走键盘，窗口只是出现在上面。页面里照常弹出 **拒绝** / **允许** 提示和"请求观看"列表；50 s 没回答就是 `timeout`。
+  选了显示窗口而不是系统通知：托盘气泡（`Shell_NotifyIcon` 的 NIF_INFO）tray-icon 不支持，点了也回不到应用；Windows 的 toast 要给未打包的程序注册 AUMID。
+- **只运行一个**：应用启动时对 `<配置目录>/instance.lock` 加独占锁（Windows `LockFileEx`，macOS `flock`；进程怎么结束系统都会放开）。锁被占着 = 这份配置已经在运行：
+  带 `--background` 的（登录项）直接退出；其他情况把参数写进 `open-request.json`（先写临时文件再改名），等最多 2 s 看它被取走，然后退出。
+  正在运行的应用每 400 ms 的状态循环里取这个文件：显示并聚焦窗口，参数是邀请时弹出加入确认（`join-invite` 事件）。启动时先删掉没人取的旧请求。
+  否则两个进程会用同一把设备密钥、同一个 peer id 在组里各宣告一次。不同的 `HDRCAST_DATA_ROOT` 各有各的锁，同机双配置测试不受影响。
 
 ## 3. 接收端
 
@@ -620,6 +649,9 @@ answer: "hdrcast/v1/answer-device" gid  sid  t  ok(true|false)  reason  cands  �
 | `SendInput` | Quartz 事件（`CGEventPost`），需要"辅助功能"授权；字符键按 US 键位表给键码，表里没有的当 Unicode 文本；双击靠自己数点击次数 |
 | 剪贴板里有邀请时自动提示 | 不做（macOS 会向用户报告每一次读剪贴板）；用 **我有邀请码** / **粘贴邀请码** |
 | Mica | 侧边栏毛玻璃（`NSVisualEffectView`），系统的红黄绿按钮 |
+| 通知区域图标：左键打开窗口，右键菜单 | 菜单栏图标，单击出菜单（打开 / 退出）；窗口藏起来时点程序坞图标（`RunEvent::Reopen`）也打开窗口；程序坞图标一直在 |
+| 登录时启动：`HKCU\…\Run` 的 `HdrCast` 值，任务管理器能关 | `~/Library/LaunchAgents/app.hdrcast.login.plist`：`ProgramArguments` = 程序本身 + `--background`，`RunAtLoad`，`LimitLoadToSessionType` = Aqua，`ProcessType` = Interactive。只写 / 删文件，不 `launchctl load`（会马上再启动一份）也不 `bootout`（会结束登录时启动的那一份），下次登录生效。开关的状态 = 文件存在且指向这个程序；在"系统设置 → 通用 → 登录项"里被关掉的读不到。程序在 App Translocation 的临时路径里（从"下载"直接打开的）时拒绝，请先拖进"应用程序" |
+| 只运行一个：`instance.lock` | 同一套（`flock`）。从访达 / 程序坞打开时 LaunchServices 本来就只开一个，会把已经在运行的那个叫到前面（`Reopen`） |
 
 权限：开播要"屏幕与系统音频录制"（第一次开播时系统弹框，允许后要重开应用）；当主播被远程控制要"辅助功能"。
 

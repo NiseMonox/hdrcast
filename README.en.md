@@ -41,9 +41,16 @@ The delay is 3-6 seconds by design: it is a broadcast, not a remote desktop.
    get a warning. macOS asks once for the Screen & System Audio Recording permission.
 2. Talking with the group in a voice chat? On Windows pick it under **Sound > Leave out** (for example `Discord.exe`) so your
    friends do not hear themselves coming back through the stream. Needs Windows 10 21H1 or newer.
-3. You do not have to go live: while HdrCast is open your computer is **Online** in the group, and friends can click
+3. You do not have to go live: while HdrCast runs your computer is **Online** in the group, and friends can click
    **Connect**. Under **Share > Who Can Connect** you decide what happens then (next section). Your screen is only captured
    while somebody you let in is watching, and capture stops by itself 20 s after the last one leaves.
+4. Closing the window does not take you offline: while **Available to connect** is on, HdrCast goes on running in the
+   notification area (the menu bar on a Mac). Click its icon (or **Open HdrCast** in its menu) to get the window back;
+   **Quit HdrCast** in that menu takes you offline. A red dot on the icon means somebody is watching your screen right now.
+   With Available to connect off, closing the window quits as before.
+5. **Settings > General > Start HdrCast when I sign in** starts it without a window each time you sign in, so your computer
+   is online without you doing anything. When a friend asks to watch (or for control) while the window is closed, the
+   window comes back on top and its taskbar button flashes; it does not take the keyboard from what you are typing in.
 
 ## Who can connect, and remote control
 
@@ -59,7 +66,8 @@ Rules follow that code, not the name, and nobody else in the group can pretend t
 
 Your own laptop, able to control your desktop from anywhere: install 0.3.1 on both and join the same group; on the desktop
 use **Add a Computer… > My Computer** for the laptop; later, on the laptop, **Watch > (desktop) > Connect**. Nothing has to
-be clicked on the desktop, but HdrCast has to be running there.
+be clicked on the desktop, but HdrCast has to be running there (its window may be closed); turn on **Start HdrCast when I
+sign in** on the desktop and it is, after every restart.
 
 As a viewer: when the sharer allows it, control is on as soon as you connect and the player window sends your mouse and
 keyboard (`Ctrl + Alt + Enter` stays with your own player: full screen on/off). **Just Watch** gives it back, **Take
@@ -79,7 +87,7 @@ The panel on the Watch page says what happened. The usual ones:
 | ... although the host takes IPv4 from any port ... | Something on your computer grabs UDP: a VPN, proxy or game accelerator (Clash TUN, UU, ...). Turn it off, or let HdrCast bypass it. |
 | The host's PC has no IPv6 internet connection | The friend sharing needs IPv6 (same advice, their side). |
 | Both sides have IPv6 but the path is blocked | A VPN or a very strict firewall drops incoming UDP. Turn the VPN off; on the router look for "IPv6 firewall: block all". |
-| Not live right now / Nobody is online right now | HdrCast is not open on your friend's computer (or they turned off "Available to connect"). The list refreshes by itself. |
+| Not live right now / Nobody is online right now | HdrCast is not running on your friend's computer (they quit it, or turned off "Available to connect"). The list refreshes by itself. |
 | ... did not let you in | The sharer said no, or set your computer to Never. Ask them. |
 | Nobody at ... answered your request | The sharer was not at their computer to click Allow within a minute. |
 | ... is full | The sharer's "Viewers at once" is reached. |

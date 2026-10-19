@@ -1,7 +1,7 @@
 //! What the page can ask for. Anything that may take a moment (a process to stop, a file dialog, Windows'
 //! permission prompt) is an `async` command, which Tauri runs off the main thread.
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use hdrcast_core::common::firewall::{self, row as firewall_row};
@@ -17,7 +17,7 @@ use tauri::{AppHandle, State};
 
 use crate::access::AccessSettings;
 use crate::state::{self, AppState, UiSettings};
-use crate::{clipboard, status, window};
+use crate::{autostart, clipboard, status, tray, window};
 
 type Shared<'a> = State<'a, Arc<AppState>>;
 type CmdResult<T = Value> = Result<T, String>;
@@ -25,15 +25,20 @@ type CmdResult<T = Value> = Result<T, String>;
 #[tauri::command]
 pub fn app_init(app: State<'_, Arc<AppState>>) -> Value {
     let startup = app.startup_invite.lock().unwrap().take();
+    let start_hidden = app.start_hidden.swap(false, Ordering::SeqCst);
     let status = status::snapshot(&app);
+    let autostart = autostart::read().view();
     let inner = app.inner.lock().unwrap();
     let platform = app.platform;
     let group = inner.group.current();
-    let startup_invite = startup.map(|text| preview(group, &text)).filter(|p| p["ok"] == true && p["alreadyMember"] == false);
+    let startup_invite = startup.and_then(|text| offer_of(group, &text));
     json!({
         "version": env!("CARGO_PKG_VERSION"),
         "platform": state::platform_name(platform),
         "backdrop": app.backdrop,
+        // started at sign-in: the page leaves the window hidden
+        "startHidden": start_hidden,
+        "autostart": autostart,
         "defaultName": invite_flow::default_display_name(group),
         "ui": inner.ui,
         "sender": inner.sender,
@@ -120,6 +125,31 @@ pub fn settings_save(app: Shared<'_>, handle: AppHandle, settings: AllSettings) 
         crate::share::settings_changed(&app);
     }
     Ok(reply)
+}
+
+// ---- starting at sign-in, the notification area ------------------------------------------------------------------
+
+/// What the system will do at the next sign-in, read from the system (Task Manager may have changed it).
+#[tauri::command(async)]
+pub fn autostart_get() -> Value {
+    autostart::read().view()
+}
+
+#[tauri::command(async)]
+pub fn autostart_set(app: Shared<'_>, on: bool) -> CmdResult {
+    let now = autostart::set(on).inspect_err(|e| app.log(&format!("[app] {e}")))?;
+    app.log(if now.on {
+        "[app] HdrCast will start when you sign in (in the background)"
+    } else {
+        "[app] HdrCast will no longer start when you sign in"
+    });
+    Ok(now.view())
+}
+
+/// The words of the icon's menu and tooltip, in the page's language.
+#[tauri::command(async)]
+pub fn tray_texts(handle: AppHandle, texts: tray::Texts) {
+    tray::set_texts(&handle, texts);
 }
 
 // ---- who may connect ---------------------------------------------------------------------------------------------
@@ -320,6 +350,17 @@ fn preview(current: &hdrcast_core::group::config::GroupConfig, text: &str) -> Va
             "text": text,
         }),
     }
+}
+
+/// An invite HdrCast was started with, as the join sheet takes it: None when it is no invite or one of the
+/// group this computer is in already.
+fn offer_of(current: &hdrcast_core::group::config::GroupConfig, text: &str) -> Option<Value> {
+    Some(preview(current, text)).filter(|p| p["ok"] == true && p["alreadyMember"] == false)
+}
+
+/// The same for an invite a later start of HdrCast handed over (`instance.rs`).
+pub fn invite_offer(app: &AppState, text: &str) -> Option<Value> {
+    offer_of(&app.group(), text)
 }
 
 /// `text` = what the user pasted; without it, the clipboard is looked at.

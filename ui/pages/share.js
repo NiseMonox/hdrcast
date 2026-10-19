@@ -422,7 +422,7 @@ function AccessSection({ access, group, device, candidates }) {
   return html`
     <div class="section-title"><span>${t('access.title')}</span></div>
     <div class="card rows">
-      <${Row} name=${t('access.available')} hint=${t('access.availableHint')}>
+      <${Row} name=${t('access.available')} hint=${t(state.init?.platform === 'macos' ? 'access.availableHintMac' : 'access.availableHint')}>
         <${Switch} on=${access.available} onChange=${(v) => editAccess({ available: v })} />
       <//>
       <div class="row access-row">

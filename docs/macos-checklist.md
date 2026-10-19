@@ -381,3 +381,20 @@ open dist/HdrCast.app
       勾选后再点一次允许。观众的指针被限制在正在分享的那块显示器上；双击、拖拽窗口、滚动、`Shift` 组合键都正常。
       - 验证：`crates/control/src/inject/mac.rs`（Quartz 事件、US 键位表、双击计数）。键位不对（例如 `;` 打出别的字符）说明主播用的不是 US 键盘布局：把现象发回来。
 - [ ] 主播点 **收回** 或观众断线：按住的键 / 鼠标按钮 1.5 s 内被松开。
+
+## 16. 菜单栏图标与登录时启动（`app/src/tray.rs`、`autostart.rs`、`instance.rs`）
+
+先把 `HdrCast.app` 拖进"应用程序"再测：从"下载"直接打开的 app 跑在 App Translocation 的临时路径里，登录项会指向一个重启后就没了的地方
+（那种情况下打开开关应该报"Move HdrCast to the Applications folder first"）。
+
+- [ ] 菜单栏右上有 HdrCast 图标；单击出菜单 **打开 HdrCast** / **退出 HdrCast**。图标是彩色小方块（没有做成模板图），深浅菜单栏上都看得清就行。
+- [ ] 开放连接打开时点红色关闭按钮：窗口消失，HdrCast 仍在运行，Windows 观众的列表里仍"在线"。点程序坞图标或菜单里的 **打开**：窗口回来。
+- [ ] Windows 观众来连接、窗口关着时：窗口自己出来，程序坞图标跳动，弹出 **拒绝** / **允许**。
+- [ ] 有人在看时菜单栏图标右下角有红点。
+- [ ] 菜单里 **退出**、或 `Cmd + Q`（有人在看时）：观众几秒内看到主播离开；`pgrep -fl 'HdrCast|ffmpeg'` 没有残留。
+- [ ] **设置 → 通用 → 登录时自动启动 HdrCast**：`plutil -p ~/Library/LaunchAgents/app.hdrcast.login.plist` 显示 `ProgramArguments` =
+      `/Applications/HdrCast.app/Contents/MacOS/HdrCast`、`--background`，`RunAtLoad` = 1；系统可能弹"已添加后台项目"的通知。关掉后文件消失。
+- [ ] 打开它后注销再登录：没有窗口弹出，菜单栏和程序坞里有 HdrCast，Windows 观众 10 s 内看到它在线。
+      "系统设置 → 通用 → 登录项"里能看到它；在那里关掉后 HdrCast 的开关**仍显示开**（读不到这个状态，是已知局限）。
+- [ ] HdrCast 运行时在访达里再打开 HdrCast.app：不会出现第二个进程（`pgrep -fl HdrCast` 只有一个应用进程），原来的窗口出来。
+      登录项启动的那一份同样如此（它是 launchd 直接启动的，LaunchServices 是否把它认作同一个应用要实测；不认时 `instance.lock` 会让第二个进程把窗口叫出来后退出）。

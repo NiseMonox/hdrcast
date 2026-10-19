@@ -391,4 +391,7 @@ boot()
   .catch((e) => {
     document.getElementById('app').textContent = 'HdrCast could not start: ' + e;
   })
-  .finally(() => requestAnimationFrame(() => win.show()));
+  .finally(() => {
+    // started at sign-in: the window stays hidden until it is opened from the notification area
+    if (!state.init?.startHidden) requestAnimationFrame(() => win.show());
+  });

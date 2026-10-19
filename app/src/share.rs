@@ -7,7 +7,7 @@
 //! answered, so that the viewer's player finds the stream at once. Remote control is registered per session,
 //! with the key agreed with the viewer's device and the rule of that device.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
@@ -104,6 +104,8 @@ struct Session {
     starting: Mutex<()>,
     /// Why the stream could not start for the latest request (shown until the next start).
     problem: Mutex<Option<String>>,
+    /// Viewers whose request for control the user has been told about.
+    control_asks: Mutex<HashSet<String>>,
 }
 
 #[derive(Default)]
@@ -249,6 +251,7 @@ fn start_hosting(app: &Arc<AppState>) -> Result<Arc<Session>, Vec<String>> {
             disconnected: Mutex::new(HashMap::new()),
             starting: Mutex::new(()),
             problem: Mutex::new(None),
+            control_asks: Mutex::new(HashSet::new()),
         }
     });
     let hub = session.hub.clone();
@@ -286,13 +289,16 @@ impl Session {
     }
 }
 
+/// The rules say this computer is available to connect, and there is a group to be available to. Closing the
+/// window then leaves HdrCast running in the notification area.
+pub fn stays_available(app: &AppState) -> bool {
+    let inner = app.inner.lock().unwrap();
+    inner.access.available && inner.group.current().is_configured()
+}
+
 /// At start, and whenever the group or the settings change: announce this computer if it should be available.
 pub fn autostart(app: &Arc<AppState>) {
-    let wanted = {
-        let inner = app.inner.lock().unwrap();
-        inner.access.available && inner.group.current().is_configured()
-    };
-    if wanted && current(app).is_none() {
+    if stays_available(app) && current(app).is_none() {
         if let Err(problems) = start_hosting(app) {
             app.log(&format!("[app] not available to the group: {}", problems.join(" ")));
         }
@@ -600,6 +606,17 @@ pub fn housekeeping(app: &Arc<AppState>) {
     let viewers = session.host.viewers();
     let sids: Vec<String> = viewers.iter().map(|v| v.sid.clone()).collect();
     session.hub.keep_only(&sids);
+    // A viewer asks for control: like a request to watch, it reaches the user even with the window out of sight.
+    let asking: HashSet<String> = sids.iter().filter(|sid| session.hub.state_of(sid) == "requested").cloned().collect();
+    let newly_asked = {
+        let mut told = session.control_asks.lock().unwrap();
+        let newly = asking.iter().any(|sid| !told.contains(sid));
+        *told = asking;
+        newly
+    };
+    if newly_asked {
+        app.request_attention();
+    }
     {
         let mut admitted = session.admitted.lock().unwrap();
         admitted.retain(|sid, _| sids.contains(sid));

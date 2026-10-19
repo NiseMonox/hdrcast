@@ -2,7 +2,7 @@ import { html, useEffect, useRef, useState } from '../vendor/preact-htm.js';
 import { invoke } from '../api.js';
 import { t } from '../i18n.js';
 import { Icon } from '../icons.js';
-import { useStore, editSettings, openSheet, toast, setState } from '../store.js';
+import { useStore, editSettings, openSheet, toast, setState, state } from '../store.js';
 import { Avatar, NumberField, Row, Section, Segmented, Select, Switch, TextField } from '../components.js';
 import { FirewallRow, copyInvite } from './share.js';
 import { isSharing } from './share.js';
@@ -38,6 +38,22 @@ function ToolRow({ kind, name, tool, value, onChange, hint }) {
   <//>`;
 }
 
+function autostartHint(autostart, mac) {
+  if (autostart.disabled) return t('settings.autostartDisabled');
+  if (autostart.other) return t('settings.autostartOther', { path: autostart.other });
+  return t(mac ? 'settings.autostartHintMac' : 'settings.autostartHint');
+}
+
+async function setAutostart(on) {
+  setState({ autostart: { ...state.autostart, on } });
+  try {
+    setState({ autostart: await invoke('autostart_set', { on }) });
+  } catch (e) {
+    toast(String(e), { kind: 'warn' });
+    invoke('autostart_get').then((autostart) => setState({ autostart })).catch(() => {});
+  }
+}
+
 export function SettingsPage() {
   const s = useStore();
   const { ui, sender, receiver } = s.settings;
@@ -45,6 +61,11 @@ export function SettingsPage() {
   const watching = isWatching(s.status);
   const mac = s.init.platform === 'macos';
   const setR = (patch) => editSettings('receiver', patch);
+
+  // the entry belongs to the system (Task Manager can turn it off): look again whenever the page opens
+  useEffect(() => {
+    invoke('autostart_get').then((autostart) => setState({ autostart })).catch(() => {});
+  }, []);
 
   return html`
     <div class="page-head"><div class="titles"><h1>${t('settings.title')}</h1></div></div>
@@ -58,6 +79,9 @@ export function SettingsPage() {
         <${Segmented} value=${ui.theme} onChange=${(v) => editSettings('ui', { theme: v })}
           options=${[{ value: 'auto', label: t('settings.themeAuto') }, { value: 'light', label: t('settings.themeLight') }, { value: 'dark', label: t('settings.themeDark') }]} />
       <//>
+      ${s.autostart?.supported && html`<${Row} name=${t('settings.autostart')} tile="bolt" hint=${autostartHint(s.autostart, mac)}>
+        <${Switch} on=${s.autostart.on} onChange=${setAutostart} />
+      <//>`}
     <//>
 
     <${Section} title=${t('settings.group')} note=${t('settings.groupNote')}>

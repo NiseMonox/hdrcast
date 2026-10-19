@@ -1,6 +1,6 @@
 import { useEffect, useState } from './vendor/preact-htm.js';
 import { invoke, listen } from './api.js';
-import { setLanguage } from './i18n.js';
+import { setLanguage, t } from './i18n.js';
 
 const MAX_LOG_LINES = 1500;
 
@@ -9,6 +9,7 @@ export const state = {
   init: null,          // static facts from app_init (platform, version, lists)
   settings: null,      // { ui, sender, receiver }
   access: null,        // who may connect and control: { rev, available, others, devices }
+  autostart: null,     // starting at sign-in, as the system has it: { supported, on, other, disabled }
   status: null,        // the latest runtime snapshot (pushed a few times a second)
   group: null,
   tools: null,
@@ -45,6 +46,17 @@ export function applyAppearance() {
   else delete root.dataset.theme;
   setLanguage(ui?.language || 'auto', state.init?.locale || navigator.language);
   root.lang = document.documentElement.dataset.lang || 'en';
+  sendTrayTexts();
+}
+
+// The icon in the notification area is drawn by the system: it gets its words from here, in the same language.
+let trayLang = null;
+function sendTrayTexts() {
+  const lang = document.documentElement.dataset.lang;
+  if (lang === trayLang) return;
+  trayLang = lang;
+  const texts = { open: t('tray.open'), quit: t('tray.quit'), available: t('tray.available'), sharing: t('tray.sharing') };
+  invoke('tray_texts', { texts }).catch(() => {});
 }
 
 export async function boot() {
@@ -53,6 +65,7 @@ export async function boot() {
     init,
     settings: { ui: init.ui, sender: init.sender, receiver: init.receiver },
     access: init.access,
+    autostart: init.autostart,
     group: init.group,
     tools: init.tools,
     firewall: init.firewall,
@@ -83,6 +96,8 @@ export async function boot() {
   listen('invite', (preview) => {
     if (!state.sheet) openSheet('invite-found', { preview });
   });
+  // HdrCast was started again with an invite while it ran: the same as being started with it
+  listen('join-invite', (preview) => openSheet('join', { preview }));
   if (init.startupInvite) openSheet('join', { preview: init.startupInvite });
 }
 

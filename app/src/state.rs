@@ -2,6 +2,7 @@
 //! them the page shows.
 
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use hdrcast_capture::OutputInfo;
@@ -98,6 +99,8 @@ pub struct AppState {
     pub platform: Platform,
     pub backdrop: bool,
     pub startup_invite: Mutex<Option<String>>,
+    /// Started with `--background` (at sign-in): the page leaves the window hidden (taken by the first `app_init`).
+    pub start_hidden: AtomicBool,
     pub inner: Mutex<Inner>,
     /// This computer's device key (docs/design.md §8.10).
     pub device: Arc<DeviceKey>,
@@ -111,7 +114,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(logs: Arc<Logs>, backdrop: bool, startup_invite: Option<String>) -> Self {
+    pub fn new(logs: Arc<Logs>, backdrop: bool, startup_invite: Option<String>, start_hidden: bool) -> Self {
         let platform = Platform::CURRENT;
         let outputs = hdrcast_capture::enumerate_outputs().unwrap_or_else(|e| {
             logs.tagged("app", &format!("cannot enumerate displays: {e}"));
@@ -140,6 +143,7 @@ impl AppState {
             platform,
             backdrop,
             startup_invite: Mutex::new(startup_invite),
+            start_hidden: AtomicBool::new(start_hidden),
             inner: Mutex::new(inner),
             device: Arc::new(device),
             seen: Mutex::new(Vec::new()),
@@ -159,12 +163,11 @@ impl AppState {
         seen.truncate(32);
     }
 
-    /// Something needs the user (a request to connect): flash the window's taskbar button / bounce the dock icon.
+    /// Something needs the user (a request to connect, or for control): the window comes back if it was closed
+    /// to the notification area or minimized, and its taskbar button flashes / the dock icon bounces.
     pub fn request_attention(&self) {
-        use tauri::Manager;
-        let Some(window) = self.handle.get().and_then(|h| h.get_webview_window(crate::window::LABEL)) else { return };
-        if !window.is_focused().unwrap_or(false) {
-            let _ = window.request_user_attention(Some(tauri::UserAttentionType::Informational));
+        if let Some(handle) = self.handle.get() {
+            crate::window::surface(handle);
         }
     }
 

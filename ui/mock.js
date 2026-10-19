@@ -1,7 +1,8 @@
 // A stand-in backend for working on the UI in a plain browser (never loaded inside the app).
 // URL switches: ?fresh (no group yet), ?live (already sharing), ?watching, ?knock (somebody asks to watch),
 // ?off (not available to connect), ?mac, ?lang=zh|ja|en, ?theme=dark|light,
-// ?nohdr (the system refuses HDR capture: an HDR display is sent as SDR, as on a Mac without it)
+// ?nohdr (the system refuses HDR capture: an HDR display is sent as SDR, as on a Mac without it),
+// ?autostart=on|disabled|other (the sign-in entry)
 
 const q = new URLSearchParams(location.search);
 const handlers = new Map();
@@ -51,6 +52,12 @@ const db = {
   viewers: [],
   knocks: [],
   seen: [{ key: 'k-jiuyi', code: 'B7WP-3N6S-KCE1', name: 'Hana', source: 'asked' }],
+  autostart: {
+    supported: true,
+    on: q.get('autostart') === 'on',
+    other: q.get('autostart') === 'other' ? (mac ? '/Users/me/Downloads/HdrCast.app/Contents/MacOS/HdrCast' : 'D:\\HdrCast-0.3.0\\HdrCast.exe') : null,
+    disabled: q.get('autostart') === 'disabled',
+  },
 };
 
 const hosts = [
@@ -187,8 +194,16 @@ const api = {
       caps: { audioExclude: !mac, clipboardWatch: !mac },
       status: status(),
       startupInvite: null,
+      startHidden: false,
+      autostart: db.autostart,
     };
   },
+  autostart_get: () => db.autostart,
+  autostart_set({ on }) {
+    db.autostart = { supported: true, on, other: null, disabled: false };
+    return db.autostart;
+  },
+  tray_texts: () => null,
   settings_save({ settings }) {
     db.ui = settings.ui; db.sender = settings.sender; db.receiver = settings.receiver;
     return { ...settings, tools: null };
