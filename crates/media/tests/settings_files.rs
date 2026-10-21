@@ -255,8 +255,9 @@ fn enums_are_written_as_their_numbers() {
         ),
         (&json!(1), &json!(3), &json!(1))
     );
+    // the defaults of a Windows viewer, as 0.2.4 would have written them (a Mac's player input is the pipe)
     assert_eq!(
-        serde_json::to_value(ReceiverSettings::default()).unwrap(),
+        serde_json::to_value(ReceiverSettings::defaults_for(Platform::Windows)).unwrap(),
         json!({
             "latencyMs": 1500, "expectedBitrateMbps": 100, "displayMode": 0, "toneMapping": "bt.2390", "hwDec": 1,
             "bufferSeconds": 1.5, "fullscreen": false, "fullscreenScreen": 0, "frontend": 0, "mpvPath": "",

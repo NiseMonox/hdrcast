@@ -28,7 +28,7 @@ const db = {
   },
   receiver: {
     latencyMs: 1500, expectedBitrateMbps: 100, displayMode: 0, toneMapping: 'bt.2390', hwDec: 1, bufferSeconds: 1.5,
-    fullscreen: false, fullscreenScreen: 0, frontend: 0, mpvPath: '', ffmpegPath: '', autoCatchUp: true, targetPeakNits: 0, lastHost: '',
+    fullscreen: false, fullscreenScreen: 0, frontend: mac ? 1 : 0, mpvPath: '', ffmpegPath: '', autoCatchUp: true, targetPeakNits: 0, lastHost: '',
   },
   access: {
     rev: 0,
@@ -188,7 +188,7 @@ const api = {
       latencyPresets: [{ name: 'Fast', latencyMs: 300 }, { name: 'Japan', latencyMs: 1500 }, { name: 'Australia', latencyMs: 2000 }, { name: 'China', latencyMs: 3500 }],
       toneMappings: ['bt.2390', 'auto', 'spline', 'bt.2446a', 'st2094-40', 'st2094-10', 'hable', 'mobius', 'reinhard', 'clip'],
       hwDecModes: [{ id: 0, name: 'auto-safe' }, { id: 1, name: mac ? 'videotoolbox' : 'd3d11va' }, { id: 2, name: mac ? 'videotoolbox-copy' : 'd3d11va-copy' }, { id: 3, name: 'no (software)' }],
-      tools: { ffmpeg: { path: mac ? '/opt/homebrew/bin/ffmpeg' : 'D:\\HdrCast\\tools\\ffmpeg.exe' }, mpv: { path: mac ? null : 'D:\\HdrCast\\tools\\mpv.exe' } },
+      tools: { ffmpeg: { path: mac ? '/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg' : 'D:\\HdrCast\\tools\\ffmpeg.exe' }, mpv: { path: mac ? null : 'D:\\HdrCast\\tools\\mpv.exe' } },
       firewall: db.firewall,
       paths: { config: mac ? '~/Library/Application Support/HdrCast' : 'C:\\Users\\me\\AppData\\Roaming\\HdrCast', logs: '' },
       caps: { audioExclude: !mac, clipboardWatch: !mac },

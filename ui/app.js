@@ -393,5 +393,9 @@ boot()
   })
   .finally(() => {
     // started at sign-in: the window stays hidden until it is opened from the notification area
-    if (!state.init?.startHidden) requestAnimationFrame(() => win.show());
+    if (state.init?.startHidden) return;
+    // After the first frame, so there is no white flash. WebKit (macOS) draws no frames for a window that was never
+    // shown (the page counts as hidden), so the frame would never come: there it is shown right away.
+    if (document.visibilityState === 'hidden') win.show();
+    else requestAnimationFrame(() => win.show());
   });

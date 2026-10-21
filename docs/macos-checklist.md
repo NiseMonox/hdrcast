@@ -15,7 +15,8 @@
 
 - [ ] Xcode Command Line Tools：`xcode-select --install`（提供链接器和 SDK）。
 - [ ] Rust 1.85 以上：`curl https://sh.rustup.rs -sSf | sh`，然后 `rustc --version`。
-- [ ] ffmpeg（要带 zscale，Homebrew 的就有）：`brew install ffmpeg`，`ffmpeg -filters | grep zscale` 有输出。
+- [ ] ffmpeg（要带 zscale 和 libsrt）：`brew install ffmpeg-full`（Homebrew 普通的 `ffmpeg` 两样都没有）。它是 keg-only，不在 PATH 里：
+      先 `export PATH="$(brew --prefix ffmpeg-full)/bin:$PATH"`，然后 `ffmpeg -filters | grep zscale` 有输出。
 - [ ] 取到仓库的 `rust-rewrite` 分支，`cd` 到仓库根目录。下文所有命令都在仓库根目录执行。
 - [ ] 命令按 **bash** 写（用到了 `$F` 的自动分词和 `%1` 作业号）；macOS 默认是 zsh，先执行一次 `bash` 再往下做。
 
@@ -331,7 +332,7 @@ macOS 特有的只有下面几处，同样**只做过类型检查**（`cargo che
 ## 12. 构建与启动
 
 ```sh
-brew install ffmpeg mpv
+brew install ffmpeg-full mpv
 cargo install tauri-cli --version "^2" --locked
 ./build.sh --no-test          # 产物：dist/HdrCast.app 和 dmg；或者先 cargo run -p hdrcast 直接跑调试版
 open dist/HdrCast.app
@@ -340,8 +341,10 @@ open dist/HdrCast.app
 - [ ] 构建通过。失败时把 `dist/logs/build.log` 末尾发回来（最可能出问题的是 `app/src/window.rs` 的 macOS 分支和 `app/tauri.conf.json` 的 bundle 配置）。
 - [ ] 窗口：左上角是系统的红黄绿按钮，没有标题文字；侧边栏是半透明的毛玻璃（跟随窗口激活状态）；右上角**没有** Windows 式的最小化 / 关闭按钮；
       拖动侧边栏顶部或内容区顶部能移动窗口。浅色 / 深色跟随系统，**设置 → 外观** 能强制切换（毛玻璃也跟着变）。
-- [ ] 没有自签名 / 公证，第一次打开要在访达里右键 → 打开（或 `xattr -dr com.apple.quarantine dist/HdrCast.app`）。
-- [ ] **设置 → 工具**：ffmpeg、mpv 都显示"已找到"，路径是 `/opt/homebrew/bin/…`（Intel Mac 是 `/usr/local/bin/…`）。
+- [ ] 只有 ad-hoc 签名（`tauri.conf.json` 的 `signingIdentity: "-"`），没有公证：从别处拿到的副本第一次打开要在访达里右键 → 打开
+      （或 `xattr -dr com.apple.quarantine dist/HdrCast.app`）。ad-hoc 签名每次构建都不同，重新构建后录屏、辅助功能授权要重新给。
+- [ ] **设置 → 工具**：ffmpeg、mpv 都显示"已找到"：ffmpeg 是 `/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg`，mpv 是 `/opt/homebrew/bin/mpv`
+      （Intel Mac 是 `/usr/local/…`）。**播放方式** 默认是"ffmpeg 管道 → mpv"（Homebrew 的 mpv 不带 libsrt）。
 - [ ] 设置和日志在 `~/Library/Application Support/HdrCast/`；**设置 → 设置与日志 → 打开文件夹** 用访达打开它。
 - [ ] 没有"防火墙"一栏（那是 Windows 防火墙的）；**开播 → 声音** 里没有"排除程序"。
 

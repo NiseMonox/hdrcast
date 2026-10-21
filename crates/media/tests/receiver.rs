@@ -22,6 +22,8 @@ fn settings(display: DisplayMode) -> ReceiverSettings {
         latency_ms: 1500,
         expected_bitrate_mbps: 60,
         display_mode: display,
+        // mpv opening srt:// itself on every machine (a Mac's default is the pipe, which has tests of its own)
+        frontend: ReceiverFrontend::MpvDirect,
         ..ReceiverSettings::default()
     }
     .normalized()
@@ -933,6 +935,25 @@ mod receiver_settings {
         assert!(s.validate().is_empty());
         assert_eq!(s.clone().normalized(), s);
         assert_eq!(s.hw_dec, HwDecMode::D3d11va); // = the platform's hardware decoder
+    }
+
+    #[test]
+    fn a_mac_plays_through_the_ffmpeg_pipe_by_default() {
+        // Homebrew's mpv cannot open srt:// (no libsrt); its ffmpeg-full can
+        assert_eq!(ReceiverSettings::defaults_for(Platform::MacOs).frontend, ReceiverFrontend::FfmpegPipe);
+        for platform in [Platform::Windows, Platform::Other] {
+            assert_eq!(ReceiverSettings::defaults_for(platform).frontend, ReceiverFrontend::MpvDirect, "{platform:?}");
+        }
+        // and that is the only difference
+        let mac = ReceiverSettings {
+            frontend: ReceiverFrontend::MpvDirect,
+            ..ReceiverSettings::defaults_for(Platform::MacOs)
+        };
+        assert_eq!(mac, ReceiverSettings::defaults_for(Platform::Windows));
+        // a file without the field gets this platform's default; what a file says is kept
+        assert_eq!(ReceiverSettings::from_json("{}"), Some(ReceiverSettings::default()));
+        assert_eq!(ReceiverSettings::from_json(r#"{"frontend":0}"#).unwrap().frontend, ReceiverFrontend::MpvDirect);
+        assert_eq!(ReceiverSettings::from_json(r#"{"frontend":1}"#).unwrap().frontend, ReceiverFrontend::FfmpegPipe);
     }
 
     #[test]

@@ -69,7 +69,8 @@ int_enum! {
     pub enum ReceiverFrontend (fallback = ReceiverFrontend::MpvDirect) {
         /// mpv opens srt:// itself (needs a libsrt-enabled mpv build: shinchiro / zhongfly).
         MpvDirect = 0,
-        /// `ffmpeg -i srt://127.0.0.1:… -c copy -f mpegts pipe:1 | mpv -` (fallback when mpv lacks libsrt).
+        /// `ffmpeg -i srt://127.0.0.1:… -c copy -f mpegts pipe:1 | mpv -` (when mpv lacks libsrt; the default on
+        /// macOS, where Homebrew's mpv does).
         FfmpegPipe = 1,
     }
 }
@@ -117,7 +118,19 @@ pub struct ReceiverSettings {
 }
 
 impl Default for ReceiverSettings {
+    /// [`defaults_for`](Self::defaults_for) the platform this was compiled for.
     fn default() -> Self {
+        Self::defaults_for(Platform::CURRENT)
+    }
+}
+
+impl ReceiverSettings {
+    pub const FILE_NAME: &'static str = "receiver.json";
+    pub const DEFAULT_TONE_MAPPING: &'static str = "bt.2390";
+
+    /// Fresh settings. On macOS mpv is fed through the ffmpeg pipe: Homebrew's mpv has no libsrt (its ffmpeg-full
+    /// has).
+    pub fn defaults_for(platform: Platform) -> Self {
         ReceiverSettings {
             latency_ms: 1500,
             expected_bitrate_mbps: 100,
@@ -127,7 +140,10 @@ impl Default for ReceiverSettings {
             buffer_seconds: 1.5,
             fullscreen: false,
             fullscreen_screen: 0,
-            frontend: ReceiverFrontend::MpvDirect,
+            frontend: match platform {
+                Platform::MacOs => ReceiverFrontend::FfmpegPipe,
+                Platform::Windows | Platform::Other => ReceiverFrontend::MpvDirect,
+            },
             mpv_path: String::new(),
             ffmpeg_path: String::new(),
             auto_catch_up: true,
@@ -135,11 +151,6 @@ impl Default for ReceiverSettings {
             last_host: String::new(),
         }
     }
-}
-
-impl ReceiverSettings {
-    pub const FILE_NAME: &'static str = "receiver.json";
-    pub const DEFAULT_TONE_MAPPING: &'static str = "bt.2390";
 
     /// "Fast" is for watching while controlling the host's PC (remote control); the regions are sized for the
     /// retransmissions their distance from the host needs (design.md §5).

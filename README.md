@@ -52,7 +52,7 @@ sharer's computer. No relay server, no public IPv4 address, no port forwarding t
   Windows Firewall allows HdrCast. The app opens its port on the router by itself (UPnP) while it shares or plays, and
   closes it again when it stops.
 - **ffmpeg** (to share) and **mpv** (to watch), built with SRT support. Windows: both already come in the `tools\` folder of
-  the release. macOS: `brew install ffmpeg mpv`. See [Tools](#tools).
+  the release. macOS: `brew install ffmpeg-full mpv` (Homebrew's plain `ffmpeg` has no SRT). See [Tools](#tools).
 - A GPU that decodes 10-bit HEVC in hardware (NVIDIA GTX 10 series or newer, AMD RX 400 or newer, Intel 7th gen or newer,
   any Apple silicon Mac).
 - Download bandwidth of about 1.3 × the stream's bitrate (a 40 Mbps stream needs about 50 Mbps). Sharing needs one stream's
@@ -64,8 +64,8 @@ sharer's computer. No relay server, no public IPv4 address, no port forwarding t
 
 - **Windows:** unzip `HdrCast-<version>.zip` anywhere and run `HdrCast.exe`. ffmpeg, ffprobe and mpv are already in its
   `tools\` folder. (Friends usually get the zip from whoever runs the group; to make one, see [Building](#building).)
-- **macOS:** drag `HdrCast.app` to Applications, then install the tools: `brew install ffmpeg mpv`. The first time you share,
-  macOS asks for the Screen & System Audio Recording permission.
+- **macOS:** drag `HdrCast.app` to Applications, then install the tools: `brew install ffmpeg-full mpv`. The first time you
+  share, macOS asks for the Screen & System Audio Recording permission.
 
 ### Start or join a group
 
@@ -174,7 +174,7 @@ The panel on the Watch page says what happened. The usual ones:
 | The signaling server cannot be reached | Your internet is down, or the signaling server is. People already watching keep watching. |
 | Picture stutters, then recovers every few seconds | Raise the delay (China: try a custom 4000-5000 ms), or ask for a lower bitrate. |
 | Colours look grey and flat on an HDR display | HDR is off in the system (Windows: `Win + Alt + B`). |
-| mpv says it cannot open `srt://` | Your mpv has no libsrt: use the zhongfly / shinchiro build (get-tools.cmd does) or Homebrew's. |
+| mpv says it cannot open `srt://` | Your mpv has no libsrt: on Windows use the zhongfly / shinchiro build (get-tools.cmd does). Homebrew's mpv has none either: on a Mac keep **Settings → Player input** at **ffmpeg pipe → mpv** (the default there). |
 
 More in [docs/faq.md](docs/faq.md). When you ask a friend for help, send them what **Activity → Copy** gives you:
 passwords and invites are masked in it.
@@ -225,12 +225,16 @@ It cannot read or forge anything (see [Privacy and security](#privacy-and-securi
 
 | Tool | Who needs it | Windows | macOS |
 |---|---|---|---|
-| ffmpeg | whoever shares | in the release's `tools\` (BtbN gpl build, with libsrt and NVENC / AMF / QSV) | `brew install ffmpeg` (with libsrt and VideoToolbox) |
-| mpv | whoever watches | in the release's `tools\` (zhongfly build, with libsrt) | `brew install mpv` |
+| ffmpeg | whoever shares (on a Mac, whoever watches, too) | in the release's `tools\` (BtbN gpl build, with libsrt and NVENC / AMF / QSV) | `brew install ffmpeg-full` (with libsrt and VideoToolbox; the plain `ffmpeg` formula has no libsrt) |
+| mpv | whoever watches | in the release's `tools\` (zhongfly build, with libsrt) | `brew install mpv` (no libsrt: it plays through the ffmpeg pipe, see below) |
 | WebView2 | the app's UI | part of Windows 11; on Windows 10 it normally comes with Edge | not needed (the system's WebKit) |
 
 On Windows, `scripts\get-tools.cmd` downloads or updates ffmpeg and mpv (`sender`, `viewer` or `both`; add `force` to
 download again), and `scripts\check-tools.cmd` checks the encoders and `srt://` support.
+
+On a Mac, HdrCast finds Homebrew's `ffmpeg-full` by itself (it is keg-only, so it is on no PATH) and takes it over a plain
+`ffmpeg`. Homebrew's mpv has no libsrt, so on a Mac **Settings → Player input** is **ffmpeg pipe → mpv** by default:
+ffmpeg-full receives the stream and hands it to mpv.
 
 Settings and logs are in `%APPDATA%\HdrCast\` (macOS: `~/Library/Application Support/HdrCast/`). `group.json` is the same
 file 0.2 used, so an upgrade keeps you in your group. 0.3.1 adds `device.json` (this computer's private device key: never

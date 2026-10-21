@@ -592,7 +592,12 @@ fn receiver_settings_files_are_read_and_normalised_like_the_csharp_did() {
             "{file}: only the C# read it"
         );
 
-        let raw = read.unwrap_or_default();
+        // What `load` gives: the file's settings or the defaults. (Windows: the C# knew no other. A file without
+        // "frontend" gets this platform's player input, which on a Mac is the ffmpeg pipe.)
+        let mut raw = read.unwrap_or_else(|| ReceiverSettings::defaults_for(Platform::Windows));
+        if !file.contains("\"frontend\"") {
+            raw.frontend = ReceiverSettings::defaults_for(Platform::Windows).frontend;
+        }
         let out = if csharp_read { out } else { &csharp_defaults };
         assert_eq!(
             raw.validate(),
