@@ -99,6 +99,10 @@ export function SharePage() {
       ? t('share.subtitleAvailable', { group: s.group.groupName })
       : t('share.subtitle', { group: s.group.groupName });
   const panel = sharing || share.state === 'failed' || (share.problem && share.mode !== 'off');
+  // Reachable, but friends behind routers that change ports cannot get through: say so at the top, not only in
+  // the Firewall row at the bottom of the page.
+  const fw = s.firewall;
+  const firewallCard = share.mode !== 'off' && fw?.applicable && fw.allowed === false && fw.canFix;
 
   return html`
     <div class="page-head">
@@ -111,6 +115,7 @@ export function SharePage() {
     ${panel
       ? html`<${LivePanel} status=${status} group=${s.group} sender=${sender} />`
       : html`<${AvailabilityCard} share=${share} access=${s.access} />`}
+    ${firewallCard && html`<${FirewallCard} />`}
     ${knocks.length > 0 && html`<${Knocks} knocks=${knocks} />`}
     ${(viewers.length > 0 || sharing) && html`<${Viewers} share=${share} />`}
 
@@ -210,7 +215,7 @@ export function SharePage() {
         <${NumberField} value=${sender.uploadMbps} min=${0} max=${100000} onChange=${(v) => set({ uploadMbps: v })} />
         <span class="unit">Mbps</span>
       <//>
-      ${s.firewall?.applicable && html`<${FirewallRow} firewall=${s.firewall} />`}
+      ${fw?.applicable && !firewallCard && html`<${FirewallRow} firewall=${fw} />`}
     <//>
     <div style="height:8px"></div>`;
 }
@@ -222,13 +227,31 @@ function uploadNote(plan, sender) {
   return plan.uploadTooMuch ? base + ' ' + t('share.uploadTooMuch') : base;
 }
 
+/** Runs the elevated Allow (Windows shows its UAC prompt) with `setBusy` true meanwhile. */
+async function allowFirewall(setBusy) {
+  setBusy(true);
+  try { setState({ firewall: await invoke('firewall_allow') }); } catch (e) { toast(String(e), { kind: 'warn' }); }
+  setBusy(false);
+}
+
+/** Near the top of the page while the firewall keeps friends out: the same fix as the Firewall row. */
+function FirewallCard() {
+  const [busy, setBusy] = useState(false);
+  return html`<div class="card avail" style="margin-top:12px">
+    <span class="avail-mark"><${Icon} name="shield" /></span>
+    <div class="who">
+      <div class="pname">${t('share.firewallTitle')}</div>
+      <div class="pmeta">${t('share.firewallSub')}</div>
+    </div>
+    <div class="pactions">
+      <button class="btn tinted" disabled=${busy} onClick=${() => allowFirewall(setBusy)}><${Icon} name="shield" />${t('firewall.allow')}</button>
+    </div>
+  </div>`;
+}
+
 export function FirewallRow({ firewall }) {
   const [busy, setBusy] = useState(false);
-  const allow = async () => {
-    setBusy(true);
-    try { setState({ firewall: await invoke('firewall_allow') }); } catch (e) { toast(String(e), { kind: 'warn' }); }
-    setBusy(false);
-  };
+  const allow = () => allowFirewall(setBusy);
   return html`<${Row} name=${t('firewall.title')} hint=${firewall.text}>
     ${firewall.allowed === true
       ? html`<span class="badge green"><${Icon} name="check" style="width:11px;height:11px" />${t('firewall.open')}</span>`

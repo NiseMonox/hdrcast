@@ -370,6 +370,14 @@ function watchStatus() {
     setState({ firewallOfferedWatching: true });
     openSheet('firewall', { why: t('firewall.whyViewer') });
   }
+  // Others can connect to this computer (available, or live) but Windows Firewall only lets replies in. Going live
+  // used to be the moment to ask; now nobody has to go live, so ask once per run as soon as the computer is
+  // reachable. A new copy in a new folder is a new program to the firewall, so this comes back after an upgrade.
+  const mode = state.status?.share?.mode;
+  if ((mode === 'available' || mode === 'live') && fw?.applicable && fw.allowed === false && fw.canFix && !state.firewallOffered && !state.sheet) {
+    setState({ firewallOffered: true });
+    openSheet('firewall', { why: t('firewall.whyHost') });
+  }
 }
 
 window.addEventListener('contextmenu', (e) => {
