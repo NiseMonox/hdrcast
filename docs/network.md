@@ -206,12 +206,12 @@ bitrate to expect** (100 Mbps by default; larger is safer, it only costs memory)
     renewed every 20 minutes while HdrCast is online, live or watching, and the forward is deleted when it stops; if
     HdrCast crashes, the forward runs out by itself within the hour. In the log these are the `[p2p] router: …` lines.
     UPnP has to be on in the router settings (it is by default on most).
-  - **Windows Firewall**: click **Allow…** when the **Firewall** line offers it (on the **Share** page under
-    **Viewers**, and in **Settings → Network**). After the Windows UAC prompt there is an inbound rule "HdrCast": only
+  - **Windows Firewall**: click **Allow…** when the **Firewall** line offers it (on the **Share** page, at the top
+    while it is missing and under **Viewers** otherwise, and in **Settings → Network**). After the Windows UAC prompt there is an inbound rule "HdrCast": only
     for this exe, only UDP, for every network type (the two rules of 0.2, "HdrCast Sender" and "HdrCast Receiver", can
-    stay). Block rules left over from clicking "Cancel" on a Windows prompt are disabled, not deleted. If the rule is
-    missing when you click **Go Live**, HdrCast asks once; a viewer is asked once too, when an IPv4 attempt failed in a
-    way the rule could help with.
+    stay). Block rules left over from clicking "Cancel" on a Windows prompt are disabled, not deleted. While the rule
+    is missing, HdrCast asks once per run as soon as this computer can be connected to (**Available to connect** on,
+    or **Go Live**); a viewer is asked once too, when an IPv4 attempt failed in a way the rule could help with.
   - The rule is tied to the full path of the exe: a new version in a new folder (say `D:\HdrCast-0.3.1\`) needs another
     click. To undo it: Windows Security → Firewall & network protection → Advanced settings → Inbound Rules, and delete
     the rule.

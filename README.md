@@ -49,8 +49,9 @@ sharer's computer. No relay server, no public IPv4 address, no port forwarding t
   sharer's side is open (next point).
 - **Windows Firewall: one click.** If the **Firewall** line in the app offers **Allow…**, click it once and confirm the
   Windows prompt. Some routers (common in China) give every destination a new port, and a PC only lets such packets in when
-  Windows Firewall allows HdrCast. The app opens its port on the router by itself (UPnP) while it shares or plays, and
-  closes it again when it stops.
+  Windows Firewall allows HdrCast. The rule is tied to the program's path, so every new version unzipped into a new
+  folder needs this click again (the app asks). The app opens its port on the router by itself (UPnP) while it is
+  online or plays, and closes it again when it stops.
 - **ffmpeg** (to share) and **mpv** (to watch), built with SRT support. Windows: both already come in the `tools\` folder of
   the release. macOS: `brew install ffmpeg-full mpv` (Homebrew's plain `ffmpeg` has no SRT). See [Tools](#tools).
 - A GPU that decodes 10-bit HEVC in hardware (NVIDIA GTX 10 series or newer, AMD RX 400 or newer, Intel 7th gen or newer,

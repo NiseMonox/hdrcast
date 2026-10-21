@@ -24,7 +24,7 @@
 
 - **Windows 10 或 11**（64 位），或 **macOS 13** 及以上。在 Mac 上分享 HDR 需要 macOS 15 和 Apple 芯片。
 - **最好有 IPv6**。点对点在 IPv6 上最好用（IPv6 没有 NAT，两台电脑能直接互通）。在 <https://test-ipv6.com> 检查：看到 "10/10"，至少是 "IPv6 address detected" 就行。没有 IPv6？通常可以在路由器里打开，或者请运营商开通。没有 IPv6 时 HdrCast 走 IPv4，只要主播那边是开放的就能连（见下一条）。
-- **Windows 防火墙：点一次**。应用里 **防火墙** 那一行出现 **放行…** 时点一下，并在 Windows 的提示里确认。有些路由器（国内常见）每个目的地换一个端口，这样的包只有在 Windows 防火墙放行 HdrCast 时才进得来。应用在开播或播放时会自己在路由器上打开端口（UPnP），停下后再关掉。
+- **Windows 防火墙：点一次**。应用里 **防火墙** 那一行出现 **放行…** 时点一下，并在 Windows 的提示里确认。有些路由器（国内常见）每个目的地换一个端口，这样的包只有在 Windows 防火墙放行 HdrCast 时才进得来。这条规则认的是程序所在的路径，所以每次把新版本解压到新文件夹，都要再点一次（应用会问）。应用在线或播放时会自己在路由器上打开端口（UPnP），停下后再关掉。
 - **ffmpeg**（开播用）和 **mpv**（观看用），都要带 SRT 支持。Windows：发行包的 `tools\` 里已经带了。macOS：`brew install ffmpeg-full mpv`（Homebrew 普通的 `ffmpeg` 不带 SRT）。见 [工具](#工具)。
 - 能硬解 10 bit HEVC 的显卡（NVIDIA GTX 10 系及以上、AMD RX 400 及以上、Intel 7 代及以上、任何 Apple 芯片的 Mac）。
 - 下行带宽约为码率的 1.3 倍（40 Mbps 的流要 50 Mbps 左右）。开播的人每位观众要占一路上行（见 [开播](#开播)）。
