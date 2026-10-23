@@ -1431,7 +1431,7 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "hdrcast"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "arboard",
  "chrono",
@@ -1452,7 +1452,7 @@ dependencies = [
 
 [[package]]
 name = "hdrcast-capture"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "block2",
  "dispatch2",
@@ -1474,7 +1474,7 @@ dependencies = [
 
 [[package]]
 name = "hdrcast-control"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "chacha20poly1305",
  "core-foundation",
@@ -1484,7 +1484,7 @@ dependencies = [
 
 [[package]]
 name = "hdrcast-core"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "ed25519-dalek",
  "getrandom 0.4.3",
@@ -1503,7 +1503,7 @@ dependencies = [
 
 [[package]]
 name = "hdrcast-media"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "hdrcast-capture",
  "hdrcast-core",
@@ -1514,9 +1514,10 @@ dependencies = [
 
 [[package]]
 name = "hdrcast-p2p"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "hdrcast-core",
+ "hdrcast-media",
  "libc",
  "serde_json",
  "socket2",

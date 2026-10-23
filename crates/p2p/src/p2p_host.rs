@@ -23,6 +23,7 @@ use hdrcast_core::{endpoint, GroupConfig, GroupKeys, LiveRecord, ProcessJob, Sig
 use crate::cancel::CancelToken;
 use crate::echo_protocol;
 use crate::host_link::{HostLink, HostSessionInfo, HostSideHandler};
+use crate::srt_monitor::SrtStats;
 use crate::link_base::{LinkAddresses, SOURCE_ECHO, SOURCE_ROUTER};
 use crate::p2p_diagnostics;
 use crate::peer_session::LinkState;
@@ -134,6 +135,11 @@ pub struct ViewerInfo {
     pub viewer_id: String,
     /// The viewer's device key, when its join was signed (docs/design.md §8.10).
     pub device_key: Option<String>,
+    /// What the SRT packets on the viewer's path say about it (docs/design.md §8.11); `None` before it has a path.
+    pub srt: Option<SrtStats>,
+    /// Times this viewer's remux child fell so far behind that its queue in the fan-out was emptied (half a
+    /// second of the stream each time, before SRT ever saw it).
+    pub queue_clears: u32,
 }
 
 pub struct P2pHost {
@@ -514,7 +520,16 @@ impl Inner {
 
     fn viewers(&self) -> Vec<ViewerInfo> {
         let viewers: Vec<Arc<Viewer>> = lock(&self.state).viewers.values().cloned().collect();
-        let mut list: Vec<ViewerInfo> = viewers.iter().filter(|v| !v.ended.load(Ordering::Acquire)).map(|v| lock(&v.info).clone()).collect();
+        let link = self.link.get();
+        let mut list: Vec<ViewerInfo> = viewers
+            .iter()
+            .filter(|v| !v.ended.load(Ordering::Acquire))
+            .map(|v| ViewerInfo {
+                srt: link.and_then(|link| link.srt_stats(&v.sid)),
+                queue_clears: self.fan.get().and_then(|fan| fan.stats(&v.sid)).map_or(0, |(_, clears)| clears),
+                ..lock(&v.info).clone()
+            })
+            .collect();
         list.sort_by_key(|v| v.joined_utc);
         list
     }
@@ -790,6 +805,8 @@ impl Inner {
                 wants_control: join.remote_control,
                 viewer_id: join.viewer_id.clone(),
                 device_key: device.as_ref().map(|d| d.key.clone()),
+                srt: None,
+                queue_clears: 0,
             }),
             child: Mutex::new(ChildSlot::default()),
             ended: AtomicBool::new(false),

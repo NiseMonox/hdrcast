@@ -26,6 +26,7 @@ use serde_json::{json, Value};
 use crate::access::{AccessSettings, Connect, Control};
 use crate::commands;
 use crate::control_host::ControlHub;
+use crate::net_report::{self, End, NetReport};
 use crate::sender_runner::{self, RunnerState, SendPlan, SenderRunner};
 use crate::state::{self, AppState, Inner};
 
@@ -106,6 +107,8 @@ struct Session {
     problem: Mutex<Option<String>>,
     /// Viewers whose request for control the user has been told about.
     control_asks: Mutex<HashSet<String>>,
+    /// Each viewer's network report in the log (by session id).
+    net_reports: Mutex<HashMap<String, NetReport>>,
 }
 
 #[derive(Default)]
@@ -252,6 +255,7 @@ fn start_hosting(app: &Arc<AppState>) -> Result<Arc<Session>, Vec<String>> {
             starting: Mutex::new(()),
             problem: Mutex::new(None),
             control_asks: Mutex::new(HashSet::new()),
+            net_reports: Mutex::new(HashMap::new()),
         }
     });
     let hub = session.hub.clone();
@@ -628,6 +632,21 @@ pub fn housekeeping(app: &Arc<AppState>) {
     }
     session.recent_no.lock().unwrap().retain(|_, at| at.elapsed() < RECENTLY_REFUSED);
     session.disconnected.lock().unwrap().retain(|_, at| at.elapsed() < DISCONNECTED_FOR);
+    {
+        let mut reports = session.net_reports.lock().unwrap();
+        reports.retain(|sid, _| sids.contains(sid));
+        for viewer in &viewers {
+            let report = reports.entry(viewer.sid.clone()).or_insert_with(|| NetReport::new(End::Host));
+            let flowing = viewer.srt.as_ref().is_some_and(|s| s.total.sent > 0);
+            if let Some(line) = report.queue_line(viewer.queue_clears, flowing) {
+                app.log(&format!("[net] {}: {line}", viewer.name));
+            }
+            let Some(stats) = &viewer.srt else { continue };
+            if let Some(line) = report.line(stats) {
+                app.log(&format!("[net] {}, {line}", viewer.name));
+            }
+        }
+    }
 
     let expired: Vec<Knock> = {
         let mut knocks = session.knocks.lock().unwrap();
@@ -717,6 +736,7 @@ pub fn status(app: &AppState) -> Value {
                 "rttMs": v.rtt_ms,
                 "latencyMs": v.latency_ms,
                 "overheadPercent": v.overhead_percent,
+                "net": v.srt.as_ref().map(|s| net_report::status(s, End::Host)),
                 "control": session.hub.state_of(&v.sid),
             })
         })

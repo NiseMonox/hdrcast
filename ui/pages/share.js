@@ -391,7 +391,9 @@ function Viewers({ share }) {
                 ${v.state === 'watching'
                   ? html`<span class=${'badge ' + (v.ipv6 ? 'blue' : '')}>${v.ipv6 ? 'IPv6' : 'IPv4'}</span>
                       ${v.rttMs >= 0 && html`<span>${t('share.ping', { ms: Math.round(v.rttMs) })}</span>`}
-                      <span>· ${t('share.srtLatency', { s: (v.latencyMs / 1000).toFixed(1).replace(/\.0$/, '') })}</span>`
+                      <span>· ${t('share.srtLatency', { s: (v.latencyMs / 1000).toFixed(1).replace(/\.0$/, '') })}</span>
+                      ${v.net?.lossPercent >= 0.05 && html`<span>· ${t('share.loss', { p: v.net.lossPercent.toFixed(1) })}</span>`}
+                      ${v.net?.lostForGood > 0 && html`<span>· ${t('share.lostForGood', { n: v.net.lostForGood })}</span>`}`
                   : html`<span class="spinner"></span><span>${t('share.connecting')}</span>`}
                 ${v.control === 'granted' && html`<span class="badge orange"><${Icon} name="cursor" style="width:11px;height:11px" />${t('control.active')}</span>`}
               </div>

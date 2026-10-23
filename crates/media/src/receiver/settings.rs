@@ -66,11 +66,17 @@ impl HwDecMode {
 }
 
 int_enum! {
-    pub enum ReceiverFrontend (fallback = ReceiverFrontend::MpvDirect) {
-        /// mpv opens srt:// itself (needs a libsrt-enabled mpv build: shinchiro / zhongfly).
-        MpvDirect = 0,
-        /// `ffmpeg -i srt://127.0.0.1:… -c copy -f mpegts pipe:1 | mpv -` (fallback when mpv lacks libsrt).
+    /// How the stream reaches mpv. The numbers are what receiver.json stores.
+    pub enum ReceiverFrontend (fallback = ReceiverFrontend::Auto) {
+        /// The ffmpeg pipe when ffmpeg is there, mpv direct otherwise. 0 meant "mpv direct" up to 0.3.1, where it
+        /// was the default: the settings of earlier viewers get the guard this way.
+        Auto = 0,
+        /// `ffmpeg -f data -i srt://127.0.0.1:… pipe:1`, through HdrCast's guard (docs/design.md §3.2) into
+        /// `mpv -`: pictures damaged in transport never reach the screen. mpv needs no libsrt for it.
         FfmpegPipe = 1,
+        /// mpv opens srt:// itself (needs a libsrt-enabled mpv build: shinchiro / zhongfly) and shows a picture
+        /// damaged in transport the way the decoder makes it.
+        MpvDirect = 2,
     }
 }
 
@@ -127,7 +133,7 @@ impl Default for ReceiverSettings {
             buffer_seconds: 1.5,
             fullscreen: false,
             fullscreen_screen: 0,
-            frontend: ReceiverFrontend::MpvDirect,
+            frontend: ReceiverFrontend::Auto,
             mpv_path: String::new(),
             ffmpeg_path: String::new(),
             auto_catch_up: true,

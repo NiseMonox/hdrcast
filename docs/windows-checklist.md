@@ -186,9 +186,23 @@ shader 里 90° 与 270° 的映射（`desk_to_src`）互为逆运算，DXGI 文
 ## 11. 出问题时看哪里
 
 - 日志：应用里的 **日志** 页（**复制** 得到的内容已打码，可以直接发人），文件在 `%APPDATA%\HdrCast\logs\hdrcast-yyyyMMdd.log`。
-  `[p2p]` 开头的行是打洞与信令，`[remux 名字]` 是那位观众的 ffmpeg，`[capture]` 是采集引擎，`[mpv]` / `[ipc]` 是播放器，`[control]` 是远程控制。
+  `[p2p]` 开头的行是打洞与信令，`[remux 名字]` 是那位观众的 ffmpeg，`[capture]` 是采集引擎，`[mpv]` / `[ipc]` 是播放器，`[control]` 是远程控制，
+  `[net]` 是线路丢包统计（0.3.2，两端都有），`[guard]` 是观众端拦下受损画面的记录（0.3.2）。
 - 配置：`%APPDATA%\HdrCast\sender.json`、`receiver.json`、`app.json`（删掉即恢复默认）、`group.json`（组和密钥，删掉即退出组）。
 - 连不上：先看观看页面板的原话，对照 `docs/network.zh-CN.md` §1.2；画面卡顿 / 断线的排查顺序见 `docs/faq.zh-CN.md`。
+
+## 12. 丢包时画面定格、线路统计（0.3.2）
+
+主播和中国的朋友都装 0.3.2。单机回环（2026-10-23）已经核对过：旧的 `sender.json`（2 s / 2 s、没有 `settingsVersion`）读入后编码器参数是 `-bufsize 10000k -g 60`（40 Mbps、60 fps），
+remux 子进程的 `inputbw=5465531`，观众走 `ffmpeg -f data` → 守卫 → mpv，d3d11va 硬解、HDR 直通。没有真实跨境线路，下面这些要和朋友一起看：
+
+- [ ] 主播日志里 `[run]` 的 ffmpeg 命令行有 `-bufsize` = 码率的四分之一、`-g` = 帧率（关键帧 1 s）。
+- [ ] 观众日志里有 `[app] ffmpeg receives the stream and HdrCast passes it on to mpv`；**设置 → 播放方式** 是 **自动（有 ffmpeg 就用）**。
+- [ ] 看 15 s 后两边日志各有一行 `[net]`；之后丢包时每 30 s 一行。记下高峰时段（晚上）的 `lost on the way` 和观众那行的 `never recovered in time`。
+- [ ] 线路丢包时观众的画面**停住**（最多约 1 s），然后从关键帧继续，**不再出现满屏色块**；声音不断。观看页显示"传输丢失 n 次 · 已拦下 n 帧受损画面 · 定格 n 次"，
+      日志有 `[guard]` 行。主播 **开播** 页这位观众的一行显示"途中丢包 x %"。
+- [ ] 经常定格时：观众把延迟改成 **中国**（3.5 s）或自定义加 500～1000 ms，看 `never recovered` 是否降到 0；还多就降码率（比如 40 → 25 Mbps）再看。
+- [ ] 把观众的播放方式改成 **mpv 直接播放** 对比：丢包时又出现色块（守卫只在 ffmpeg 管道里起作用）。
 
 ## 单机回环（不碰真实群组、路由器和朋友）
 

@@ -19,6 +19,10 @@
 - v0.3.1（2026-10）：接近 Parsec 的用法。**被控端不用手动开播**：应用开着就以"在线"出现在组里，别人点"连接"并被放行后才开始采集，
   最后一个人离开后自动停（§8.10）。**权限按电脑授予**：每台电脑有自己的设备密钥，主播给每台电脑定"能不能直接看、能不能控制"，
   例如自己的笔记本连上即可控制、朋友只能看（§8.10、§9）。协议仍是 v1，新字段都是可选的。
+- v0.3.2（2026-10）：**丢包不再花屏**。中国观众看日本主播时，传输中丢掉的数据让画面糊成色块，一直到下一个关键帧。
+  现在观众端的守卫（§3.2）让画面停在最后一帧完好的画面上，等到关键帧再继续（Moonlight 的做法）；主播端把编码器的码率缓冲从 2 s 降到
+  0.25 s、关键帧间隔从 2 s 降到 1 s，并按线上的真实码率告诉 SRT（§2.5、§2.6），丢包本身也少了；两端都从 SRT 的包头读出丢包、重发、
+  补发不及和往返时间，写进日志、显示在界面上（§8.11）。线上协议不变。
 
 ## 1. 架构
 
@@ -172,6 +176,25 @@ ffmpeg -hide_banner -loglevel warning -nostdin -stats_period 1 -progress pipe:2
 - stdout（`pipe:1`）是 MPEG-TS 本身，进 P2P 分发（§8.8）；`-progress pipe:2` 的 `key=value` 行（fps、bitrate、speed、frame、drop_frames、
   dup_frames、out_time_us）和日志共用 stderr，按行的形状区分后给 GUI 显示。
 - 默认编码器：`hevc_nvenc`，`-profile:v main10`（HDR）/ `main`（SDR）。备选按探测结果：`hevc_amf`、`hevc_qsv`、`libx265`。
+- **关键帧间隔**默认 1 s（`-g` = fps × `gopSeconds`；0.2 / 0.3.1 是 2 s）：传输中丢掉的数据让观众的画面停到下一个关键帧（§3.2），
+  1 s 让这段时间减半，代价是多大约 3 % 码率。Moonlight 用无限 GOP、丢包时向主播要 IDR；ffmpeg 命令行没有运行中要关键帧的办法，
+  所以这里只能缩短间隔（要做到按需 IDR 得在进程内驱动编码器，见 §3.2 末尾）。
+- **码率缓冲**（VBV，`-bufsize` = 码率 × `bufferSeconds`）默认 0.25 s（0.2 / 0.3.1 是 2 s，界面上没有这一项）。它决定 CBR 下复杂画面能超出码率多少，
+  而 SRT 给每位观众最多按 `inputbw × (1 + oheadbw)` 发（§2.6，重发也算在里面）：超出的部分在 SRT 的发送队列里排队，而 SRT 的期限从**采集时刻**算起，
+  排队用掉的正是丢包重发的时间，排得太久的包到观众那里已经过期。实测（2026-10-23，NVENC p5 CBR 40 Mbps，静止和满屏噪点每 3 s 交替，
+  按 SRT 的节流模拟发送队列，oheadbw 25 %）：
+
+  | `bufferSeconds` | 最忙的一秒 | 发送前最多排队 | PSNR |
+  |---|---|---|---|
+  | 2（旧默认） | 82 Mbps | 860 ms | 27.05 dB |
+  | 1 | 70 Mbps | 600 ms | 27.03 dB |
+  | 0.5 | 56 Mbps | 265 ms | 27.01 dB |
+  | **0.25** | 46 Mbps | 110 ms | 27.00 dB |
+
+  2 s 时平均码率也冒到 45 Mbps（设的是 40）。朋友试过的 800 ms / 1000 ms 延迟下，排队 860 ms 的包第一次发出就已经晚了。Sunshine 用一帧的 VBV（超低延迟），
+  这里是缓冲直播，0.25 s 足够平稳，画质几乎不变。
+- **旧设置文件**：`sender.json` 没有 `settingsVersion`（0.3.2 之前写的）时，`SenderSettings::load` 把还是旧默认值的 `gopSeconds` 2 和 `bufferSeconds` 2
+  换成新默认值，一次（之后文件里写 `"settingsVersion": 1`，再选 2 s 就是用户的选择）。`bufferSeconds` 的下限从 0.5 改成 0.25。
 - 输出像素格式按编码器显式指定：硬件编码器吃 `p010le` / `nv12`（即采集引擎的原生输出），libx265 只收平面格式，必须写 `yuv420p10le` / `yuv420p`，否则 ffmpeg 可能协商成 8 bit，HDR 精度悄悄丢失。
 - **libx265 的坑（本机实测 7.1.5）**：ffmpeg 的 libx265 封装只把 `-colorspace` 和 `-color_range` 传给 x265，`-color_primaries` 与 `-color_trc` **不会**进 VUI（ffprobe 读回是 `unknown`）。必须在 `-x265-params` 里写 `colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:range=limited`，否则观众端拿到的是无标记流，会按 SDR 显示。
 - 编码器探测：启动时运行 `ffmpeg -hide_banner -encoders`，再对候选编码器做 1 帧 `-f lavfi -i nullsrc ... -f null -` 试编码判断可用。
@@ -186,6 +209,11 @@ ffmpeg -hide_banner -loglevel warning -nostdin -stats_period 1 -progress pipe:2
 | 观众端：mpv | `srt://127.0.0.1:<L>?mode=caller&passphrase=<组派生>&pbkeylen=32&pkt_size=1316&transtype=live&latency=<地区预设>&rcvbuf=..&ffs=..&recv_buffer_size=8000000&connect_timeout=5000` |
 
 - 缓冲大小公式：`packets = latency_s × bitrate_bps / (1316×8)`；`ffs ≥ packets`，`sndbuf/rcvbuf ≥ packets × 1472`（`SrtBufferSizing`）。
+- `inputbw` 是**线上码率**（0.3.2 起，`RemuxChild::wire_bps`）：`视频码率 × 1.05 × 1360/1316 + 320 kbit/s`，即 MPEG-TS 封装和 CBR 的超出
+  （NVENC 实测：40 Mbps 的视频封装成 TS 后是 41.2 Mbps（缓冲 0.25 s）到 42.8 Mbps（缓冲 2 s），取 5 %）、每个 1316 字节载荷上
+  44 字节的 SRT / UDP / IP 头（SRT 节流时连头一起算），再加上声音。
+  0.3.1 之前只告诉 SRT 视频码率，`oheadbw` 25 % 里实际只剩不到一半留给重发。`maxbw=0` + 固定 `inputbw` 比让 SRT 自己测输入码率（`inputbw=0`）好：
+  桌面静止时 NVENC 的输出很低，测出的码率跟着变低，画面一动起来就被限在很低的速率上；`mininputbw` 能防这个，但 ffmpeg 的 `srt://` 不支持这个选项。
 - listener 只能绑具体地址：libsrt 绑 `[::]` 必须显式设 SRTO_IPV6ONLY，而 ffmpeg 没有这个选项（实测 "Operation not supported"）。这里只绑 127.0.0.1，不受影响。
 - 不用 ffmpeg 的 `mode=rendezvous`（它会 bind 到远端地址）；打洞由 HdrCast 自己做。
 
@@ -274,10 +302,48 @@ mpv --vo=gpu-next --gpu-api=d3d11 --hwdec=d3d11va
 - mpv 只在打洞路径建好后启动；之后路径断了由 ViewerSession 在同一个本地端口上重新加入，mpv 每 3 s 自己重连。
 - HDR 直通只在 `--wid` 嵌入或独立窗口下都以「窗口化 HDR」工作，静态元数据只在全屏时下发 → 提供全屏按钮（`--fs`，不用 `--d3d11-exclusive-fs`）。
 - **不嵌入 libmpv**，独立启动 mpv.exe；用 JSON IPC 命名管道读 `demuxer-cache-duration`、`frame-drop-count`、`video-params`、`video-target-params`、`hwdec-current`、`estimated-vf-fps`、`paused-for-cache` 显示状态。
-- 兜底：「用 ffmpeg 拉流」模式 = `ffmpeg -i srt://127.0.0.1:<L>?... -c copy -f mpegts - | mpv -`（万一 mpv 构建没带 libsrt）。
+- **播放方式**（`receiver.json` 的 `frontend`，0.3.2 起）：0 **自动**（默认）= 找得到 ffmpeg 就走 ffmpeg 管道，否则 mpv 直接播放；
+  1 **ffmpeg → HdrCast → mpv** = `ffmpeg -f data -i srt://127.0.0.1:<L>?... -map 0 -c copy -f data -flush_packets 1 pipe:1`，
+  stdout 经过守卫（§3.2）进 `mpv -`（`-f data` 进出：不解复用也不重新封装，SRT 的载荷原样交出来，守卫才看得到原来的连续计数器和时间戳；
+  mpv 也不需要带 libsrt）；2 **mpv 直接播放** = mpv 自己打开 `srt://`，传输中受损的画面照样显示。0 在 0.3.1 之前表示"mpv 直接播放"（当时的默认值），
+  所以旧的设置文件都自动用上守卫。
 - mpv 路径：同目录 `mpv.exe` / `tools\mpv.exe` / PATH；缺失时提示下载 shinchiro 或 zhongfly 构建（均带 libsrt）。macOS 见 §10。
 - 远程控制开着时，应用另外观察 mpv 的 `mouse-pos` 和 `osd-dimensions`，并让 mpv 把按键转给自己（§9）。
 - 配置：`%APPDATA%\HdrCast\receiver.json`。
+
+### 3.2 画面守卫：不让受损的画面上屏（0.3.2 起）
+
+**问题**。SRT 在延迟窗口内重发丢掉的包；窗口过了还没补上的，接收端跳过去，流里就少了 7 个 TS 包。HEVC 解码器察觉不到：受损的那一帧照样解出来，
+后面所有参考它的帧（到下一个关键帧为止）都跟着花，mpv 全都显示出来——2026-10-23 中国朋友看到的大片色块就是这个。
+FFmpeg 的 HEVC 解码器把带 `AV_PKT_FLAG_CORRUPT` 的包当完好的解（libavcodec/hevc 不看这个标志），mpv 也不看。
+Moonlight 的做法是：一帧不完整就丢掉，之后的帧也全丢，直到收到关键帧（它还会马上向主播要 IDR）。
+
+**做法**（`crates/media/src/receiver/ts_guard.rs`，`TsGuard`）。播放方式为 ffmpeg 管道时（§3.1，默认），ffmpeg 把 SRT 的载荷原样交出来，
+`mpv_runner` 把它经过守卫写进 mpv 的 stdin：
+
+- 读 PAT / PMT 找到 HEVC 视频（stream_type 0x24；别的编码原样放过），按 PID 检查**连续计数器**；视频的每个 PES（一帧）先扣住，下一帧开始时再决定。
+  再用**解码时间戳**检查整帧丢失（相邻两帧的 DTS 差超过 1.5 帧；计数器正好差 16 的倍数时只有它看得出来）。
+- 完好的帧照原样放行。受损的帧，以及受损的**参考帧**之后、下一个关键帧之前的所有帧：把它们的 slice 的 NAL 类型改成 **RASL_N**，
+  并把缺口之后的起始码破坏掉（`00 00 01` → `00 00 03`，后面的字节留在前一个 slice 里，不会被读）。解码器读完一个完好的 slice 头就跳过整帧：
+  IDR 之后的 RASL 帧按标准就是不输出的。时间戳都还在，所以 mpv 看到的是一路正常的流，只是有些帧不出图像，画面停在最后一帧完好的画面上，声音照常。
+  **不能直接把帧拿掉**：实测 mpv 发现视频队列空了就暂停声音缓冲（"Enter buffering"），拿掉 2 s 的帧就卡 0.5 s。
+- 受损的帧没有完好的 slice 头（缺口在它前 128 字节以内），或受损的是关键帧本身：整帧拿掉（只空一帧，没关系）。
+  只有不被参考的帧（NAL 类型为偶数的 TRAIL_N 等，NVENC 的 P B B 里每三帧一个）受损时，只藏这一帧，画面不停。
+- 第一个完好的关键帧结束停帧。恢复点是 CRA 时改成 BLA_W_LP，它的前导帧（参考了丢掉的帧）也被跳过；流开头第一个关键帧之前的帧都不放行
+  （观众中途加入时本来就看不到）。上一个关键帧是流中间没改过的 CRA 时（开放 GOP，libx265 默认），解码器会解 RASL 帧，改类型藏不住，
+  这时受损的帧整帧拿掉。
+- 视频 PID 的连续计数器在输出里重新编号，mpv 不会再报 "Packet corrupt"。音频和表照原样立即放行（视频最多晚一帧，按时间戳播放没有影响）。
+- 日志：第一次停帧时写一行 `[guard] part of the stream was lost on the way: …`，之后最多每 10 s 一行汇总（停了几次、一共多久、拦下多少帧）。
+  观看页上显示"传输丢失 n 次 · 已拦下 n 帧受损画面 · 定格 n 次"，停帧时显示正在等关键帧。
+
+**验证**（`crates/p2p/tests/lossy_path_tests.rs`，真 libx265 + libsrt 走真的 HostLink / ViewerLink）：观众这边把 1/150 的首发数据包连同它们的所有重发都丢掉，
+每一个都补不回来。照原样解码：282 帧里 131 帧是编码器从没产生过的（花屏）；经过守卫：149 帧，每一帧都和编码器的输出逐位相同，停帧 4 次。
+对照：只给解码器加 `fflags=+discardcorrupt`（扔掉带损坏标志的包，靠 FFmpeg ≥ 8.0 的"参考帧缺失就不输出"）仍有 31 帧花屏（FFmpeg 9.0.2），
+旧版 FFmpeg 更糟（缺失的参考帧用灰色补），所以"mpv 直接播放"保持原样，不加这个选项。mpv 在 d3d11va 硬解下播放经过守卫的流：不缓冲、不报错、不退回软解。
+
+**局限**：缺口内视频包正好 16 的倍数、又没丢整帧时看不出来（极少）；停帧最长一个关键帧间隔。Moonlight 能在约一个 RTT 内恢复，是因为它向主播要 IDR
+（或用 NVENC 的参考帧失效 RFI）；ffmpeg 命令行在运行中没有办法强制 IDR（`-force_key_frames` 只能事先定好），要做到这一点得在进程内驱动编码器
+（libavcodec 或 NVENC SDK），观众经旁路通道（§8.9）告诉主播哪里丢了。
 
 ## 4. 信令服务器（signal/）
 
@@ -322,6 +388,9 @@ Cargo workspace（Rust 1.85+，edition 2021）。全部用普通线程和阻塞 
   - 协议 golden 向量（`tests/vectors/group-v1.json`，Python 测试也读它）；与 **C# 0.2.4 的真实输出**逐字节对照（core：1359 个刁钻输入；
     media：946 个向量，覆盖全部编码器参数表、ffmpeg / mpv 命令行、设置文件）；`group.json` 经真实的 .NET `DataContractJsonSerializer` 往返。
   - 打洞（模拟有状态防火墙、对称型 NAT 两个方向）、假路由器上的 UPnP、真 Python 信令服务器上的全栈（真 libx265 HDR10 编码 + P2pHost + 两个 ViewerSession + ffprobe）。
+  - 丢包的整条路径（0.3.2）：真 libx265 + remux 子进程 + HostLink / ViewerLink + 以 `-f data` 收流的 ffmpeg，观众这边丢掉一部分首发包和它们的全部重发；
+    两端的 `SrtMonitor` 数到的丢失与实际一致，经过守卫解出的每一帧都与编码器的输出逐位相同（§3.2）。守卫本身另有单元测试（构造的 TS：参考帧 / 非参考帧 /
+    关键帧受损、整帧丢失而计数器不变、中途加入、CRA 改 BLA、重复包、失步）。
   - 把发行版 0.2.4 的 exe 加载起来与 Rust 版**互相观看**（两个方向都出 HEVC Main10 / PQ 画面）。
   - 每一组生成的编码器参数都让真 ffmpeg 编一次；mpv 的每个选项名和取值都问过真 mpv。
   - 采集引擎：假后端上的主循环契约；真显示器上的 `list-outputs` / selftest / P010 与 NV12 落盘，与 0.2.4 的 exe 对比。
@@ -473,10 +542,16 @@ mac   = b64u(HMAC-SHA256(serverKey, METHOD + "\n" + PATH_AND_QUERY + "\n" + ts +
 喂给每个观众自己的 remux 子进程：
 
 ```
-ffmpeg -hide_banner -loglevel warning -probesize 65536 -analyzeduration 500000 -f mpegts -i pipe:0
+ffmpeg -hide_banner -loglevel warning -probesize 2000000 -analyzeduration 500000 -fflags +discardcorrupt -f mpegts -i pipe:0
        -map 0 -c copy -f mpegts -mpegts_flags +resend_headers -muxdelay 0 -muxpreload 0
        "srt://127.0.0.1:<Y>?mode=listener&passphrase=…&pbkeylen=32&latency=<观众要求>&maxbw=0&inputbw=…&oheadbw=<观众要求>&…"
 ```
+
+- `-probesize 2000000`（0.3.2 起，原 65536）：子进程从流中间开始读，探测时必须看到一个 PMT（每 0.1 s 一个），2 MB 在 160 Mbps 以内都够，
+  0.5 s 的 `analyzeduration` 照样封顶。64 KB 时，在两个 PMT 之间启动的子进程认不出音频是什么，报 "Cannot map stream #0:1" 退出：
+  40 Mbps 下 30 次中途启动失败 13 次（2026-10-23 真实日志里中国朋友的一次加入就是这样），2 MB 时 0 次。
+- `-fflags +discardcorrupt`（0.3.2 起）：分发器队列溢出时被截断的画面在这里扔掉。重新封装后连续计数器是新的，观众端的守卫（§3.2）看不出它残缺，
+  只能从之后的时间戳空缺发现丢了帧，那时这一帧已经上屏。
 
 `HostLink` 为每个会话开一个 `127.0.0.1` 本地 socket 连到 `<Y>`，在 WAN 与子进程之间原样搬运数据报。
 观众端 `ViewerLink` 在 `127.0.0.1:<L>` 上等 mpv（`srt://127.0.0.1:<L>`，caller），搬到主播的已确认地址。
@@ -578,6 +653,25 @@ answer: "hdrcast/v1/answer-device" gid  sid  t  ok(true|false)  reason  cands  �
   （第一轮 15 s 可能已经用完）。旧主播照旧等 20 s。
 - 最后一个观众离开 20 s 后停止采集和编码（开播期间不停）；"全部断开" / "停止"会断开所有观众，各自一分钟内不能重连。
 - 码率、人数上限、ffmpeg 路径可以在运行中改（`P2pHost::set_stream` / `set_ffmpeg_path`，设置一变就生效），`announce_now` 让下一次心跳马上发出。
+
+### 8.11 SRT 链路统计（0.3.2 起）
+
+两端的转发器（`HostLink`、`ViewerLink`）把经过的每个 SRT 包交给 `SrtMonitor`（`crates/p2p/src/srt_monitor.rs`）。SRT 只加密载荷，16 字节的包头是明文，
+读包头不改动任何字节、也不需要密钥：
+
+- 数据包：序号（31 位，回绕）；序号落在已见最大序号之后是首发，否则是重发（旧版本不设 R 位，所以不靠它）。
+- ACK（类型 2）：下一个期望的序号、RTT 和它的方差（µs）、空闲缓冲、接收速率（包/s）、链路容量估计（包/s）、接收速率（字节/s）；轻 ACK 只有第一项。
+- NAK（类型 3）：丢失的序号，区间写成 `first | 0x80000000, last`。DROPREQ（类型 7）：发送端放弃的首尾序号。握手（类型 0）：新连接，序号重新开始。
+
+统计（各自去重，按序号记在 2^17 位的窗口里）：首发、重发、接收端报告丢失、发送端放弃（来不及重发）、**补不回来**（接收端的 ACK 越过了一个从没到过的序号：
+只有观众端看得到，就是让画面受损的那些）、RTT、链路容量估计；最近约 10 s 另算一份。ACK 里的接收速率是最近几个包的突发速率，不是流的码率，不拿来显示。
+
+- 主播：每位观众一份。**开播** 页"正在观看"的每一行显示"途中丢包 x %"和"n 个包来不及补发"；日志里开始 15 s 后写一行，之后丢包时每 30 s 一行：
+  `[net] <名字>, last 30 s: 43.6 Mbps sent, 2.10% lost on the way, 2.31% sent again, 0 too late to send again; round trip 92 ms; …`。
+  分发器给这位观众的队列被清空时（它的 remux 子进程跟不上，半秒的流在发出前就丢了）也写一行。
+- 观众：**观看** 页码率一格下面显示"丢包 x %"；日志同样格式：`[net] last 30 s: … Mbps arrived, …% lost on the way, n never recovered in time; …`。
+- 这些数字是排查"画面花了 / 卡了"的依据：丢包率高而补不回来的少 → 延迟够；补不回来的多 → 加延迟或降码率；主播端"来不及重发"多 → 主播上行或码率的问题。
+  `lossy_path_tests` 用真 libsrt 核对：两端数到的丢失与实际丢掉的包数一致，观众端"补不回来"的数目也一致。
 
 ## 9. 远程控制（0.3.0 起）
 

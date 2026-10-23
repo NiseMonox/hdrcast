@@ -22,9 +22,9 @@ const db = {
   ui: { language: q.get('lang') || 'auto', theme: q.get('theme') || 'auto' },
   sender: {
     outputIndex: 0, outputDeviceName: '\\\\.\\DISPLAY1', outputFriendlyName: 'AW3225QF', fps: 60, scale: 0, hdrMode: 0, cursor: true,
-    sdrWhite: 80, encoder: 0, quality: 1, bitrateMbps: 40, gopSeconds: 2, bufferSeconds: 2, bFrames: true, lookahead: true,
+    sdrWhite: 80, encoder: 0, quality: 1, bitrateMbps: 40, gopSeconds: 1, bufferSeconds: 0.25, bFrames: true, lookahead: true,
     audio: true, audioDevice: 'default', audioCodec: 1, audioBitrateKbps: 192, audioExcludeApp: '', maxViewers: 4, uploadMbps: 0,
-    ffmpegPath: '',
+    ffmpegPath: '', settingsVersion: 1,
   },
   receiver: {
     latencyMs: 1500, expectedBitrateMbps: 100, displayMode: 0, toneMapping: 'bt.2390', hwDec: 1, bufferSeconds: 1.5,
@@ -132,12 +132,14 @@ function status() {
         state: connected ? 'connected' : asks ? 'approval' : wup > 1 ? 'punching' : 'joining',
         status: connected ? `Connected to ${w.hostName} (IPv6 [2400:aaaa::1]:51234, ping 38 ms)` : asks ? `Waiting for ${w.hostName} to answer` : `Connecting to ${w.hostName}`,
         path: connected ? 'IPv6 · ping 38 ms' : '', couldHelp: false,
+        net: connected ? { lossPercent: 2.1, lostForGood: 3, mbps: 39.2, rttMs: 38 } : null,
       } : null,
       player: w.active && connected ? {
         state: playing ? 'playing' : 'waiting', text: playing ? 'Playing' : 'Connecting…', attempt: 1, uptimeSec: Math.max(0, wup - 7),
         cacheSeconds: playing ? 1.5 + wobble * 0.2 : null, drops: 0, decoderDrops: 0, fps: playing ? 60 : null,
         bitrateMbps: playing ? 39.2 + wobble : null, hwdec: playing ? (mac ? 'videotoolbox' : 'd3d11va') : '',
         source: playing ? '3840x2160 p010 bt.2020 pq' : '', output: playing ? 'SDR' : '', hdr: playing,
+        guard: playing ? { frozen: wobble > 0.9, losses: 3, freezes: 2, heldBack: 95 } : null,
       } : null,
       control,
     },
@@ -152,9 +154,12 @@ function status() {
 
 function scheduleViewers() {
   const people = [
-    { sid: 's1', name: 'Hana', deviceCode: 'B7WP-3N6S-KCE1', verified: true, ipv6: false, path: '198.51.100.13:62909', rttMs: 74, latencyMs: 3500, overheadPercent: 50, control: 'none' },
-    { sid: 's2', name: 'Leo', deviceCode: '', verified: false, ipv6: false, path: '198.51.100.3:20834', rttMs: 81, latencyMs: 3500, overheadPercent: 50, control: 'requested' },
-    { sid: 's3', name: 'Mika', deviceCode: 'P0VD-2KQN-71XA', verified: true, ipv6: true, path: '[2400:aaaa::7]:50112', rttMs: 12, latencyMs: 1500, overheadPercent: 25, control: 'none' },
+    { sid: 's1', name: 'Hana', deviceCode: 'B7WP-3N6S-KCE1', verified: true, ipv6: false, path: '198.51.100.13:62909', rttMs: 74, latencyMs: 3500, overheadPercent: 50, control: 'none',
+      net: { lossPercent: 3.4, lostForGood: 12, mbps: 43.6, rttMs: 76 } },
+    { sid: 's2', name: 'Leo', deviceCode: '', verified: false, ipv6: false, path: '198.51.100.3:20834', rttMs: 81, latencyMs: 3500, overheadPercent: 50, control: 'requested',
+      net: { lossPercent: 0.4, lostForGood: 0, mbps: 43.6, rttMs: 83 } },
+    { sid: 's3', name: 'Mika', deviceCode: 'P0VD-2KQN-71XA', verified: true, ipv6: true, path: '[2400:aaaa::7]:50112', rttMs: 12, latencyMs: 1500, overheadPercent: 25, control: 'none',
+      net: { lossPercent: 0, lostForGood: 0, mbps: 43.6, rttMs: 12 } },
   ];
   people.forEach((p, i) => setTimeout(() => {
     if (db.share.state === 'streaming' || db.share.state === 'starting') {

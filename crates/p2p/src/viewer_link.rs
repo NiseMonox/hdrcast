@@ -16,6 +16,7 @@ use crate::control_packet::{self, PeerRole};
 use crate::link_base::{LinkAddresses, LinkCore, LinkEvents};
 use crate::peer_session::{LinkState, PeerSession};
 use crate::side_channel;
+use crate::srt_monitor::{SrtMonitor, SrtStats};
 use crate::udp_channel::{mono_clock, UdpChannel};
 use crate::util::{lock, round_half_even, Callbacks};
 
@@ -41,6 +42,8 @@ struct State {
     session: Option<Arc<PeerSession>>,
     mpv: Option<SocketAddr>,
     reported: LinkState,
+    /// The current session's SRT packets: the host's remux child is the sender, mpv (or ffmpeg) the receiver.
+    srt: Arc<SrtMonitor>,
 }
 
 impl ViewerLink {
@@ -61,7 +64,7 @@ impl ViewerLink {
         let inner = Arc::new(Inner {
             core,
             local,
-            state: Mutex::new(State { session: None, mpv: None, reported: LinkState::Punching }),
+            state: Mutex::new(State { session: None, mpv: None, reported: LinkState::Punching, srt: Arc::new(SrtMonitor::new()) }),
             bytes_from_host: AtomicU64::new(0),
             state_changed: Callbacks::new(),
             side_handler: Mutex::new(None),
@@ -152,6 +155,11 @@ impl ViewerLink {
         self.inner.session().map_or(-1.0, |s| s.rtt_ms())
     }
 
+    /// What the current session's SRT packets say about the path (docs/design.md §8.11).
+    pub fn srt_stats(&self) -> SrtStats {
+        lock(&self.inner.state).srt.snapshot()
+    }
+
     pub fn bytes_from_host(&self) -> u64 {
         self.inner.bytes_from_host.load(Ordering::Relaxed)
     }
@@ -163,6 +171,9 @@ impl ViewerLink {
         let previous = {
             let mut state = lock(&self.inner.state);
             state.reported = LinkState::Punching;
+            if state.session.as_ref().is_none_or(|s| s.sid() != sid) {
+                state.srt = Arc::new(SrtMonitor::new());
+            }
             state.session.replace(Arc::new(next))
         };
         if let Some(previous) = previous.filter(|p| p.sid() != sid) {
@@ -248,16 +259,17 @@ impl Inner {
         if from.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
             return;
         }
-        let session = {
+        let (session, srt) = {
             let mut state = lock(&self.state);
             state.mpv = Some(from); // a restarted mpv comes from a new port: follow it
-            state.session.clone()
+            (state.session.clone(), state.srt.clone())
         };
         let Some(session) = session else { return };
         let Some(to) = session.selected() else { return };
         if session.is_over() {
             return;
         }
+        srt.from_receiver(datagram);
         if self.core.send_wan(datagram, to) {
             session.note_sent(mono_clock::now_us());
         }
@@ -305,15 +317,16 @@ impl LinkEvents for Inner {
     }
 
     fn on_wan_data(&self, datagram: &[u8], from: SocketAddr) {
-        let (session, mpv) = {
+        let (session, mpv, srt) = {
             let state = lock(&self.state);
-            (state.session.clone(), state.mpv)
+            (state.session.clone(), state.mpv, state.srt.clone())
         };
         let Some(session) = session else { return };
         if !session.on_data(from, mono_clock::now_us()) {
             return;
         }
         let Some(mpv) = mpv else { return };
+        srt.from_sender(datagram);
         if self.local.send(datagram, mpv) {
             self.bytes_from_host.fetch_add(datagram.len() as u64, Ordering::Relaxed);
         }

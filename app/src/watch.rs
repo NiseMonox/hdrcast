@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 use crate::commands;
 use crate::control_viewer::ViewerControlLink;
 use crate::mpv_runner::MpvRunner;
+use crate::net_report::{self, End, NetReport};
 use crate::state::{self, AppState};
 
 struct Session {
@@ -31,6 +32,7 @@ struct Session {
     host_name: String,
     /// mpv is started once, when the path first works; after that its own retry loop rides out reconnects.
     mpv_started: AtomicBool,
+    net_report: Mutex<NetReport>,
 }
 
 #[derive(Default)]
@@ -103,6 +105,7 @@ pub fn start(app: &Arc<AppState>, host_id: &str) -> Result<(), Vec<String>> {
             host_id: host_id.to_string(),
             host_name,
             mpv_started: AtomicBool::new(false),
+            net_report: Mutex::new(NetReport::new(End::Viewer)),
         }
     });
 
@@ -180,6 +183,13 @@ impl Session {
                 return;
             }
         };
+        app.log(if plan.uses_ffmpeg_pipe() {
+            "[app] ffmpeg receives the stream and HdrCast passes it on to mpv: pictures damaged on the way are held back"
+        } else if s.frontend == ReceiverFrontend::MpvDirect {
+            "[app] mpv receives the stream itself (as set): pictures damaged on the way are shown as they come"
+        } else {
+            "[app] ffmpeg was not found: mpv receives the stream itself, and pictures damaged on the way are shown as they come"
+        });
         if let Ok(sizing) = srt_buffer_sizing::compute(s.latency_ms.max(0) as u32, s.expected_bitrate_mbps.max(0) as u64 * 1_000_000) {
             app.log(&format!(
                 "[app] SRT buffer: {} packets in flight -> ffs={} rcvbuf={} bytes",
@@ -199,6 +209,16 @@ pub fn stop(app: &AppState) {
     session.runner.stop();
     session.viewer.stop();
     app.log("[app] stopped watching");
+}
+
+/// Runs with every status tick: the network report in the log.
+pub fn housekeeping(app: &AppState) {
+    let Some(session) = current(app) else { return };
+    let Some(stats) = session.viewer.srt_stats() else { return };
+    let line = session.net_report.lock().unwrap().line(&stats);
+    if let Some(line) = line {
+        app.log(&format!("[net] {line}"));
+    }
 }
 
 pub fn toggle_fullscreen(app: &AppState) {
@@ -264,6 +284,13 @@ pub fn status(app: &AppState) -> Value {
             "target": st.target.as_ref().map(|p| p.describe()).unwrap_or_default(),
             "output": output,
             "hdr": st.target.as_ref().is_some_and(|t| t.is_hdr()),
+            // null: mpv receives the stream itself, nothing is guarded
+            "guard": play.guard.map(|g| json!({
+                "frozen": g.frozen,
+                "losses": g.losses,
+                "freezes": g.freezes,
+                "heldBack": g.hidden + g.dropped,
+            })),
         })
     });
     let control = match &session.control {
@@ -280,6 +307,7 @@ pub fn status(app: &AppState) -> Value {
             "state": state_name,
             "status": viewer.status(),
             "path": viewer.path_description(),
+            "net": viewer.srt_stats().map(|s| net_report::status(&s, End::Viewer)),
             "couldHelp": viewer.state() == ViewerSessionState::Waiting && viewer.this_side_could_help(),
         },
         "player": player,

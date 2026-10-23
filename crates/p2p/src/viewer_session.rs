@@ -21,6 +21,7 @@ use crate::p2p_diagnostics;
 use crate::p2p_host::resolve_ipv4;
 use crate::peer_session::{LinkState, PUNCH_DEADLINE_US};
 use crate::signaling_client::{SignalingClient, SignalingError};
+use crate::srt_monitor::SrtStats;
 use crate::upnp::{PortMappingOptions, RouterPortMapping};
 use crate::util::{lock, Callbacks, LogFn, Worker};
 use crate::viewer_link::{ViewerLink, ViewerSideHandler};
@@ -190,6 +191,12 @@ impl ViewerSession {
 
     pub fn path_description(&self) -> String {
         self.inner.link.get().map(ViewerLink::describe_path).unwrap_or_default()
+    }
+
+    /// What the SRT packets of the current session say about the path (docs/design.md §8.11); `None` before the
+    /// session has a link.
+    pub fn srt_stats(&self) -> Option<SrtStats> {
+        self.inner.link.get().map(ViewerLink::srt_stats)
     }
 
     pub fn ever_connected(&self) -> bool {

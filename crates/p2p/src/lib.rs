@@ -25,6 +25,7 @@ pub mod remux_child;
 mod router_http;
 pub mod side_channel;
 pub mod signaling_client;
+pub mod srt_monitor;
 pub mod switchable_stream;
 pub mod ts_fan_out;
 pub mod udp_channel;
@@ -43,6 +44,7 @@ pub use p2p_host::{AdmitFn, JoinTicket, P2pHost, P2pHostOptions, ViewerInfo, Vie
 pub use peer_session::{LinkState, Outgoing, PeerSession};
 pub use remux_child::{RemuxChild, RemuxInput};
 pub use signaling_client::{LiveEntry, SignalingClient, SignalingError};
+pub use srt_monitor::{SrtCounts, SrtMonitor, SrtStats};
 pub use switchable_stream::SwitchableStream;
 pub use ts_fan_out::TsFanOut;
 pub use udp_channel::{mono_clock, ChannelIo, PacketFilter, UdpChannel};
@@ -88,6 +90,7 @@ mod tests {
         shared::<TsFanOut>();
         shared::<RemuxChild>();
         shared::<PeerSession>();
+        shared::<SrtMonitor>();
         shared::<UdpChannel>();
         shared::<CancelToken>();
         shared::<P2pHostOptions>();

@@ -81,6 +81,11 @@ pub struct SenderSettings {
     // ---- tools ----
     #[serde(deserialize_with = "null_as_default")]
     pub ffmpeg_path: String,
+
+    /// The defaults the file was written with: 0 (no number) = before 0.3.2, see [`SenderSettings::load`]. Its own
+    /// default is 0, not the current version, so that a file without it reads as an old one.
+    #[serde(default)]
+    pub settings_version: i32,
 }
 
 impl Default for SenderSettings {
@@ -92,6 +97,19 @@ impl Default for SenderSettings {
 
 impl SenderSettings {
     pub const FILE_NAME: &'static str = "sender.json";
+
+    /// The keyframe interval of fresh settings. A picture damaged on the way is held until the next keyframe
+    /// (docs/design.md §3.2): one second keeps that short, for about 3% more bits than two.
+    pub const DEFAULT_GOP_SECONDS: f64 = 1.0;
+    /// The encoder's rate buffer (VBV) in seconds of the bitrate: how far above the bitrate a busy scene may go.
+    /// SRT sends at most a quarter more than the stream's rate, so what goes beyond waits in its queue and uses
+    /// up the time a lost packet has to be sent again (docs/design.md §2.5). With NVENC at 40 Mbps CBR, calm
+    /// and busy scenes in turn: 2 s let one second carry 82 Mbps and packets wait up to 860 ms; 0.25 s, 46 Mbps
+    /// and 110 ms, for 0.04 dB less PSNR.
+    pub const DEFAULT_BUFFER_SECONDS: f64 = 0.25;
+    /// Files without it (0) were written before 0.3.2 and hold that version's defaults: a 2 s keyframe interval
+    /// and a 2 s buffer, which [`load`](Self::load) changes to today's once.
+    pub const SETTINGS_VERSION: i32 = 1;
 
     /// Fresh settings: the encoder is the first one `platform` offers.
     pub fn defaults_for(platform: Platform) -> Self {
@@ -108,8 +126,8 @@ impl SenderSettings {
             encoder: encoder_profiles::default_encoder(platform),
             quality: QualityPreset::Balanced,
             bitrate_mbps: 40,
-            gop_seconds: 2.0,
-            buffer_seconds: 2.0,
+            gop_seconds: Self::DEFAULT_GOP_SECONDS,
+            buffer_seconds: Self::DEFAULT_BUFFER_SECONDS,
             b_frames: true,
             lookahead: true,
 
@@ -123,6 +141,7 @@ impl SenderSettings {
             upload_mbps: 0,
 
             ffmpeg_path: String::new(),
+            settings_version: Self::SETTINGS_VERSION,
         }
     }
 
@@ -149,7 +168,7 @@ impl SenderSettings {
         }
         self.bitrate_mbps = self.bitrate_mbps.clamp(1, 500);
         self.gop_seconds = self.gop_seconds.clamp(0.25, 10.0);
-        self.buffer_seconds = self.buffer_seconds.clamp(0.5, 10.0);
+        self.buffer_seconds = self.buffer_seconds.clamp(0.25, 10.0);
         self.audio_bitrate_kbps = self.audio_bitrate_kbps.clamp(32, 512);
         if self.audio_device.trim().is_empty() {
             self.audio_device = "default".to_string();
@@ -276,11 +295,27 @@ impl SenderSettings {
     }
 
     /// Never fails: a missing, unreadable or corrupt file gives the defaults, and whatever was read is
-    /// normalised.
+    /// normalised. A file from before 0.3.2 gets today's keyframe interval and buffer where it still has that
+    /// version's defaults (see [`SETTINGS_VERSION`](Self::SETTINGS_VERSION)); the page never offered the buffer, so
+    /// that one had to be the default.
     pub fn load(path: &Path) -> SenderSettings {
         settings_file::load::<SenderSettings>(path)
             .unwrap_or_default()
+            .migrated()
             .normalized()
+    }
+
+    fn migrated(mut self) -> Self {
+        if self.settings_version < Self::SETTINGS_VERSION {
+            if self.gop_seconds == 2.0 {
+                self.gop_seconds = Self::DEFAULT_GOP_SECONDS;
+            }
+            if self.buffer_seconds == 2.0 {
+                self.buffer_seconds = Self::DEFAULT_BUFFER_SECONDS;
+            }
+            self.settings_version = Self::SETTINGS_VERSION;
+        }
+        self
     }
 
     /// Writes the file atomically (a reader sees the old or the new file, never half of one).

@@ -741,7 +741,7 @@ mod ffmpeg_command_line {
         assert_eq!(value(&a, "-pix_fmt"), "p010le");
         // the probe is small and short whatever the stream settings are
         assert_eq!(value(&a, "-b:v"), "2000k");
-        assert_eq!(value(&a, "-g"), "60");
+        assert_eq!(value(&a, "-g"), "30"); // one second of 30 fps: the default keyframe interval
         let sized = ffmpeg_command::build_probe_sized(&EncoderSettings::default(), 320, 240);
         assert_eq!(
             value(&sized, "-i"),
@@ -811,6 +811,8 @@ mod ffmpeg_command_line {
     fn the_whole_command_line_is_the_one_of_0_2_4() {
         let mut p = plan(true, true);
         p.encoder.preset = QualityPreset::Balanced;
+        // 0.2.4's defaults (0.3.2 has a 1 s keyframe interval and a 0.25 s buffer)
+        (p.encoder.gop_seconds, p.encoder.buffer_seconds) = (2.0, 2.0);
         let expected = r"-hide_banner -loglevel warning -nostdin -stats_period 1 -progress pipe:2 \
             -thread_queue_size 1024 -f rawvideo -pix_fmt p010le -video_size 2560x1440 -framerate 60 \
             -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc -color_range tv -i \\.\pipe\hdrcast-video-1234 \
@@ -1066,7 +1068,7 @@ mod sender_settings {
         );
         assert_eq!(
             (low.gop_seconds, low.buffer_seconds, low.audio_bitrate_kbps),
-            (0.25, 0.5, 32)
+            (0.25, 0.25, 32) // the buffer may be a quarter of a second since 0.3.2 (0.5 s before)
         );
         assert_eq!(
             (low.audio_device.as_str(), low.max_viewers, low.upload_mbps),

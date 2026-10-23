@@ -30,6 +30,13 @@ pub mod mono_clock {
 pub trait PacketFilter: Send + Sync {
     fn on_outbound(&self, to: SocketAddr);
     fn allow_inbound(&self, from: SocketAddr) -> bool;
+
+    /// Whether `datagram` from `from` gets through (a lossy path decides by content); by default what
+    /// [`allow_inbound`](Self::allow_inbound) says.
+    fn allow_datagram(&self, from: SocketAddr, datagram: &[u8]) -> bool {
+        let _ = datagram;
+        self.allow_inbound(from)
+    }
 }
 
 /// Called on the channel's receive thread for every datagram; the buffer is the thread's own and is reused.
@@ -234,7 +241,7 @@ fn receive_loop(io: &ChannelIo, socket: &UdpSocket, on_receive: &mut ReceiveHand
             return;
         }
         let from = canonical(from);
-        if io.filter.as_ref().is_some_and(|filter| !filter.allow_inbound(from)) {
+        if io.filter.as_ref().is_some_and(|filter| !filter.allow_datagram(from, &buffer[..n])) {
             continue;
         }
         io.datagrams_in.fetch_add(1, Ordering::Relaxed);

@@ -128,10 +128,11 @@ function displayHint(mode, platform) {
 }
 
 // "IPv6 [2400:…]:51234, ping 38 ms" -> "IPv6 · ping 38 ms" (the full address is in the line above)
-function shortPath(path) {
+function shortPath(path, net) {
   if (!path) return ' ';
   const ping = /ping [\d.]+ ms/.exec(path);
-  return path.split(' ')[0] + (ping ? ' · ' + ping[0] : '');
+  const loss = net?.lossPercent >= 0.05 ? ' · ' + t('watch.loss', { p: net.lossPercent.toFixed(1) }) : '';
+  return path.split(' ')[0] + (ping ? ' · ' + ping[0] : '') + loss;
 }
 
 function pillOf(session, playing) {
@@ -158,6 +159,15 @@ function ControlLine({ watch }) {
     <span class="what"><${Icon} name="cursor" /> ${t('control.state.' + c, { host: watch.hostName })}</span>
     ${button}
   </div>`;
+}
+
+/** What the guard did with pictures damaged on the way (null when mpv receives the stream itself). */
+function GuardLine({ guard }) {
+  if (!guard) return null;
+  if (guard.frozen) return html`<div class="hero-sub" style="margin-top:-6px">${t('watch.guardFrozen')}</div>`;
+  if (!guard.losses && !guard.heldBack) return null;
+  return html`<div class="hero-sub" style="margin-top:-6px">
+    ${t('watch.guardSummary', { losses: guard.losses, held: guard.heldBack, freezes: guard.freezes })}</div>`;
 }
 
 function NowPlaying({ watch }) {
@@ -188,12 +198,13 @@ function NowPlaying({ watch }) {
         <div class="s">${player?.hwdec || ' '}</div></div>
       <div class="tile"><div class="k">${t('watch.tBitrate')}</div>
         <div class="v">${player?.bitrateMbps != null ? player.bitrateMbps.toFixed(1) : '—'}<small>Mbps</small></div>
-        <div class="s">${shortPath(session?.path)}</div></div>
+        <div class="s">${shortPath(session?.path, session?.net)}</div></div>
       <div class="tile"><div class="k">${t('watch.tDropped')}</div>
         <div class="v">${player ? player.drops + player.decoderDrops : '—'}</div>
         <div class="s">${player?.hdr ? t('watch.hdrActive') : (player?.output || ' ')}</div></div>
     </div>`}
     ${!refused && html`<${ControlLine} watch=${watch} />`}
+    ${!refused && html`<${GuardLine} guard=${player?.guard} />`}
     ${!refused && player?.source && html`<div class="hero-sub" style="margin-top:-6px">${player.source}</div>`}
   </div>`;
 }

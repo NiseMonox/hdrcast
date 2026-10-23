@@ -12,6 +12,7 @@ mod live;
 mod logs;
 mod mpv_ipc;
 mod mpv_runner;
+mod net_report;
 mod sender_runner;
 mod share;
 mod state;
@@ -125,6 +126,7 @@ fn run_app(startup_invite: Option<String>, background: bool, instance: instance:
                     ticks += 1;
                     if ticks % 2 == 0 {
                         share::housekeeping(&state);
+                        watch::housekeeping(&state);
                         let _ = handle.emit("status", status::snapshot(&state));
                         tray::show(&handle, tray_mode(&state));
                         if let Some(args) = instance::take_request() {

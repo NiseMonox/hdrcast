@@ -75,12 +75,17 @@ impl RemuxChild {
         self.process.safe_command_line()
     }
 
-    /// Small probe (the input is already clean MPEG-TS), copy every stream, keep repeating the parameter sets
-    /// for a viewer that joins mid-stream, no mux delay.
+    /// Copy every stream, keep repeating the parameter sets for a viewer that joins mid-stream, no mux delay.
+    ///
+    /// The probe must see a PMT, which comes every 0.1 s: 2 MB covers that up to 160 Mbps, and half a second of
+    /// the stream still ends it. With 64 KB (0.3.1), a child that started between two PMTs could not tell what the
+    /// audio was and exited ("Cannot map stream #0:1"): 13 of 30 starts at 40 Mbps, a real viewer's join on
+    /// 2026-10-23 among them. `discardcorrupt`: a picture the fan-out cut short (its queue overflowed) is dropped
+    /// here; remuxed, it would look whole to the viewer's guard (docs/design.md §3.2), with fresh continuity counters.
     pub fn build_arguments(srt_url: &str) -> Vec<String> {
         [
             "-hide_banner", "-loglevel", "warning",
-            "-probesize", "65536", "-analyzeduration", "500000",
+            "-probesize", "2000000", "-analyzeduration", "500000", "-fflags", "+discardcorrupt",
             "-f", "mpegts", "-i", "pipe:0",
             "-map", "0", "-c", "copy",
             "-f", "mpegts", "-mpegts_flags", "+resend_headers", "-muxdelay", "0", "-muxpreload", "0",
@@ -91,8 +96,18 @@ impl RemuxChild {
         .collect()
     }
 
-    /// The per-viewer listener URL: 127.0.0.1 only; the WAN side is [`HostLink`](crate::HostLink)'s job.
-    pub fn build_listener_url(port: u16, passphrase: &str, latency_ms: u32, overhead_percent: i32, bitrate_bps: u64) -> Result<String, SrtUrlError> {
+    /// What a stream with `video_bps` of video takes on the wire, which is the rate SRT's pacing is told (inputbw):
+    /// the audio (up to 320 kbit/s), MPEG-TS packetisation and the encoder's overshoot (together about 5%, measured
+    /// with NVENC CBR), and the 44 bytes of SRT, UDP and IP header on each 1316-byte payload (3.3%). SRT counts
+    /// all of these against its cap, and resends share it: told the video bitrate alone, it kept less than half
+    /// of the viewer's headroom (oheadbw) for resends.
+    pub fn wire_bps(video_bps: u64) -> u64 {
+        (video_bps as f64 * 1.05 * 1360.0 / 1316.0).round() as u64 + 320_000
+    }
+
+    /// The per-viewer listener URL for a stream with `video_bps` of video: 127.0.0.1 only; the WAN side is
+    /// [`HostLink`](crate::HostLink)'s job.
+    pub fn build_listener_url(port: u16, passphrase: &str, latency_ms: u32, overhead_percent: i32, video_bps: u64) -> Result<String, SrtUrlError> {
         srt_url::build(&SrtUrlOptions {
             topology: SrtTopology::Listener,
             listen_address: Some("127.0.0.1".to_string()),
@@ -101,7 +116,7 @@ impl RemuxChild {
             passphrase: Some(passphrase.to_string()),
             pb_key_len: 32,
             latency_ms,
-            bitrate_bps,
+            bitrate_bps: RemuxChild::wire_bps(video_bps),
             rate_control: true,
             overhead_percent: overhead_percent.clamp(5, 100) as u32,
             ..SrtUrlOptions::default()

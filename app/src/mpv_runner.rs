@@ -14,11 +14,15 @@ use hdrcast_media::receiver::mpv_command::MpvLaunchPlan;
 use hdrcast_media::receiver::mpv_ipc::{observed, MpvIpcMessage, MpvIpcMessageKind, MpvStatusModel};
 use hdrcast_media::receiver::mpv_log;
 use hdrcast_media::receiver::settings::ReceiverSettings;
+use hdrcast_media::receiver::ts_guard::{GuardEvent, GuardStats, TsGuard};
 
 use crate::mpv_ipc::{Handlers, MpvIpcClient};
 
 pub const RETRY_DELAY: Duration = Duration::from_millis(3000);
 const RECENT_LINES: usize = 40;
+/// The guard's freezes go into the log at most this often (each one ends at a keyframe, a second or two apart
+/// on a bad line): the first one at once, then a summary of what happened meanwhile.
+const GUARD_LOG_EVERY: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlayerState {
@@ -48,6 +52,8 @@ pub struct PlayerSnapshot {
     pub attempt: u32,
     pub uptime: Duration,
     pub status: MpvStatusModel,
+    /// What the guard did, when the stream goes through it (the ffmpeg pipe).
+    pub guard: Option<GuardStats>,
 }
 
 type LogFn = Arc<dyn Fn(&str) + Send + Sync>;
@@ -71,6 +77,7 @@ struct Gate {
     text: String,
     status: MpvStatusModel,
     recent: VecDeque<String>,
+    guard: Option<GuardStats>,
 }
 
 struct Shared {
@@ -103,6 +110,7 @@ impl MpvRunner {
             text: "Idle".to_string(),
             status: MpvStatusModel::new(),
             recent: VecDeque::new(),
+            guard: None,
         };
         Self { shared: Arc::new(Shared { gate: Mutex::new(gate), job, log, tap: Mutex::new(None), ready: Mutex::new(None) }) }
     }
@@ -124,6 +132,7 @@ impl MpvRunner {
             attempt: g.attempt,
             uptime: if g.user_stopped { Duration::ZERO } else { g.started.map(|t| t.elapsed()).unwrap_or_default() },
             status: g.status.clone(),
+            guard: g.guard,
         }
     }
 
@@ -221,6 +230,7 @@ impl Shared {
             g.attempt += 1;
             g.catching_up = false;
             g.recent.clear();
+            g.guard = None;
             (g.generation, plan, g.attempt)
         };
         let text = if attempt == 1 { "Starting mpv…".to_string() } else { format!("Reconnecting (attempt {attempt})…") };
@@ -326,35 +336,53 @@ impl Shared {
         gen == g.generation && !g.user_stopped
     }
 
-    /// The ffmpeg pipe frontend: ffmpeg's stdout into mpv's stdin.
+    /// The ffmpeg pipe: ffmpeg's stdout through the guard (docs/design.md §3.2) into mpv's stdin.
     fn start_pump(self: &Arc<Self>, gen: u64, ffmpeg: &LineProcess, mpv: &LineProcess) {
         let (Some(mut src), Some(mut dst)) = (ffmpeg.take_stdout(), mpv.take_stdin()) else { return };
         let me = self.clone();
         thread::Builder::new()
             .name("ffmpeg-to-mpv".into())
             .spawn(move || {
+                let mut guard = TsGuard::new();
+                let mut journal = GuardJournal::default();
                 let mut buf = vec![0u8; 65536];
+                let mut out = Vec::with_capacity(2 * buf.len());
                 loop {
                     if !me.current(gen) {
                         break;
                     }
-                    match src.read(&mut buf) {
+                    let n = match src.read(&mut buf) {
                         Ok(0) => break,
-                        Ok(n) => {
-                            if let Err(e) = dst.write_all(&buf[..n]) {
-                                if me.current(gen) {
-                                    me.emit(&format!("[pipe] ended: {e}"));
-                                }
-                                break;
-                            }
-                        }
+                        Ok(n) => n,
                         Err(e) => {
                             if me.current(gen) {
                                 me.emit(&format!("[pipe] ended: {e}"));
                             }
                             break;
                         }
+                    };
+                    out.clear();
+                    guard.push(&buf[..n], &mut out);
+                    let stats = guard.stats();
+                    if let Some(line) = journal.note(&guard.take_events(), &stats) {
+                        me.emit(&line);
                     }
+                    {
+                        let mut g = me.gate.lock().unwrap();
+                        if g.generation == gen {
+                            g.guard = Some(stats);
+                        }
+                    }
+                    if let Err(e) = dst.write_all(&out) {
+                        if me.current(gen) {
+                            me.emit(&format!("[pipe] ended: {e}"));
+                        }
+                        break;
+                    }
+                }
+                guard.finish();
+                if let Some(line) = journal.flush(&guard.stats()) {
+                    me.emit(&line);
                 }
                 // dropping `dst` closes mpv's stdin, which ends its playback
             })
@@ -492,5 +520,63 @@ impl Shared {
         } else {
             None
         }
+    }
+}
+
+/// Turns the guard's freezes into log lines a person can read: the first one at once, then at most one line per
+/// [`GUARD_LOG_EVERY`] summing up what happened since.
+#[derive(Default)]
+struct GuardJournal {
+    last_line: Option<Instant>,
+    /// Since the last line: freezes that ended, the frames they kept off the screen and how long (90 kHz ticks).
+    freezes: u64,
+    skipped: u64,
+    ticks: u64,
+    /// The guard's loss count at the last line.
+    losses: u64,
+}
+
+impl GuardJournal {
+    fn note(&mut self, events: &[GuardEvent], stats: &GuardStats) -> Option<String> {
+        let mut froze = false;
+        for event in events {
+            match *event {
+                GuardEvent::Froze => froze = true,
+                GuardEvent::Recovered { skipped, ticks } => {
+                    self.freezes += 1;
+                    self.skipped += skipped;
+                    self.ticks += ticks;
+                }
+            }
+        }
+        if froze && self.last_line.is_none() {
+            self.last_line = Some(Instant::now());
+            return Some(
+                "[guard] part of the stream was lost on the way: the picture holds on the last good frame until the next keyframe"
+                    .to_string(),
+            );
+        }
+        let due = self.last_line.is_none_or(|at| at.elapsed() >= GUARD_LOG_EVERY);
+        (due && self.freezes > 0).then(|| self.line(stats))
+    }
+
+    /// What is left to say when the stream ends.
+    fn flush(&mut self, stats: &GuardStats) -> Option<String> {
+        (self.freezes > 0).then(|| self.line(stats))
+    }
+
+    fn line(&mut self, stats: &GuardStats) -> String {
+        let line = format!(
+            "[guard] {} {} until a keyframe, {:.1} s in all ({} frames held back); {} losses in the stream",
+            self.freezes,
+            if self.freezes == 1 { "freeze" } else { "freezes" },
+            self.ticks as f64 / 90_000.0,
+            self.skipped,
+            stats.losses.saturating_sub(self.losses),
+        );
+        self.last_line = Some(Instant::now());
+        self.losses = stats.losses;
+        (self.freezes, self.skipped, self.ticks) = (0, 0, 0);
+        line
     }
 }

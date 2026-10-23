@@ -28,7 +28,7 @@ one.
   turn on **Settings → General → Start HdrCast when I sign in** there as well, so that it is online after every restart.
 - **"The signaling server cannot be reached"**: this computer is offline, or the signaling server is down; people already
   watching are not affected.
-- It connects, but **the picture never shows up**: mpv waits for the first keyframe (at most one keyframe interval, 2 s by
+- It connects, but **the picture never shows up**: mpv waits for the first keyframe (at most one keyframe interval, 1 s by
   default). After more than 10 s, look for errors in the `[remux …]` lines on the sharer's **Activity** page.
 
 ## Is IPv6 a must?
@@ -100,8 +100,9 @@ Rules of thumb for 10-bit HEVC at 60 fps, a mix of desktop and games:
   bitrate, and takes half the bandwidth.
 - The ceiling is set by **the sharer's upload ÷ (viewers × 1.25)**, not by how good you would like it to look: see the
   next question.
-- Keep the keyframe interval at 1-2 s (2 s by default, **Share → More options → Keyframe interval**): a viewer who joins
-  sees nothing until the next IDR frame, and mpv prints "Could not find ref with POC" until then, which is normal.
+- Keep the keyframe interval at 1-2 s (1 s by default since 0.3.2, **Share → More options → Keyframe interval**): a
+  viewer who joins sees nothing until the next IDR frame, and a picture damaged on the way is held until the next one
+  (see below). With **mpv direct**, mpv prints "Could not find ref with POC" until then, which is normal.
 
 ## How much upload does sharing take?
 
@@ -132,6 +133,25 @@ upload needed ≈ bitrate × viewers × 1.25   (SRT overhead oheadbw=25 %; ×1.5
    encoder cannot keep up: lower the resolution or the frame rate, or set **More options → Encoder preset** to **Speed**.
    (**Dropped frames** counts the frames the encoder dropped as well as those the capture could not hand over because
    ffmpeg was not reading, which is usually the same problem.)
+
+## The picture freezes for a moment (it used to break up into coloured blocks)
+
+When part of the stream is lost on the way and SRT cannot get it sent again within the viewer's delay, a few packets of
+the stream are simply missing. The decoder does not notice: before 0.3.2 the broken picture, and every picture after it
+up to the next keyframe, came out smeared and blocky. Since 0.3.2 the viewer's HdrCast holds the last good picture until
+the next keyframe instead (at most one keyframe interval, 1 s by default; the sound goes on), like Moonlight does.
+
+- It needs **Settings → Player input → Automatic (ffmpeg when found)** (the default) and the ffmpeg that comes with
+  HdrCast: with **mpv direct**, damaged pictures are shown as before. The **Watch** page then says how often the picture
+  was held, and the viewer's **Activity** page has `[guard]` lines.
+- How lossy the path is: **loss … %** under the bitrate on the **Watch** page, and on the sharer's **Share** page next to
+  each viewer **… % lost on the way** / **… too late to resend**. Both logs get a `[net]` line every 30 s while packets
+  are lost: `…% lost on the way, n never recovered in time` (viewer) is what actually breaks pictures.
+- Frequent freezes: the viewer stops and adds 500-1000 ms under **Watch → Delay → Custom** (or picks **China**, 3.5 s);
+  if "never recovered" stays high, the sharer lowers the bitrate. Lots of "too late to resend" on the sharer's side
+  means its upload or its bitrate is the problem.
+- Since 0.3.2 the sharer's encoder also keeps its bitrate steadier (a 0.25 s rate buffer instead of 2 s) and SRT is told
+  the stream's real rate, so fewer packets are lost in the first place: both sides should update.
 
 ## Where does the sound come from? Do I need a virtual audio device?
 

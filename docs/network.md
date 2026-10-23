@@ -164,7 +164,14 @@ Why these values:
 6. The delay decides how much **packet loss** the stream rides out (the retransmission window), not the picture quality:
    on a good line 1.5 s and 3.5 s look the same, one just runs two seconds later; quality only depends on the bitrate and
    the encoder preset. Viewers across the border in China should pick the China preset (3500 ms, oheadbw 50 %);
-   otherwise retransmissions of the occasional lost packet arrive too late and the picture breaks up.
+   otherwise retransmissions of the occasional lost packet arrive too late and the picture freezes until the next
+   keyframe (before 0.3.2 it broke up into blocks; see [faq.md](faq.md)).
+7. SRT's deadline for a packet counts from when it was captured, not from when it was first sent. Whatever waits in the
+   sharer's SRT queue uses up that time: SRT sends at most `inputbw × (1 + oheadbw)`, resends included, so a
+   bitrate peak above it waits. Since 0.3.2 the encoder's rate buffer is 0.25 s (it was 2 s, which let a busy second
+   reach twice the bitrate and packets wait up to 860 ms before their first send: with a delay of 1 s they arrived
+   too late without any loss at all), and `inputbw` is the stream's real rate on the wire, not the video bitrate
+   (docs/design.md §2.5, §2.6). Both logs now say how lossy the path is: the `[net]` lines (design.md §8.11).
 
 > Viewers can tune it themselves: if the picture keeps stalling (mpv buffering again and again), stop, add 500 ms under
 > **Watch → Delay → Custom** and connect again; on a good line go down instead.

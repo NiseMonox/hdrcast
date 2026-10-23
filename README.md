@@ -34,6 +34,10 @@ sharer's computer. No relay server, no public IPv4 address, no port forwarding t
   may watch without asking and who may control: your own laptop gets control as soon as it connects, friends only watch,
   anybody else has to ask every time. Input takes the same peer-to-peer path, end-to-end encrypted with a key only those
   two computers can work out.
+- **No smeared picture after packet loss (0.3.2).** When a lossy line (across the border into China, say) loses part of
+  the stream for good, the viewer holds the last good picture until the next keyframe instead of showing colourful
+  blocks, like Moonlight; the sound goes on. The sharer's encoder keeps its bitrate steadier, so less is lost in the
+  first place, and both ends show and log how lossy the path is ([docs/faq.md](docs/faq.md)).
 - **English, Chinese and Japanese** in the app (**Settings → Language**; Automatic follows the system).
 
 > **Status (0.3.1):** on Windows, capture, encoding, peer-to-peer, playback and the UI have been tested on real machines.

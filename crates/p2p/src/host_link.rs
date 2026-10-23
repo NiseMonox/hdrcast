@@ -15,6 +15,7 @@ use crate::control_packet::{self, PeerRole};
 use crate::link_base::{LinkAddresses, LinkCore, LinkEvents};
 use crate::peer_session::{LinkState, PeerSession};
 use crate::side_channel;
+use crate::srt_monitor::{SrtMonitor, SrtStats};
 use crate::udp_channel::{mono_clock, UdpChannel};
 use crate::util::{lock, Callbacks};
 
@@ -32,6 +33,8 @@ pub struct HostSessionInfo {
     pub path_learned: bool,
     pub rtt_ms: f64,
     pub bytes_to_viewer: u64,
+    /// What the SRT packets on this path say about it (docs/design.md §8.11).
+    pub srt: SrtStats,
 }
 
 /// Receives what viewers send on the side channel: (session id, payload). Runs on a network thread.
@@ -74,6 +77,8 @@ struct Entry {
     tag: Option<String>,
     reported: Mutex<LinkState>,
     bytes_to_viewer: AtomicU64,
+    /// The remux child is the SRT sender, the viewer's player the receiver.
+    srt: SrtMonitor,
 }
 
 impl HostLink {
@@ -164,6 +169,7 @@ impl HostLink {
             tag,
             reported: Mutex::new(LinkState::Punching),
             bytes_to_viewer: AtomicU64::new(0),
+            srt: SrtMonitor::new(),
         });
         let _ = slot.set(Arc::downgrade(&entry));
 
@@ -204,6 +210,11 @@ impl HostLink {
 
     pub fn snapshot(&self) -> Vec<HostSessionInfo> {
         lock(&self.inner.sessions).by_sid.values().map(|entry| info(entry)).collect()
+    }
+
+    /// What the SRT packets of a viewer's session say about its path; `None` for an unknown session.
+    pub fn srt_stats(&self, sid: &str) -> Option<SrtStats> {
+        lock(&self.inner.sessions).by_sid.get(sid).map(|entry| entry.srt.snapshot())
     }
 
     pub fn session_count(&self) -> usize {
@@ -268,6 +279,7 @@ impl Inner {
         if entry.session.is_over() {
             return;
         }
+        entry.srt.from_sender(datagram);
         if self.core.send_wan(datagram, to) {
             entry.session.note_sent(mono_clock::now_us());
             entry.bytes_to_viewer.fetch_add(datagram.len() as u64, Ordering::Relaxed);
@@ -332,6 +344,7 @@ impl LinkEvents for Inner {
         if !entry.session.on_data(from, mono_clock::now_us()) {
             return;
         }
+        entry.srt.from_receiver(datagram);
         let target = *lock(&entry.target);
         entry.local.send(datagram, target);
     }
@@ -370,5 +383,6 @@ fn info(entry: &Entry) -> HostSessionInfo {
         path_learned: path.is_some_and(|p| !entry.session.is_advertised(p)),
         rtt_ms: entry.session.rtt_ms(),
         bytes_to_viewer: entry.bytes_to_viewer.load(Ordering::Relaxed),
+        srt: entry.srt.snapshot(),
     }
 }

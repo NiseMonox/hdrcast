@@ -6,6 +6,7 @@
 
 use serde::Serialize;
 
+use super::settings::SenderSettings;
 use crate::text::words;
 use crate::Platform;
 
@@ -199,8 +200,8 @@ impl Default for EncoderSettings {
             hdr: false,
             bitrate_kbps: 40000,
             fps: 60,
-            gop_seconds: 2.0,
-            buffer_seconds: 2.0,
+            gop_seconds: SenderSettings::DEFAULT_GOP_SECONDS,
+            buffer_seconds: SenderSettings::DEFAULT_BUFFER_SECONDS,
             b_frames: true,
             lookahead: true,
             mastering_max_nits: 0,

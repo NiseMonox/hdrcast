@@ -230,19 +230,18 @@ mod mpv_command_line {
     }
 
     #[test]
-    fn ffmpeg_fallback_pipes_a_copy_into_mpv_stdin() {
+    fn the_ffmpeg_pipe_hands_the_raw_stream_to_the_guard_and_mpv_stdin() {
         let mut s = settings(DisplayMode::Auto);
         s.frontend = ReceiverFrontend::FfmpegPipe;
         let plan = build_on(Platform::Windows, &s, 1, "mpv", Some(r"C:\ff\ffmpeg.exe"));
         assert!(plan.uses_ffmpeg_pipe());
         let ffmpeg_args = plan.ffmpeg_args.as_ref().unwrap();
-        assert!(ffmpeg_args.iter().any(|a| a == "-c"));
-        assert!(ffmpeg_args.iter().any(|a| a == "copy"));
         assert_eq!(plan.mpv_args.last().unwrap(), "-"); // mpv reads stdin
         assert!(plan.to_command_line().contains(" | "));
+        // -f data in and out: the SRT payload byte for byte, continuity counters and all (docs/design.md §3.2)
         assert_eq!(
             ffmpeg_args.join(" "),
-            format!("-hide_banner -loglevel warning -nostdin -fflags nobuffer -flags low_delay -i {} -c copy -f mpegts -muxdelay 0 -muxpreload 0 pipe:1", plan.url)
+            format!("-hide_banner -loglevel warning -nostdin -f data -i {} -map 0 -c copy -f data -flush_packets 1 pipe:1", plan.url)
         );
         // stdin is not a terminal and not a seekable file: mpv is told both
         assert_eq!(flag(&plan.mpv_args, "demuxer-lavf-format"), "mpegts");
@@ -255,6 +254,17 @@ mod mpv_command_line {
         );
         assert_eq!(direct.ffmpeg_command_line(), None);
         assert_eq!(direct.to_command_line(), direct.mpv_command_line());
+    }
+
+    #[test]
+    fn automatic_uses_the_pipe_whenever_ffmpeg_is_there() {
+        let auto = settings(DisplayMode::Auto);
+        assert_eq!(auto.frontend, ReceiverFrontend::Auto, "the default");
+        assert!(build_on(Platform::Windows, &auto, 1, "mpv", Some("ffmpeg")).uses_ffmpeg_pipe());
+        assert!(!build_on(Platform::Windows, &auto, 1, "mpv", None).uses_ffmpeg_pipe(), "no ffmpeg: mpv direct");
+        assert!(!build_on(Platform::Windows, &auto, 1, "mpv", Some("")).uses_ffmpeg_pipe());
+        let direct = ReceiverSettings { frontend: ReceiverFrontend::MpvDirect, ..auto };
+        assert!(!build_on(Platform::Windows, &direct, 1, "mpv", Some("ffmpeg")).uses_ffmpeg_pipe(), "asked for");
     }
 
     #[test]

@@ -147,7 +147,11 @@ export function SettingsPage() {
       <//>
       <${Row} name=${t('settings.frontend')} hint=${t('settings.frontendHint')} disabled=${watching}>
         <${Select} value=${receiver.frontend} onChange=${(v) => setR({ frontend: v })}
-          options=${[{ value: 0, label: t('settings.frontendMpv') }, { value: 1, label: t('settings.frontendPipe') }]} />
+          options=${[
+            { value: 0, label: t('settings.frontendAuto') },
+            { value: 1, label: t('settings.frontendPipe') },
+            { value: 2, label: t('settings.frontendMpv') },
+          ]} />
       <//>
     <//>
 
