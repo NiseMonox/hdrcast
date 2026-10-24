@@ -3,7 +3,7 @@
 自动测试（`cargo test --workspace`：协议 golden 向量、与 C# 0.2.4 的逐字节对照、模拟对称型 NAT 的打洞、假路由器上的 UPnP、
 真 ffmpeg / 真 mpv / 真信令服务器的全栈测试、真显示器上的采集）跑通之后，下面是要在真机和真网络上看的部分，按顺序执行，每一步都写了预期结果。
 
-环境：Windows 11 + RTX 4090 + AW3225QF（4K HDR），`dist/HdrCast-<版本>/` 解压到任意目录（下文记为 `HdrCast\`）。
+环境：Windows 11 + RTX 4090 + AW3225QF（4K HDR），`HdrCast-<版本>.zip` 解压到任意目录（解压出的文件夹就叫 `HdrCast\`，不带版本号）。
 
 > **2026-10-13 在主播这台机器上已经实测过的**（同一台电脑上开两个互相隔离的实例 + 本机信令服务器，见文末"单机回环"）：
 > 第 1–4 步（工具、显示器列表、selftest、采集落盘，均与 0.2.4 的 exe 对比过）、第 6–7 步的出画面与统计（1080p SDR 和 4K HDR 两条链路、
@@ -93,9 +93,11 @@ idx  device         name                      size        pos          hz     hd
       PowerShell 里 `Get-NetIPAddress -AddressFamily IPv6 | ft IPAddress,PrefixOrigin,SuffixOrigin,AddressState`，
       日志里的地址那一行 SuffixOrigin 应为 **Link**（不是 Random = 临时地址）。
 - [ ] 信令服务器的 UDP 18651 放行后，日志还有 `[p2p] public IPv4 mapping: …`（没有也不影响 IPv6）。
-- [ ] **防火墙** 一栏（开播 → 观众，或 设置 → 网络）：新版本目录第一次打开是 `Only replies get in…` 加 **放行…** 按钮。
+- [ ] **防火墙** 一栏（开播 → 观众，或 设置 → 网络）：新目录第一次打开是 `Only replies get in…` 加 **放行…** 按钮。
       第一次开播程序会问一次是否放行 → 放行 → Windows UAC 确认 → 变成 `Friends can reach this PC through Windows Firewall.`；
       Windows 防火墙高级设置的入站规则里多了 "HdrCast"（程序 = 这个 exe，UDP，所有配置文件）。
+- [ ] 升级：托盘图标 → **Quit HdrCast**，把下一个版本的 zip 解压覆盖到同一个位置（`HdrCast\` 里的文件被替换）。
+      再打开：**防火墙** 一栏直接是 `Friends can reach this PC…`，不再问；**设置** 里 **Start HdrCast when I sign in** 仍然打开。
 - [ ] 开播几秒内日志有 `[p2p] router: UDP NNNNN forwarded to this PC (XG-100NE, internet address …:NNNNN)`；
       停止后有 `[p2p] router: forward of UDP NNNNN removed`（路由器 UPnP 页面里 HdrCast 那条也消失）。
       路由器关了 UPnP 时是 `could not forward UDP … no UPnP router answered`，面板说明 IPv4 没打开缺什么。

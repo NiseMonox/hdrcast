@@ -2,8 +2,8 @@
 # HdrCast build script (run from the repo root: Git Bash on Windows, a terminal on macOS; needs Rust, see README):
 #   runs the tests (cargo test, plus the signaling server's Python tests), builds the app in release mode and
 #   packages it.
-#     Windows  dist/HdrCast-<version>/ with HdrCast.exe and ffmpeg / ffprobe / mpv in tools/, zipped to
-#              dist/HdrCast-<version>.zip
+#     Windows  dist/HdrCast/ with HdrCast.exe and ffmpeg / ffprobe / mpv in tools/, zipped to dist/HdrCast-<version>.zip;
+#              the folder has no version, so an update unzipped over it keeps its firewall rule and sign-in entry
 #     macOS    dist/HdrCast.app and a .dmg, made by the Tauri CLI (cargo install tauri-cli --version "^2" --locked);
 #              ffmpeg and mpv come from Homebrew there and are not bundled
 #   ./build.sh              full run
@@ -48,7 +48,7 @@ VERSION="${VERSION:-0.0.0}"
 # Where cargo puts its output (a .cargo/config.toml may move it off this checkout).
 TARGET="$(cargo metadata --format-version 1 --no-deps 2>/dev/null | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p' | sed 's/\\\\/\//g')"
 TARGET="${TARGET:-$ROOT/target}"
-DIST="$ROOT/dist/HdrCast-$VERSION"
+DIST="$ROOT/dist/HdrCast"
 LOGDIR="$ROOT/dist/logs"
 mkdir -p "$LOGDIR"
 
@@ -205,15 +205,17 @@ TXT
 fi
 
 step "dist tree"
-if command -v tree >/dev/null 2>&1; then tree -a --du -h "$DIST"; else (cd "$ROOT/dist" && find "HdrCast-$VERSION" -type f -printf '%8s  %p\n' | sort -k2); fi
+if command -v tree >/dev/null 2>&1; then tree -a --du -h "$DIST"; else (cd "$ROOT/dist" && find HdrCast -type f -printf '%8s  %p\n' | sort -k2); fi
 echo "total: $(du -sh "$DIST" | cut -f1)"
 
-# One top folder, forward slashes, files only - what Explorer's "Extract all" and every unzip expect.
+# One top folder, forward slashes, files only - what Explorer's "Extract all" and every unzip expect. Only the zip's
+# name says the version: Windows Firewall's rule and the sign-in entry name the exe's full path, so the folder is
+# plain HdrCast and the next version unzipped over it is the same program to both.
 step "zip dist/HdrCast-$VERSION.zip"
 ZIP="$ROOT/dist/HdrCast-$VERSION.zip"
 rm -f "$ZIP"
 if [ -n "$PYTHON" ]; then
-  if (cd "$ROOT/dist" && "$PYTHON" - "HdrCast-$VERSION" "HdrCast-$VERSION.zip" <<'PY'
+  if (cd "$ROOT/dist" && "$PYTHON" - HdrCast "HdrCast-$VERSION.zip" <<'PY'
 import os, sys, zipfile
 top, out = sys.argv[1], sys.argv[2]
 with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:

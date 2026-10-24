@@ -578,8 +578,9 @@ Cargo workspace（Rust 1.85+，edition 2021）。全部用普通线程和阻塞 
 | `crates/control`（hdrcast-control） | 远程控制：报文、按键名、输入注入（§9） |
 | `app`（hdrcast，产物 `HdrCast`） | Tauri 2 应用：窗口、命令、采集 + ffmpeg 的编排（`sender_runner`）、mpv 的编排（`mpv_runner`、`mpv_ipc`）、远程控制两端的粘合 |
 
-- `build.sh`：`cargo test --workspace` + 信令服务器的 Python 测试 → Windows：`cargo build --release -p hdrcast`，装配 `dist/HdrCast-<版本>/`
-  （`HdrCast.exe`、`tools/`、`scripts/`、`docs/`、`signal/`、README）并出 zip；macOS：`cargo tauri build` 出 `HdrCast.app` 和 dmg。
+- `build.sh`：`cargo test --workspace` + 信令服务器的 Python 测试 → Windows：`cargo build --release -p hdrcast`，装配 `dist/HdrCast/`
+  （`HdrCast.exe`、`tools/`、`scripts/`、`docs/`、`signal/`、README）并打成 `dist/HdrCast-<版本>.zip`；macOS：`cargo tauri build` 出 `HdrCast.app` 和 dmg。
+  zip 里的文件夹名不带版本号：防火墙规则（§8.7）和登录时启动的 Run 项（§2.7）认的都是 exe 的完整路径，新版本解压覆盖旧文件夹，两者都不用重做。
 - 配置存 `%APPDATA%\HdrCast\`（macOS：`~/Library/Application Support/HdrCast/`）；日志存其下的 `logs/hdrcast-yyyyMMdd.log`。
 - 界面不经打包器：`node scripts/ui-preview.mjs` 可以在浏览器里单独打开它（`ui/mock.js` 扮演后端）。
 - 调试用的环境变量：`HDRCAST_DATA_ROOT`（另一份配置）、`HDRCAST_NO_ROUTER=1`（不做 UPnP）、`HDRCAST_CONTROL_DRY_RUN=1`（远程控制只写日志）、

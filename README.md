@@ -53,9 +53,9 @@ sharer's computer. No relay server, no public IPv4 address, no port forwarding t
   sharer's side is open (next point).
 - **Windows Firewall: one click.** If the **Firewall** line in the app offers **Allow…**, click it once and confirm the
   Windows prompt. Some routers (common in China) give every destination a new port, and a PC only lets such packets in when
-  Windows Firewall allows HdrCast. The rule is tied to the program's path, so every new version unzipped into a new
-  folder needs this click again (the app asks). The app opens its port on the router by itself (UPnP) while it is
-  online or plays, and closes it again when it stops.
+  Windows Firewall allows HdrCast. The rule is tied to the program's path: unzip updates over the same `HdrCast` folder
+  (see [Install](#install)) and it stays; a copy in another folder needs this click again (the app asks). The app opens
+  its port on the router by itself (UPnP) while it is online or plays, and closes it again when it stops.
 - **ffmpeg** (to share) and **mpv** (to watch), built with SRT support. Windows: both already come in the `tools\` folder of
   the release. macOS: `brew install ffmpeg mpv`. See [Tools](#tools).
 - A GPU that decodes 10-bit HEVC in hardware (NVIDIA GTX 10 series or newer, AMD RX 400 or newer, Intel 7th gen or newer,
@@ -67,8 +67,13 @@ sharer's computer. No relay server, no public IPv4 address, no port forwarding t
 
 ### Install
 
-- **Windows:** unzip `HdrCast-<version>.zip` anywhere and run `HdrCast.exe`. ffmpeg, ffprobe and mpv are already in its
-  `tools\` folder. (Friends usually get the zip from whoever runs the group; to make one, see [Building](#building).)
+- **Windows:** unzip `HdrCast-<version>.zip` anywhere and run `HdrCast.exe` in the `HdrCast` folder it makes. ffmpeg,
+  ffprobe and mpv are already in its `tools\` folder. (Friends usually get the zip from whoever runs the group; to make
+  one, see [Building](#building).)
+- **Updating on Windows:** choose **Quit HdrCast** on HdrCast's icon in the notification area, then unzip the new zip
+  into the folder that holds `HdrCast` (in Explorer's **Extract All**, change the destination to that folder, say `D:\`)
+  and let it replace the files. The `HdrCast` folder has no version number in its name, so the firewall rule and
+  **Start HdrCast when I sign in** keep working.
 - **macOS:** drag `HdrCast.app` to Applications, then install the tools: `brew install ffmpeg mpv`. The first time you share,
   macOS asks for the Screen & System Audio Recording permission.
 
@@ -263,8 +268,9 @@ cargo run -p hdrcast          # run the app (debug build)
 node scripts/ui-preview.mjs   # only the UI, in a browser with mock data (http://localhost:5179)
 ```
 
-The result on Windows is `dist/HdrCast-<version>/` (`HdrCast.exe`, `tools/`, `scripts/`, `docs/`, `signal/`) and a zip of
-the same name; on macOS `dist/HdrCast.app` and a dmg. To try a build without touching your real group and settings, point
+The result on Windows is `dist/HdrCast/` (`HdrCast.exe`, `tools/`, `scripts/`, `docs/`, `signal/`) and
+`dist/HdrCast-<version>.zip` with that folder in it (only the zip's name has the version, see [Install](#install)); on
+macOS `dist/HdrCast.app` and a dmg. To try a build without touching your real group and settings, point
 the environment variable `HDRCAST_DATA_ROOT` at another folder.
 
 ## Repository layout
