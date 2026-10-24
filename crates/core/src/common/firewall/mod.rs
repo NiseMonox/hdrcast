@@ -2,8 +2,8 @@
 //!
 //! Without a rule Windows only lets in packets from an address and port the program sent to; a friend behind a
 //! router that picks a new port per destination arrives from a port we never sent to. The rule is per program
-//! path, so a new version in a new folder needs its own. Reading needs no rights; adding the rule runs this exe
-//! elevated.
+//! path, so a copy in a new folder needs its own (the release folder is plain `HdrCast`, without the version, so
+//! an update unzipped over it keeps the rule). Reading needs no rights; adding the rule runs this exe elevated.
 //!
 //! The rule evaluation is plain data in, verdict out, and runs (and is tested) on every platform. Only the
 //! functions that talk to the firewall are Windows-only; elsewhere [`check`] answers

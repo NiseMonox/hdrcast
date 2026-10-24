@@ -62,7 +62,7 @@ path ⇄ ViewerLink ⇄ mpv (127.0.0.1).
 | IPv6 | Simplest when both sides have it: then nothing below matters | Same |
 | Public IPv4 | Without IPv6, at least one side's router needs a public IPv4 address (not 10.x / 100.64-127.x / 172.16-31.x / 192.168.x) | Same |
 | Port forwarding on the router | Nothing to do by hand: while HdrCast is online or live, it forwards its own IPv4 port with UPnP, and deletes the forward when it stops (the router needs UPnP on, which most have by default) | Same (while watching) |
-| Windows Firewall | Click **Allow…** when the **Firewall** line in the app offers it (Windows asks for administrator approval once; a new version in a new folder needs another click; not needed on macOS) | Same (only matters when the sharer is behind a symmetric NAT) |
+| Windows Firewall | Click **Allow…** when the **Firewall** line in the app offers it (Windows asks for administrator approval once; updates unzipped over the same `HdrCast` folder keep it, a copy in another folder needs another click; not needed on macOS) | Same (only matters when the sharer is behind a symmetric NAT) |
 | Upload | bitrate × viewers × 1.25-1.5 (§7) | Very little (only acknowledgements) |
 | Download | Very little | bitrate × 1.3 |
 
@@ -219,9 +219,11 @@ bitrate to expect** (100 Mbps by default; larger is safer, it only costs memory)
     stay). Block rules left over from clicking "Cancel" on a Windows prompt are disabled, not deleted. While the rule
     is missing, HdrCast asks once per run as soon as this computer can be connected to (**Available to connect** on,
     or **Go Live**); a viewer is asked once too, when an IPv4 attempt failed in a way the rule could help with.
-  - The rule is tied to the full path of the exe: a new version in a new folder (say `D:\HdrCast-0.3.1\`) needs another
-    click. To undo it: Windows Security → Firewall & network protection → Advanced settings → Inbound Rules, and delete
-    the rule.
+  - The rule is tied to the full path of the exe. The folder in the zip is plain `HdrCast` (only the zip's name carries
+    the version), so a new version unzipped over the old folder keeps the rule, while a copy in any other folder needs
+    another click. Up to 0.3.3 the folder was named after the version (say `D:\HdrCast-0.3.1\`), so the move to
+    `HdrCast` takes this click once more. To undo it: Windows Security → Firewall & network protection → Advanced
+    settings → Inbound Rules, and delete the rule.
 - **Is that safe?** All it opens is one UDP port of HdrCast itself. HdrCast only accepts punch packets signed with the
   group key and data from confirmed addresses, and drops everything else; the video itself is encrypted with SRT's
   AES-256.

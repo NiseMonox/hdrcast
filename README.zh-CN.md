@@ -25,7 +25,7 @@
 
 - **Windows 10 或 11**（64 位），或 **macOS 13** 及以上。在 Mac 上分享 HDR 需要 macOS 15 和 Apple 芯片。
 - **最好有 IPv6**。点对点在 IPv6 上最好用（IPv6 没有 NAT，两台电脑能直接互通）。在 <https://test-ipv6.com> 检查：看到 "10/10"，至少是 "IPv6 address detected" 就行。没有 IPv6？通常可以在路由器里打开，或者请运营商开通。没有 IPv6 时 HdrCast 走 IPv4，只要主播那边是开放的就能连（见下一条）。
-- **Windows 防火墙：点一次**。应用里 **防火墙** 那一行出现 **放行…** 时点一下，并在 Windows 的提示里确认。有些路由器（国内常见）每个目的地换一个端口，这样的包只有在 Windows 防火墙放行 HdrCast 时才进得来。这条规则认的是程序所在的路径，所以每次把新版本解压到新文件夹，都要再点一次（应用会问）。应用在线或播放时会自己在路由器上打开端口（UPnP），停下后再关掉。
+- **Windows 防火墙：点一次**。应用里 **防火墙** 那一行出现 **放行…** 时点一下，并在 Windows 的提示里确认。有些路由器（国内常见）每个目的地换一个端口，这样的包只有在 Windows 防火墙放行 HdrCast 时才进得来。这条规则认的是程序所在的路径：升级时把新版本解压覆盖到同一个 `HdrCast` 文件夹（见 [安装](#安装)），规则就一直有效；放到别的文件夹的副本要再点一次（应用会问）。应用在线或播放时会自己在路由器上打开端口（UPnP），停下后再关掉。
 - **ffmpeg**（开播用）和 **mpv**（观看用），都要带 SRT 支持。Windows：发行包的 `tools\` 里已经带了。macOS：`brew install ffmpeg-full mpv`（Homebrew 普通的 `ffmpeg` 不带 SRT）。见 [工具](#工具)。
 - 能硬解 10 bit HEVC 的显卡（NVIDIA GTX 10 系及以上、AMD RX 400 及以上、Intel 7 代及以上、任何 Apple 芯片的 Mac）。
 - 下行带宽约为码率的 1.3 倍（40 Mbps 的流要 50 Mbps 左右）。开播的人每位观众要占一路上行（见 [开播](#开播)）。
@@ -34,7 +34,8 @@
 
 ### 安装
 
-- **Windows**：把 `HdrCast-<版本>.zip` 解压到任意位置，运行 `HdrCast.exe`。ffmpeg、ffprobe 和 mpv 已经在它的 `tools\` 里。（朋友一般从建组的人那里拿到这个 zip；自己打包见 [构建](#构建)。）
+- **Windows**：把 `HdrCast-<版本>.zip` 解压到任意位置，运行解压出来的 `HdrCast` 文件夹里的 `HdrCast.exe`。ffmpeg、ffprobe 和 mpv 已经在它的 `tools\` 里。（朋友一般从建组的人那里拿到这个 zip；自己打包见 [构建](#构建)。）
+- **Windows 上升级**：先在通知区域的 HdrCast 图标上选 **退出 HdrCast**，再把新的 zip 解压到放 `HdrCast` 的那个文件夹（资源管理器的"全部解压缩"里把目标改成那个文件夹，比如 `D:\`），替换旧文件。`HdrCast` 文件夹名不带版本号，所以防火墙规则和 **登录时自动启动 HdrCast** 都继续有效。
 - **macOS**：把 `HdrCast.app` 拖进"应用程序"，再装工具：`brew install ffmpeg-full mpv`。第一次开播时系统会请求"屏幕与系统音频录制"权限。
 
 ### 建组或加入
@@ -165,7 +166,7 @@ cargo run -p hdrcast          # 直接运行（调试构建）
 node scripts/ui-preview.mjs   # 只在浏览器里看界面，用模拟数据（http://localhost:5179）
 ```
 
-产物：Windows 是 `dist/HdrCast-<版本>/`（`HdrCast.exe`、`tools/`、`scripts/`、`docs/`、`signal/`）和同名 zip；macOS 是 `dist/HdrCast.app` 和 dmg。想不碰真实的群组和设置试一个构建：把环境变量 `HDRCAST_DATA_ROOT` 指向另一个文件夹。
+产物：Windows 是 `dist/HdrCast/`（`HdrCast.exe`、`tools/`、`scripts/`、`docs/`、`signal/`）和装着这个文件夹的 `dist/HdrCast-<版本>.zip`（只有 zip 的名字带版本号，见 [安装](#安装)）；macOS 是 `dist/HdrCast.app` 和 dmg。想不碰真实的群组和设置试一个构建：把环境变量 `HDRCAST_DATA_ROOT` 指向另一个文件夹。
 
 ## 目录结构
 
