@@ -198,7 +198,7 @@ const api = {
       latencyPresets: LATENCY_PRESETS,
       toneMappings: ['bt.2390', 'auto', 'spline', 'bt.2446a', 'st2094-40', 'st2094-10', 'hable', 'mobius', 'reinhard', 'clip'],
       hwDecModes: HWDEC_MODES,
-      tools: { ffmpeg: { path: mac ? '/opt/homebrew/bin/ffmpeg' : 'D:\\HdrCast\\tools\\ffmpeg.exe' }, mpv: { path: mac ? null : 'D:\\HdrCast\\tools\\mpv.exe' } },
+      tools: { ffmpeg: { path: mac ? '/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg' : 'D:\\HdrCast\\tools\\ffmpeg.exe' }, mpv: { path: mac ? null : 'D:\\HdrCast\\tools\\mpv.exe' } },
       firewall: db.firewall,
       paths: { config: mac ? '~/Library/Application Support/HdrCast' : 'C:\\Users\\me\\AppData\\Roaming\\HdrCast', logs: '' },
       caps: { audioExclude: !mac, clipboardWatch: !mac },

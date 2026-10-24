@@ -92,7 +92,7 @@ if [ "$OS" = macos ]; then
     cp "$TARGET"/release/bundle/dmg/*.dmg "$ROOT/dist/" 2>/dev/null || true
     echo "  dist/HdrCast.app $(du -sh "$ROOT/dist/HdrCast.app" | cut -f1)"
     ls "$ROOT"/dist/*.dmg 2>/dev/null | sed 's/^/  /'
-    echo "  ffmpeg and mpv are not inside: brew install ffmpeg mpv"
+    echo "  ffmpeg and mpv are not inside: brew install ffmpeg-full mpv"
   else
     tail -n 30 "$LOGDIR/build.log"; echo "!! build FAILED (see $LOGDIR/build.log)"; FAILED+=("app")
   fi
