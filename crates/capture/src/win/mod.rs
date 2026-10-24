@@ -9,21 +9,25 @@ mod converter;
 mod cursor;
 mod display_config;
 mod duplicator;
+mod nvenc;
 mod outputs;
 mod pipe;
 mod process;
 mod process_loopback;
 mod selftest;
+mod surfaces;
 mod timer;
 mod util;
 mod video;
 
 use std::io;
 
-use crate::args::CaptureArgs;
+use crate::args::{CaptureArgs, EncodeArgs, EngineEncoder};
+use crate::encode::VideoEncoder;
 use crate::output::OutputInfo;
 use crate::platform::{
-    AudioDeviceInfo, AudioSink, AudioSource, Backend, PipeServer, ProcessWatch, VideoSource,
+    AudioDeviceInfo, AudioSink, AudioSource, Backend, FrameLayout, PipeServer, ProcessWatch,
+    VideoSource,
 };
 
 pub(crate) use console::{
@@ -67,6 +71,20 @@ impl Backend for NativeBackend {
 
     fn self_test(&self, sdr_white: f32) -> i32 {
         selftest::run(sdr_white)
+    }
+
+    fn open_encoder(
+        &self,
+        args: &EncodeArgs,
+        layout: FrameLayout,
+        fps: u32,
+    ) -> Result<Box<dyn VideoEncoder>, String> {
+        // Frames in memory: zero copy, where possible, comes from the video source (`surface_encoder`).
+        match args.encoder {
+            EngineEncoder::Nvenc => Ok(Box::new(nvenc::NvencEncoder::open(
+                args, layout, fps, None,
+            )?)),
+        }
     }
 }
 
@@ -125,7 +143,12 @@ mod tests {
             // what a string-marshalling wrapper hands the compiler: the ANSI bytes, cut to the UTF-16 length
             let mut seen = to_code_page(source, code_page);
             seen.truncate(utf16_len);
-            for entry in [shader::ENTRY_P010, shader::ENTRY_NV12] {
+            for entry in [
+                shader::ENTRY_P010,
+                shader::ENTRY_NV12,
+                shader::ENTRY_P010_PLANES,
+                shader::ENTRY_NV12_PLANES,
+            ] {
                 if let Err(error) = super::converter::compile_shader(&seen, entry) {
                     failures.push(format!("code page {code_page}, {entry}: {error}"));
                 }

@@ -128,6 +128,12 @@ impl RemuxChild {
         crate::udp_channel::free_loopback_udp_port()
     }
 
+    /// Closes the child's input, once the fan-out let go of its copy: the child ends the stream properly, its SRT
+    /// connection with it (the viewer's side learns at once instead of after its idle timeout), and exits.
+    pub fn finish(&self) {
+        lock(&self.stdin).take();
+    }
+
     /// Kills the child (waiting up to 3 s for it to be gone), then closes its stdin.
     ///
     /// In that order, always: a child still waiting for its viewer is not reading stdin, and with the C# apps

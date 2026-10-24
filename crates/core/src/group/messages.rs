@@ -132,6 +132,10 @@ pub struct LiveRecord {
     /// "od": the host is available on request instead of broadcasting. It starts capturing when someone it lets
     /// in connects (docs/design.md §8.10). Written only when true; absent means a broadcast (as every older host).
     pub on_demand: bool,
+    /// "kf": the host takes keyframe requests on the side channel and answers them (docs/design.md §8.12): its
+    /// encoder runs inside HdrCast. Written only when true, last; absent means no, and then nothing of the kind may
+    /// be sent to it (a host older than 0.3.3 would hand the datagram to SRT).
+    pub keyframes: bool,
 }
 
 impl Default for LiveRecord {
@@ -150,6 +154,7 @@ impl Default for LiveRecord {
             remote_control: None,
             device_key: None,
             on_demand: false,
+            keyframes: false,
         }
     }
 }
@@ -181,6 +186,9 @@ impl LiveRecord {
         if self.on_demand {
             p.insert("od".to_string(), Value::from(true));
         }
+        if self.keyframes {
+            p.insert("kf".to_string(), Value::from(true));
+        }
         p
     }
 
@@ -200,6 +208,7 @@ impl LiveRecord {
             remote_control: field(p, "rc").and_then(json::as_bool),
             device_key: text(p, "dk").filter(|k| device::parse_public_key(k).is_some()).map(str::to_string),
             on_demand: field(p, "od").and_then(json::as_bool).unwrap_or(false),
+            keyframes: field(p, "kf").and_then(json::as_bool).unwrap_or(false),
         };
         (r.host_id == expected_host).then_some(r)
     }
@@ -255,6 +264,9 @@ pub struct JoinRequest {
     pub remote_control: bool,
     /// The viewer's device and its signature (0.3.1 on); `None` from older viewers.
     pub device: Option<DeviceProof>,
+    /// "kf": the viewer asks for a keyframe when it loses part of the stream, and understands the host's answers
+    /// on the side channel (docs/design.md §8.12). Written only when true, last; absent means no.
+    pub keyframes: bool,
 }
 
 impl JoinRequest {
@@ -274,6 +286,9 @@ impl JoinRequest {
         if let Some(device) = &self.device {
             device.write(&mut p);
         }
+        if self.keyframes {
+            p.insert("kf".to_string(), Value::from(true));
+        }
         p
     }
 
@@ -290,6 +305,7 @@ impl JoinRequest {
             overhead_percent: int32(p, "overhead"),
             remote_control: field(p, "rc").and_then(json::as_bool).unwrap_or(false),
             device: DeviceProof::read(p, true),
+            keyframes: field(p, "kf").and_then(json::as_bool).unwrap_or(false),
         };
         if !keys::is_valid_id(&j.session_id) || !keys::is_valid_id(&j.viewer_id) {
             return None;
@@ -410,7 +426,7 @@ mod tests {
         let open = LiveRecord { open_ipv4: Some(false), ..live };
         assert!(Value::Object(open.to_payload()).to_string().ends_with(r#","viewers":1,"open4":false}"#));
 
-        let join = JoinRequest { session_id: "S".into(), viewer_id: "V".into(), name: "n".into(), time_ms: 3, candidates: vec![], latency_ms: 3500, overhead_percent: 50, remote_control: false, device: None };
+        let join = JoinRequest { session_id: "S".into(), viewer_id: "V".into(), name: "n".into(), time_ms: 3, candidates: vec![], latency_ms: 3500, overhead_percent: 50, remote_control: false, device: None, keyframes: false };
         assert_eq!(Value::Object(join.to_payload()).to_string(), r#"{"v":1,"t":3,"sid":"S","viewer":"V","name":"n","cands":[],"latency":3500,"overhead":50}"#);
 
         let answer = JoinAnswer { session_id: "S".into(), time_ms: 4, ok: false, reason: JoinAnswer::REASON_FULL.into(), candidates: vec![], device: None };
@@ -470,6 +486,42 @@ mod tests {
         let odd = object(&format!(r#"{{"host":"{host}","dk":"AAAA","od":false}}"#));
         let read = LiveRecord::from_payload(&odd, &host).unwrap();
         assert_eq!((read.device_key, read.on_demand), (None, false));
+    }
+
+    #[test]
+    fn the_keyframe_flag_comes_last_only_when_set_so_older_peers_see_their_own_bytes() {
+        // live: without it the text is what 0.3.2 wrote, with it "kf" follows everything else
+        let host = keys::new_id();
+        let dk = device::DeviceKey::generate().public_key().to_string();
+        let live = LiveRecord { host_id: host.clone(), name: "n".into(), time_ms: 2, since_ms: 1, mbps: 40, max_viewers: 4, viewers: 1, remote_control: Some(true), device_key: Some(dk.clone()), on_demand: true, ..LiveRecord::default() };
+        let plain = Value::Object(live.to_payload()).to_string();
+        assert!(plain.ends_with(&format!(r#","viewers":1,"rc":true,"dk":"{dk}","od":true}}"#)), "{plain}");
+        assert!(!plain.contains(r#""kf""#), "{plain}");
+        assert!(!LiveRecord::from_payload(&live.to_payload(), &host).unwrap().keyframes);
+        let offering = LiveRecord { keyframes: true, ..live.clone() };
+        let text = Value::Object(offering.to_payload()).to_string();
+        assert_eq!(text, format!(r#"{}{}"#, &plain[..plain.len() - 1], r#","kf":true}"#));
+        assert_eq!(LiveRecord::from_payload(&offering.to_payload(), &host).unwrap(), offering);
+        // false is not written; what is not a flag reads as no (strings as the other flags read them)
+        for value in ["false", "7", "\"no\"", "null"] {
+            let odd = object(&format!(r#"{{"host":"{host}","kf":{value}}}"#));
+            assert!(!LiveRecord::from_payload(&odd, &host).unwrap().keyframes, "{value}");
+        }
+
+        // join: after the device proof, so a signed join's first bytes and its signature stay what they were
+        let (sid, viewer) = (keys::new_id(), keys::new_id());
+        let proof = DeviceProof { key: dk.clone(), exchange: "E".into(), signature: "S".into() };
+        let join = JoinRequest { session_id: sid, viewer_id: viewer, name: "n".into(), time_ms: 3, latency_ms: 3500, overhead_percent: 50, remote_control: true, device: Some(proof), ..JoinRequest::default() };
+        let plain = Value::Object(join.to_payload()).to_string();
+        assert!(plain.ends_with(&format!(r#","overhead":50,"rc":true,"dk":"{dk}","ek":"E","ds":"S"}}"#)), "{plain}");
+        assert!(!JoinRequest::from_payload(&join.to_payload()).unwrap().keyframes);
+        let asking = JoinRequest { keyframes: true, ..join.clone() };
+        let text = Value::Object(asking.to_payload()).to_string();
+        assert_eq!(text, format!(r#"{}{}"#, &plain[..plain.len() - 1], r#","kf":true}"#));
+        assert_eq!(JoinRequest::from_payload(&asking.to_payload()), Some(asking));
+        // and without anything else optional it still comes last
+        let bare = JoinRequest { remote_control: false, device: None, keyframes: true, ..join };
+        assert!(Value::Object(bare.to_payload()).to_string().ends_with(r#","latency":3500,"overhead":50,"kf":true}"#));
     }
 
     #[test]

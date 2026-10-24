@@ -4,6 +4,7 @@
 //! amfenc_hevc.c, qsvenc_hevc.c, qsvenc.h, libx265.c), and the integration tests run the generated lists
 //! through a real ffmpeg. The VideoToolbox profile is the exception: see [`VideoEncoder::HevcVideoToolbox`].
 
+use hdrcast_capture::{EncodeArgs, EngineEncoder, Multipass};
 use serde::Serialize;
 
 use super::settings::SenderSettings;
@@ -356,6 +357,40 @@ pub fn build_video_args(s: &EncoderSettings) -> Vec<String> {
     a
 }
 
+/// The encoder the capture engine can run itself in place of `encoder` (docs/design.md §2.8): NVENC only.
+pub fn engine_encoder(encoder: VideoEncoder) -> Option<EngineEncoder> {
+    match encoder {
+        VideoEncoder::HevcNvenc => Some(EngineEncoder::Nvenc),
+        _ => None,
+    }
+}
+
+/// The capture engine's `--encode` options for `s`: what [`build_video_args`] gives hevc_nvenc, with no lookahead
+/// (it would hold the keyframe asked for 20 frames back) and the keyframes counted by the engine. `None` for an
+/// encoder the engine cannot run.
+pub fn engine_encode_args(s: &EncoderSettings) -> Option<EncodeArgs> {
+    let encoder = engine_encoder(s.encoder)?;
+    let preset = s.preset;
+    Some(EncodeArgs {
+        encoder,
+        bitrate_kbps: s.bitrate_kbps,
+        vbv_kbits: round(f64::from(s.bitrate_kbps) * s.buffer_seconds).max(1) as u32,
+        gop_frames: round(f64::from(s.fps) * s.gop_seconds).max(1) as u32,
+        b_frames: if s.b_frames { b_frame_count(preset) } else { 0 },
+        preset: match preset {
+            QualityPreset::Speed => 3,
+            QualityPreset::Balanced => 5,
+            QualityPreset::Quality => 7,
+        },
+        multipass: match preset {
+            QualityPreset::Speed => Multipass::Off,
+            QualityPreset::Balanced => Multipass::Quarter,
+            QualityPreset::Quality => Multipass::Full,
+        },
+        aq_strength: 8,
+    })
+}
+
 /// What the capture engine's samples are: PQ / BT.2020 (HDR) or BT.709 (SDR), limited range.
 pub fn color_tags(hdr: bool) -> Vec<String> {
     words(if hdr {
@@ -480,5 +515,32 @@ mod tests {
         };
         let a = build_video_args(&s);
         assert_eq!(a[a.iter().position(|x| x == "-g").unwrap() + 1], "1");
+    }
+
+    #[test]
+    fn the_engine_encodes_like_hevc_nvenc_without_lookahead() {
+        let s = EncoderSettings { encoder: VideoEncoder::HevcNvenc, bitrate_kbps: 40000, fps: 60, gop_seconds: 1.0, buffer_seconds: 0.25, ..Default::default() };
+        let a = build_video_args(&s);
+        let value = |name: &str| a[a.iter().position(|x| x == name).unwrap() + 1].clone();
+        let e = engine_encode_args(&s).unwrap();
+        assert_eq!(e.encoder, EngineEncoder::Nvenc);
+        assert_eq!(format!("p{}", e.preset), value("-preset"));
+        assert_eq!(e.multipass.name(), "quarter");
+        assert_eq!(value("-multipass"), "qres");
+        assert_eq!(e.b_frames.to_string(), value("-bf"));
+        assert_eq!(e.gop_frames.to_string(), value("-g"));
+        assert_eq!(format!("{}k", e.vbv_kbits), value("-bufsize"));
+        assert_eq!(format!("{}k", e.bitrate_kbps), value("-b:v"));
+        assert_eq!(e.aq_strength.to_string(), value("-aq-strength"));
+        assert_eq!(value("-rc-lookahead"), "20", "ffmpeg looks ahead; the engine does not");
+        // B-frames off, the other presets
+        let off = engine_encode_args(&EncoderSettings { b_frames: false, preset: QualityPreset::Quality, ..s.clone() }).unwrap();
+        assert_eq!((off.b_frames, off.preset, off.multipass), (0, 7, Multipass::Full));
+        let fast = engine_encode_args(&EncoderSettings { preset: QualityPreset::Speed, ..s.clone() }).unwrap();
+        assert_eq!((fast.b_frames, fast.preset, fast.multipass), (0, 3, Multipass::Off));
+        // only NVENC
+        for encoder in [VideoEncoder::HevcAmf, VideoEncoder::HevcQsv, VideoEncoder::LibX265, VideoEncoder::HevcVideoToolbox] {
+            assert_eq!(engine_encode_args(&EncoderSettings { encoder, ..s.clone() }), None, "{encoder:?}");
+        }
     }
 }

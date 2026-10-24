@@ -7,6 +7,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::Duration;
 
 use hdrcast_core::endpoint;
 use hdrcast_core::group::keys::InvalidIdError;
@@ -23,6 +24,10 @@ use crate::util::{lock, round_half_even, Callbacks};
 /// Receives what the host sends on the side channel. Runs on a network thread.
 pub type ViewerSideHandler = Arc<dyn Fn(&[u8]) + Send + Sync>;
 
+/// Told when data of the stream has been missing on the way in for longer than SRT needs to get it again
+/// twice, with how long that was (docs/design.md §8.12). Runs on a network thread.
+pub type LastingLossHandler = Arc<dyn Fn(Duration) + Send + Sync>;
+
 type StateChanged = dyn Fn(LinkState) + Send + Sync;
 
 pub struct ViewerLink {
@@ -36,6 +41,7 @@ struct Inner {
     bytes_from_host: AtomicU64,
     state_changed: Callbacks<StateChanged>,
     side_handler: Mutex<Option<ViewerSideHandler>>,
+    lasting_loss: Mutex<Option<LastingLossHandler>>,
 }
 
 struct State {
@@ -68,6 +74,7 @@ impl ViewerLink {
             bytes_from_host: AtomicU64::new(0),
             state_changed: Callbacks::new(),
             side_handler: Mutex::new(None),
+            lasting_loss: Mutex::new(None),
         });
         let _ = slot.set(Arc::downgrade(&inner));
         let events: Weak<dyn LinkEvents> = Arc::downgrade(&(inner.clone() as Arc<dyn LinkEvents>));
@@ -202,6 +209,11 @@ impl ViewerLink {
         *lock(&self.inner.side_handler) = Some(handler);
     }
 
+    /// Who is told when data of the stream stays missing on the way in (see [`LastingLossHandler`]).
+    pub fn on_lasting_loss(&self, handler: LastingLossHandler) {
+        *lock(&self.inner.lasting_loss) = Some(handler);
+    }
+
     /// Sends `payload` (1..=1200 bytes) to the host on the side channel, on the path the stream uses. False
     /// when the session is not connected or the payload is out of range. Only for hosts that announced it:
     /// an older host would take the datagram for SRT.
@@ -329,6 +341,12 @@ impl LinkEvents for Inner {
         srt.from_sender(datagram);
         if self.local.send(datagram, mpv) {
             self.bytes_from_host.fetch_add(datagram.len() as u64, Ordering::Relaxed);
+        }
+        if let Some(missing) = srt.take_lasting_loss() {
+            let handler = lock(&self.lasting_loss).clone();
+            if let Some(handler) = handler {
+                handler(missing);
+            }
         }
     }
 

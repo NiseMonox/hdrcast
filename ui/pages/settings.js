@@ -123,7 +123,7 @@ export function SettingsPage() {
     <//>
 
     <${Section} title=${t('settings.playback')}>
-      <${Row} name=${t('settings.hwdec')} disabled=${watching}>
+      <${Row} name=${t('settings.hwdec')}>
         <${Select} value=${receiver.hwDec} onChange=${(v) => setR({ hwDec: v })}
           options=${s.init.hwDecModes.map((m) => ({ value: m.id, label: m.name }))} />
       <//>

@@ -28,7 +28,8 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::args::{CaptureArgs, CaptureFormat};
+use crate::args::{CaptureArgs, CaptureFormat, EncodeArgs};
+use crate::encode::VideoEncoder;
 use crate::output::OutputInfo;
 
 #[cfg(windows)]
@@ -101,7 +102,8 @@ impl FrameLayout {
 /// Outcome of one [`VideoSource::next_frame`] call.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FrameStatus {
-    /// A new picture was converted into the buffer; `gpu_ms` is what the conversion and read-back took.
+    /// A new picture was converted into the buffer; `gpu_ms` is what the conversion and read-back took (with
+    /// zero copy only what handing the conversion to the GPU took: nothing waits for it there).
     New { gpu_ms: f64 },
     /// Nothing changed within the timeout; the buffer was not written and the engine repeats the last frame.
     Unchanged,
@@ -131,7 +133,43 @@ pub trait VideoSource {
 
     /// Re-creates the capture after [`VideoError::Lost`].
     fn recover(&mut self) -> Result<(), String>;
+
+    /// Zero copy (design.md section 2.8): an encoder on this source's own GPU device that reads the pictures
+    /// straight from surfaces this source converts into, instead of frames in memory. `frames`: how many frames
+    /// the engine holds at once (its queue, the latest frame, the one being converted); the encoder makes that
+    /// many surfaces plus the ones it holds itself ([`VideoEncoder::surfaces`]). `None` (the default) when this
+    /// source cannot feed one (no such encoder on its GPU, a feature missing; the reason is logged): the engine
+    /// then opens the [`Backend`]'s encoder, which takes frames in memory.
+    fn surface_encoder(
+        &mut self,
+        args: &EncodeArgs,
+        fps: u32,
+        frames: usize,
+    ) -> Option<Box<dyn VideoEncoder>> {
+        let _ = (args, fps, frames);
+        None
+    }
+
+    /// Like [`next_frame`](Self::next_frame), but converts into surface `surface` of the encoder that
+    /// [`surface_encoder`](Self::surface_encoder) returned. The engine calls it only then, and only with a
+    /// surface nobody is reading.
+    fn next_surface(
+        &mut self,
+        surface: usize,
+        timeout: Duration,
+    ) -> Result<FrameStatus, VideoError> {
+        let _ = (surface, timeout);
+        Err(VideoError::Fatal(NO_SURFACES.to_owned()))
+    }
+
+    /// Fills surface `surface` with black: the first frame, before the screen delivered one.
+    fn black_surface(&mut self, surface: usize) -> Result<(), String> {
+        let _ = surface;
+        Err(NO_SURFACES.to_owned())
+    }
 }
+
+const NO_SURFACES: &str = "this screen converts into memory, not into encoder surfaces";
 
 /// Receives captured desktop audio: interleaved stereo f32 at 48 kHz (`samples.len()` is even).
 /// Called from the source's capture thread, one call at a time.
@@ -205,6 +243,14 @@ pub trait Backend: Send {
     /// `capture --selftest`: runs the conversion on a synthetic gradient, prints the comparison with
     /// [`crate::color`] to stdout and returns the exit code.
     fn self_test(&self, sdr_white: f32) -> i32;
+
+    /// Opens the encoder `args` names for frames of `layout` at `fps` (`--encode`, design.md section 2.8). The
+    /// error says why it cannot be had here (no such GPU, a driver too old); the engine then exits with
+    /// `ENCODER_UNAVAILABLE` and the app has ffmpeg encode instead.
+    fn open_encoder(&self, args: &EncodeArgs, layout: FrameLayout, fps: u32) -> Result<Box<dyn VideoEncoder>, String> {
+        let _ = (layout, fps);
+        Err(format!("{} is not available on this platform", args.encoder.name()))
+    }
 }
 
 /// One audio render endpoint.

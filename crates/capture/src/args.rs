@@ -35,6 +35,81 @@ impl fmt::Display for CaptureFormat {
     }
 }
 
+/// An encoder the engine can run itself (`--encode`, docs/design.md §2.8). The video pipe then carries an
+/// MPEG-TS of HEVC pictures instead of raw frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EngineEncoder {
+    /// NVIDIA's NVENC, through the driver's own nvEncodeAPI64.dll (Windows).
+    Nvenc,
+}
+
+impl EngineEncoder {
+    /// The value `--encode` takes.
+    pub fn name(self) -> &'static str {
+        match self {
+            EngineEncoder::Nvenc => "nvenc",
+        }
+    }
+}
+
+/// Two-pass mode of the encoder (`--multipass`): the first pass looks at the same frame, at a quarter or at the
+/// full resolution, so neither adds a frame of delay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Multipass {
+    Off,
+    Quarter,
+    Full,
+}
+
+impl Multipass {
+    pub fn name(self) -> &'static str {
+        match self {
+            Multipass::Off => "off",
+            Multipass::Quarter => "quarter",
+            Multipass::Full => "full",
+        }
+    }
+}
+
+/// How the engine encodes when it does so itself (`--encode` and the options after it). Rate control is CBR
+/// with no lookahead: a keyframe asked for must leave the encoder with the next frame, not 20 frames later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodeArgs {
+    pub encoder: EngineEncoder,
+    pub bitrate_kbps: u32,
+    /// The rate buffer (VBV) in kbit.
+    pub vbv_kbits: u32,
+    /// Frames from one keyframe to the next when nobody asks for one in between.
+    pub gop_frames: u32,
+    /// B-frames between two reference frames (0 = none).
+    pub b_frames: u32,
+    /// NVENC preset P1 (fastest) .. P7 (best).
+    pub preset: u32,
+    pub multipass: Multipass,
+    /// Spatial adaptive quantisation strength 1..15; 0 = off.
+    pub aq_strength: u32,
+}
+
+impl EncodeArgs {
+    pub const DEFAULT_BITRATE_KBPS: u32 = 40_000;
+    pub const DEFAULT_PRESET: u32 = 5;
+    pub const DEFAULT_AQ_STRENGTH: u32 = 8;
+
+    /// The defaults for `encoder` at `fps`: 40 Mbps, a quarter second of VBV, a keyframe a second, no B-frames.
+    pub fn defaults(encoder: EngineEncoder, fps: u32) -> Self {
+        Self {
+            encoder,
+            bitrate_kbps: Self::DEFAULT_BITRATE_KBPS,
+            vbv_kbits: Self::DEFAULT_BITRATE_KBPS / 4,
+            gop_frames: fps.max(1),
+            b_frames: 0,
+            preset: Self::DEFAULT_PRESET,
+            multipass: Multipass::Quarter,
+            aq_strength: Self::DEFAULT_AQ_STRENGTH,
+        }
+    }
+}
+
 /// Returned by [`CaptureArgs::parse`] for malformed command lines (exit code 2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureArgsError(pub String);
@@ -82,6 +157,9 @@ pub struct CaptureArgs {
     pub dump_seconds: u32,
     /// Debug: run the shader on a synthetic gradient and print values.
     pub self_test: bool,
+    /// Encode inside the engine: the video pipe (or the dump file) gets MPEG-TS, and stdin takes commands
+    /// (docs/design.md §2.8). `None` = raw frames for ffmpeg to encode, as always.
+    pub encode: Option<EncodeArgs>,
 }
 
 impl Default for CaptureArgs {
@@ -104,6 +182,7 @@ impl Default for CaptureArgs {
             dump_path: None,
             dump_seconds: 0,
             self_test: false,
+            encode: None,
         }
     }
 }
@@ -145,13 +224,31 @@ impl CaptureArgs {
              \x20 --pipe-timeout <s>        seconds to wait for the pipe client (default 30)\n\
              \x20 --parent-pid <pid>        exit when this process disappears\n\
              \x20 --dump <file> [--seconds <n>]  write raw frames to a file instead of the pipe\n\
-             \x20 --selftest                run the conversion shader on a synthetic gradient\n"
+             \x20 --selftest                run the conversion shader on a synthetic gradient\n\
+             \x20 --encode nvenc            encode here and send MPEG-TS (HEVC) instead of raw frames;\n\
+             \x20                           stdin then takes \"keyframe\" and \"bitrate <kbps> [<vbv kbit>]\"\n\
+             \x20   --bitrate <kbps>        CBR target (default 40000)\n\
+             \x20   --vbv <kbit>            rate buffer (default a quarter second of the bitrate)\n\
+             \x20   --gop <frames>          frames between keyframes nobody asked for (default = fps)\n\
+             \x20   --bframes <n>           B-frames between references (default 0)\n\
+             \x20   --preset <1..7>         NVENC preset P1..P7 (default 5)\n\
+             \x20   --multipass off|quarter|full  (default quarter)\n\
+             \x20   --aq <0..15>            spatial AQ strength, 0 = off (default 8)\n"
         )
     }
 
     /// Parses the arguments that follow the `capture` verb.
     pub fn parse<S: AsRef<str>>(args: &[S]) -> Result<CaptureArgs, CaptureArgsError> {
         let mut a = CaptureArgs::default();
+        // The encoder's options may come in any order, before or after --encode itself.
+        let mut encoder: Option<EngineEncoder> = None;
+        let mut bitrate: Option<u32> = None;
+        let mut vbv: Option<u32> = None;
+        let mut gop: Option<u32> = None;
+        let mut b_frames: Option<u32> = None;
+        let mut preset: Option<u32> = None;
+        let mut multipass: Option<Multipass> = None;
+        let mut aq: Option<u32> = None;
         let mut it = args.iter().map(AsRef::as_ref);
         while let Some(opt) = it.next() {
             let mut next = || {
@@ -197,6 +294,14 @@ impl CaptureArgs {
                 }
                 "--seconds" => a.dump_seconds = parse_int(opt, next()?, 1, 86400)? as u32,
                 "--selftest" => a.self_test = true,
+                "--encode" => encoder = Some(parse_encoder(next()?)?),
+                "--bitrate" => bitrate = Some(parse_int(opt, next()?, 100, 1_000_000)? as u32),
+                "--vbv" => vbv = Some(parse_int(opt, next()?, 1, 10_000_000)? as u32),
+                "--gop" => gop = Some(parse_int(opt, next()?, 1, 100_000)? as u32),
+                "--bframes" => b_frames = Some(parse_int(opt, next()?, 0, 4)? as u32),
+                "--preset" => preset = Some(parse_int(opt, next()?, 1, 7)? as u32),
+                "--multipass" => multipass = Some(parse_multipass(next()?)?),
+                "--aq" => aq = Some(parse_int(opt, next()?, 0, 15)? as u32),
                 _ => return err(format!("unknown option: {opt}")),
             }
         }
@@ -205,6 +310,33 @@ impl CaptureArgs {
         }
         if a.dump_seconds > 0 && a.dump_path.is_none() {
             return err("--seconds requires --dump <file>");
+        }
+        match encoder {
+            Some(encoder) => {
+                let d = EncodeArgs::defaults(encoder, a.fps);
+                let bitrate_kbps = bitrate.unwrap_or(d.bitrate_kbps);
+                a.encode = Some(EncodeArgs {
+                    encoder,
+                    bitrate_kbps,
+                    vbv_kbits: vbv.unwrap_or(bitrate_kbps / 4).max(1),
+                    gop_frames: gop.unwrap_or(d.gop_frames),
+                    b_frames: b_frames.unwrap_or(d.b_frames),
+                    preset: preset.unwrap_or(d.preset),
+                    multipass: multipass.unwrap_or(d.multipass),
+                    aq_strength: aq.unwrap_or(d.aq_strength),
+                });
+            }
+            None if bitrate.is_some()
+                || vbv.is_some()
+                || gop.is_some()
+                || b_frames.is_some()
+                || preset.is_some()
+                || multipass.is_some()
+                || aq.is_some() =>
+            {
+                return err("the encoder options (--bitrate, --gop, ...) need --encode");
+            }
+            None => {}
         }
         Ok(a)
     }
@@ -254,7 +386,45 @@ impl CaptureArgs {
         if self.self_test {
             list.push("--selftest".to_owned());
         }
+        if let Some(e) = &self.encode {
+            list.extend(e.to_argv());
+        }
         list
+    }
+}
+
+impl EncodeArgs {
+    /// `--encode` and the options after it, as [`CaptureArgs::to_argv`] appends them.
+    pub fn to_argv(&self) -> Vec<String> {
+        [
+            ("--encode", self.encoder.name().to_owned()),
+            ("--bitrate", self.bitrate_kbps.to_string()),
+            ("--vbv", self.vbv_kbits.to_string()),
+            ("--gop", self.gop_frames.to_string()),
+            ("--bframes", self.b_frames.to_string()),
+            ("--preset", self.preset.to_string()),
+            ("--multipass", self.multipass.name().to_owned()),
+            ("--aq", self.aq_strength.to_string()),
+        ]
+        .into_iter()
+        .flat_map(|(option, value)| [option.to_owned(), value])
+        .collect()
+    }
+}
+
+fn parse_encoder(value: &str) -> Result<EngineEncoder, CaptureArgsError> {
+    match value.to_lowercase().as_str() {
+        "nvenc" => Ok(EngineEncoder::Nvenc),
+        _ => err(format!("--encode: expected nvenc, got {value}")),
+    }
+}
+
+fn parse_multipass(value: &str) -> Result<Multipass, CaptureArgsError> {
+    match value.to_lowercase().as_str() {
+        "off" => Ok(Multipass::Off),
+        "quarter" => Ok(Multipass::Quarter),
+        "full" => Ok(Multipass::Full),
+        _ => err(format!("--multipass: expected off|quarter|full, got {value}")),
     }
 }
 

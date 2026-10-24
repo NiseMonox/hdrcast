@@ -18,13 +18,13 @@ use crate::cancel::CancelToken;
 use crate::echo_protocol;
 use crate::link_base::{LinkAddresses, SOURCE_ECHO, SOURCE_ROUTER};
 use crate::p2p_diagnostics;
-use crate::p2p_host::resolve_ipv4;
+use crate::p2p_host::{resolve_ipv4, SideUse};
 use crate::peer_session::{LinkState, PUNCH_DEADLINE_US};
 use crate::signaling_client::{SignalingClient, SignalingError};
 use crate::srt_monitor::SrtStats;
 use crate::upnp::{PortMappingOptions, RouterPortMapping};
 use crate::util::{lock, Callbacks, LogFn, Worker};
-use crate::viewer_link::{ViewerLink, ViewerSideHandler};
+use crate::viewer_link::{LastingLossHandler, ViewerLink, ViewerSideHandler};
 use crate::StartError;
 
 #[derive(Clone)]
@@ -47,6 +47,8 @@ pub struct ViewerSessionOptions {
     /// Ask the host for remote control: the join carries "rc", which also tells the host that this viewer
     /// understands the side channel (docs/design.md §8.9).
     pub request_control: bool,
+    /// Ask the host for keyframes when part of the stream is lost: the join carries "kf" (docs/design.md §8.12).
+    pub request_keyframes: bool,
     /// This computer's device key: every join is signed with it, so a host can recognise this computer and
     /// agree on a remote-control key with it (docs/design.md §8.10). `None` = unsigned joins, as before 0.3.1.
     pub device: Option<Arc<DeviceKey>>,
@@ -69,6 +71,7 @@ impl Default for ViewerSessionOptions {
             map_router_port: true,
             router_mapping: None,
             request_control: false,
+            request_keyframes: false,
             device: None,
             answer_wait_ms: 60_000,
         }
@@ -127,6 +130,7 @@ struct Inner {
     cancel: CancelToken,
     started: AtomicBool,
     host_offers_control: AtomicBool,
+    host_takes_keyframes: AtomicBool,
     keys: OnceLock<GroupKeys>,
     signal: OnceLock<SignalingClient>,
     link: OnceLock<ViewerLink>,
@@ -134,6 +138,7 @@ struct Inner {
     thread: Mutex<Option<Worker>>,
     changed: Callbacks<dyn Fn() + Send + Sync>,
     side_handler: Mutex<Option<ViewerSideHandler>>,
+    lasting_loss: Mutex<Option<LastingLossHandler>>,
 }
 
 impl ViewerSession {
@@ -156,6 +161,7 @@ impl ViewerSession {
                 cancel: CancelToken::new(),
                 started: AtomicBool::new(false),
                 host_offers_control: AtomicBool::new(false),
+                host_takes_keyframes: AtomicBool::new(false),
                 keys: OnceLock::new(),
                 signal: OnceLock::new(),
                 link: OnceLock::new(),
@@ -163,6 +169,7 @@ impl ViewerSession {
                 thread: Mutex::new(None),
                 changed: Callbacks::new(),
                 side_handler: Mutex::new(None),
+                lasting_loss: Mutex::new(None),
             }),
         }
     }
@@ -240,6 +247,11 @@ impl ViewerSession {
         }
     }
 
+    /// The live record of the host being watched said it takes keyframe requests ("kf"), as of the latest join.
+    pub fn host_takes_keyframes(&self) -> bool {
+        self.inner.host_takes_keyframes.load(Ordering::Acquire)
+    }
+
     /// The remote-control key agreed with the host's device for session `sid` (docs/design.md §8.10). `None`
     /// when the host is older than 0.3.1, or `sid` is not the current session: use the group-derived key then.
     pub fn control_key(&self, sid: &str) -> Option<[u8; 32]> {
@@ -262,11 +274,26 @@ impl ViewerSession {
         *lock(&self.inner.side_handler) = Some(handler);
     }
 
-    /// Sends `payload` (1..=1200 bytes) to the host on the side channel. False unless the host's live record
-    /// offered remote control (a 0.2.4 host would hand the datagram to its ffmpeg), and when the session is not
-    /// connected or the payload is out of range.
+    /// Sends `payload` (1..=1200 bytes) to the host on the side channel, for remote control. False unless the
+    /// host's live record offered remote control (a 0.2.4 host would hand the datagram to its ffmpeg), and when
+    /// the session is not connected or the payload is out of range.
     pub fn send_side(&self, payload: &[u8]) -> bool {
-        self.host_offers_control() && self.inner.link.get().is_some_and(|link| link.send_side(payload))
+        self.send_side_for(SideUse::RemoteControl, payload)
+    }
+
+    /// [`send_side`](Self::send_side) for `purpose`: only when the host's live record announced that use.
+    pub fn send_side_for(&self, purpose: SideUse, payload: &[u8]) -> bool {
+        let announced = match purpose {
+            SideUse::RemoteControl => self.host_offers_control(),
+            SideUse::Keyframes => self.host_takes_keyframes(),
+        };
+        announced && self.inner.link.get().is_some_and(|link| link.send_side(payload))
+    }
+
+    /// Who is told when data of the stream stays missing on the way in (docs/design.md §8.12), with how long
+    /// it has been missing; on a network thread. May be set before or after [`start`](Self::start).
+    pub fn on_lasting_loss(&self, handler: LastingLossHandler) {
+        *lock(&self.inner.lasting_loss) = Some(handler);
     }
 
     /// Opens the sockets, asks the router, and starts joining the host (and re-joining, until stopped).
@@ -309,6 +336,15 @@ impl Inner {
                 let handler = weak.upgrade().and_then(|session| lock(&session.side_handler).clone());
                 if let Some(handler) = handler {
                     handler(payload);
+                }
+            })
+        });
+        link.on_lasting_loss({
+            let weak = weak.clone();
+            Arc::new(move |missing| {
+                let handler = weak.upgrade().and_then(|session| lock(&session.lasting_loss).clone());
+                if let Some(handler) = handler {
+                    handler(missing);
                 }
             })
         });
@@ -430,6 +466,7 @@ impl Inner {
         self.set_state(ViewerSessionState::Joining, "Looking for the host".to_string());
         let Some(entry) = signal.get_live(ct)?.into_iter().find(|entry| entry.record.host_id == self.o.host_id) else {
             self.host_offers_control.store(false, Ordering::Release);
+            self.host_takes_keyframes.store(false, Ordering::Release);
             return Ok(Attempt::Retry("Not live right now".to_string()));
         };
         let record = entry.record;
@@ -441,6 +478,7 @@ impl Inner {
             state.control = None;
         }
         self.host_offers_control.store(record.remote_control == Some(true), Ordering::Release);
+        self.host_takes_keyframes.store(record.keyframes, Ordering::Release);
         if record.max_viewers > 0 && record.viewers >= record.max_viewers {
             return Ok(Attempt::Retry(format!("{} is full ({} viewers)", record.name, record.max_viewers)));
         }
@@ -461,6 +499,7 @@ impl Inner {
             overhead_percent: self.o.overhead_percent,
             remote_control: self.o.request_control,
             device: None,
+            keyframes: self.o.request_keyframes,
         };
         let exchange = self.o.device.as_ref().map(|device| {
             let exchange = Exchange::new();

@@ -111,6 +111,8 @@ pub struct AppState {
     pub share: crate::share::Share,
     pub watch: crate::watch::Watch,
     pub live: crate::live::Live,
+    /// The panel over the player while watching.
+    pub overlay: crate::overlay::Overlay,
 }
 
 impl AppState {
@@ -151,6 +153,7 @@ impl AppState {
             share: Default::default(),
             watch: Default::default(),
             live: Default::default(),
+            overlay: Default::default(),
         }
     }
 

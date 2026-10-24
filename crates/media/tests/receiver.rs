@@ -341,8 +341,15 @@ mod mpv_command_line {
             "--demuxer-lavf-probesize=5000000",
             "--demuxer-lavf-analyzeduration=2",
             r"--input-ipc-server=\\.\pipe\hdrcast-mpv-4321",
+            "--config=no",
+            "--input-default-bindings=no",
+            "--window-dragging=no",
+            "--drag-and-drop=no",
             "--keep-open=no",
             "--force-window=yes",
+            "--osc=no",
+            "--osd-bar=no",
+            "--media-controls=no",
             "--title=HdrCast",
             "--msg-level=all=info",
             "--term-status-msg=",
@@ -386,8 +393,15 @@ mod mpv_command_line {
             "--demuxer-lavf-analyzeduration=2",
             "--demuxer-lavf-format=mpegts",
             r"--input-ipc-server=\\.\pipe\hdrcast-mpv-7",
+            "--config=no",
+            "--input-default-bindings=no",
+            "--window-dragging=no",
+            "--drag-and-drop=no",
             "--keep-open=no",
             "--force-window=yes",
+            "--osc=no",
+            "--osd-bar=no",
+            "--media-controls=no",
             "--title=HdrCast",
             "--msg-level=all=info",
             "--term-status-msg=",
@@ -438,8 +452,14 @@ mod macos {
             "--demuxer-lavf-probesize=5000000",
             "--demuxer-lavf-analyzeduration=2",
             "--input-ipc-server=/tmp/hdrcast-mpv-9.sock",
+            "--config=no",
+            "--input-default-bindings=no",
+            "--window-dragging=no",
+            "--drag-and-drop=no",
             "--keep-open=no",
             "--force-window=yes",
+            "--osc=no",
+            "--osd-bar=no",
             "--title=HdrCast",
             "--msg-level=all=info",
             "--term-status-msg=",
@@ -447,7 +467,8 @@ mod macos {
         ];
         assert_eq!(mac.mpv_args, expected);
 
-        // the same settings on Windows: one argument more, one different, the rest identical
+        // the same settings on Windows: two arguments more (the D3D11 API, no Windows media overlay), one
+        // different, the rest identical
         let windows = mpv_command::build(
             &s,
             LOCAL_PORT,
@@ -461,7 +482,7 @@ mod macos {
         let without: Vec<&String> = windows
             .mpv_args
             .iter()
-            .filter(|a| *a != "--gpu-api=d3d11")
+            .filter(|a| *a != "--gpu-api=d3d11" && *a != "--media-controls=no")
             .collect();
         assert_eq!(without.len(), mac.mpv_args.len());
         let different: Vec<_> = without

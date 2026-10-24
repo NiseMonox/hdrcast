@@ -26,6 +26,7 @@ pub mod audio;
 pub mod cli;
 pub mod clock;
 pub mod color;
+pub mod encode;
 pub mod engine;
 pub mod frame;
 pub mod log;
@@ -57,7 +58,8 @@ mod stub;
 
 pub use aligner::{AudioAlignment, AudioClockAligner};
 pub use app_audio::ProcessEntry;
-pub use args::{quote_argv, CaptureArgs, CaptureArgsError, CaptureFormat};
+pub use args::{quote_argv, CaptureArgs, CaptureArgsError, CaptureFormat, EncodeArgs, EngineEncoder, Multipass};
+pub use encode::EncoderEvent;
 pub use cli::cli_main;
 pub use engine::{exit_codes, CaptureEngine, StopHandle};
 pub use output::OutputInfo;

@@ -19,7 +19,7 @@ use hdrcast_capture::{color, CaptureFormat};
 use hdrcast_core::common::arg_quote;
 use hdrcast_media::sender::encoder_probe;
 use hdrcast_media::sender::encoder_profiles::{self, EncoderSettings, QualityPreset, VideoEncoder};
-use hdrcast_media::sender::ffmpeg_command::{self, AudioCodec, FfmpegPlan};
+use hdrcast_media::sender::ffmpeg_command::{self, AudioCodec, FfmpegPlan, VideoInput};
 use hdrcast_media::Platform;
 
 const PRESETS: [QualityPreset; 3] = [
@@ -211,6 +211,81 @@ fn mpegts_accepts_a_real_hevc_main10_stream_with_our_muxer_options() {
         );
     }
     note("libx265 HDR10 -> MPEG-TS with our muxer options: encoded and read back with ffprobe");
+}
+
+/// When the capture engine encodes (docs/design.md §2.8), ffmpeg reads an MPEG-TS of HEVC with B-frames from the
+/// video pipe and raw f32le from the audio pipe, copies the video and encodes the sound. The stand-in for the
+/// engine's stream is ffmpeg's own (the engine's writer has unit tests of its own and the NVENC run in the
+/// checklist); what is checked here is that this ffmpeg takes the command line and that every picture, with
+/// its times, comes out next to the sound.
+#[test]
+fn a_stream_the_engine_encoded_is_copied_and_gets_its_sound() {
+    let test = "a_stream_the_engine_encoded_is_copied_and_gets_its_sound";
+    let Some(ffmpeg) = tool_or_skip("ffmpeg", test) else {
+        return;
+    };
+    if !has_encoder(&ffmpeg, "libx265") {
+        return note(&format!("SKIPPED {test}: this ffmpeg has no libx265"));
+    }
+    let dir = TempDir::new("engine-ts");
+    let (video, audio, out) = (dir.file("engine.ts"), dir.file("audio.f32"), dir.file("out.ts"));
+    let video_path = video.to_string_lossy().into_owned();
+    let audio_path = audio.to_string_lossy().into_owned();
+    let (log, exit) = run(
+        &ffmpeg,
+        [
+            "-hide_banner", "-loglevel", "error", "-nostdin", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30:duration=2",
+            "-pix_fmt", "yuv420p10le", "-c:v", "libx265", "-preset", "ultrafast", "-x265-params", "bframes=2:keyint=30:log-level=error",
+            "-f", "mpegts", "-y", &video_path,
+        ],
+    );
+    assert_eq!(exit, 0, "{}", tail(&log));
+    let (log, exit) = run(
+        &ffmpeg,
+        ["-hide_banner", "-loglevel", "error", "-nostdin", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=2", "-ac", "2", "-f", "f32le", "-y", &audio_path],
+    );
+    assert_eq!(exit, 0, "{}", tail(&log));
+
+    let plan = FfmpegPlan {
+        video_pipe_name: "engine-video".to_string(),
+        video_input: VideoInput::EncodedTs,
+        audio_pipe_name: Some("engine-audio".to_string()),
+        pixel_format: CaptureFormat::P010,
+        width: 320,
+        height: 240,
+        fps: 30,
+        encoder: EncoderSettings { encoder: VideoEncoder::HevcNvenc, hdr: true, fps: 30, ..EncoderSettings::default() },
+        audio: AudioCodec::Aac,
+        progress: false,
+        output_url: out.to_string_lossy().into_owned(),
+        log_level: "error".to_string(),
+        ..FfmpegPlan::default()
+    };
+    let mut args = ffmpeg_command::build(&plan).unwrap();
+    assert!(args.windows(2).any(|w| w == ["-c:v", "copy"]), "{args:?}");
+    assert!(!args.iter().any(|a| a == "hevc_nvenc" || a == "-fps_mode"), "ffmpeg encodes nothing of the video: {args:?}");
+    for (pipe, file) in [("engine-video", &video_path), ("engine-audio", &audio_path)] {
+        let at = args.iter().position(|a| *a == ffmpeg_command::pipe_path(pipe)).expect("the pipe is an input");
+        args[at] = file.clone();
+    }
+    let (log, exit) = run(&ffmpeg, &args);
+    assert!(!is_option_error(&log), "ffmpeg refused the command line:\n{}\n{}", arg_quote::join(&args), tail(&log));
+    assert_eq!(exit, 0, "{}\n{}", arg_quote::join(&args), tail(&log));
+
+    let Some(ffprobe) = tool_or_skip("ffprobe", "the read-back half of the engine stream test") else {
+        return;
+    };
+    let out_path = out.to_string_lossy().into_owned();
+    let (probe, probe_exit) = run(&ffprobe, ["-hide_banner", "-loglevel", "error", "-show_entries", "stream=codec_type,codec_name,profile", "-of", "csv=p=0", &out_path]);
+    assert_eq!(probe_exit, 0, "{probe}");
+    assert!(probe.contains("hevc,Main 10,video"), "{probe}");
+    assert!(probe.contains("aac,LC,audio"), "{probe}");
+    let (frames, _) = run(&ffprobe, ["-hide_banner", "-loglevel", "error", "-select_streams", "v:0", "-show_entries", "packet=pts", "-of", "csv=p=0", &out_path]);
+    let mut pts: Vec<i64> = frames.lines().filter_map(|l| l.trim().trim_end_matches(',').parse().ok()).collect();
+    assert_eq!(pts.len(), 60, "every picture copied");
+    pts.sort_unstable();
+    assert!(pts.windows(2).all(|w| w[1] - w[0] == 3000), "one picture every 1/30 s: {pts:?}");
+    note("an engine-like MPEG-TS (HEVC with B-frames) + raw sound -> ffmpeg -c:v copy: every picture and the sound came out");
 }
 
 fn put(frame: &mut [u8], at: usize, code10: i32) {

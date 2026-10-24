@@ -89,6 +89,11 @@ sharer's computer. No relay server, no public IPv4 address, no port forwarding t
 3. On an **HDR display**, switch HDR on first (Windows: `Win + Alt + B`). On an SDR display, set **Output** to SDR.
 4. When it does not connect, the panel says why, for example "This PC has no IPv6 internet connection". See
    [If something is wrong](#if-something-is-wrong).
+5. While you watch, a small round button sits on the picture (top right; drag it anywhere and it stays there next time).
+   Click it, or press `Ctrl + Alt + O` in the player, for the **overlay**: what arrives (resolution, frame rate, bitrate,
+   ping, loss), the **Delay** (**Apply** connects again with it: the picture stops for a few seconds), the **Decoder** and
+   **Mute** (both at once), and **Full Screen**. The player window has no controls or shortcuts of its own:
+   `Ctrl + Alt + Enter` switches full screen, `Esc` leaves it, and closing the window stops watching.
 
 The delay is there on purpose: this is a broadcast that rides out a bumpy connection, not a remote desktop. For remote
 control, use the **Fast** preset (see below).
@@ -100,9 +105,12 @@ control, use the **Fast** preset (see below).
    Every viewer costs one full stream of your upload: 3 viewers at 40 Mbps need about 150 Mbps up, retransmission included.
 2. The panel at the top shows the bitrate, frame rate and dropped frames. The list below shows who is watching, over IPv6 or
    IPv4, their network ping (not the picture delay) and each viewer's delay setting.
-3. In a voice chat with the group? On Windows, pick it under **Sound → Leave out** (for example `Discord.exe`) so
+3. Settings can be changed while you share: they apply at once and viewers stay connected. The encoder restarts for about
+   a second; with **Keyframe on request** a new bitrate does not even do that. A bitrate higher than a viewer started with
+   makes that viewer connect again once (about ten seconds).
+4. In a voice chat with the group? On Windows, pick it under **Sound → Leave out** (for example `Discord.exe`) so
    your friends do not hear themselves come back through the stream. Needs Windows 10 21H1 or newer; one app at a time.
-4. You do not have to go live at all: see the next section.
+5. You do not have to go live at all: see the next section.
 
 ## Connect any time, and remote control
 
@@ -147,7 +155,8 @@ nobody answers is turned down after 50 s.
    closed): turn on **Start HdrCast when I sign in** there, and it is, after every restart.
 
 **As a viewer:** where the sharer gives you control automatically, you are in control as soon as you connect: the player
-window sends your mouse and keyboard to their computer (`Ctrl + Alt + Enter` stays with your player: full screen on/off).
+window sends your mouse and keyboard to their computer (`Ctrl + Alt + Enter`, full screen on/off, and `Ctrl + Alt + O`,
+the overlay, stay with your player).
 **Just Watch** hands control back, **Take Control** takes it again. Where the sharer set Ask Me, click **Request Control**
 and wait for them to allow it. The sharer can **Take Back** control or **Disconnect** you at any time (after a disconnect
 you cannot connect again for a minute).
@@ -296,4 +305,5 @@ design.md and the two checklists are in Chinese for now; network.md and faq.md h
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE). `crates/capture/src/win/nvenc/ffi.rs` carries declarations from NVIDIA's `nvEncodeAPI.h`
+(MIT, © NVIDIA Corporation); its notice is in that file.

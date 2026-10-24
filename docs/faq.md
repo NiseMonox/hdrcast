@@ -152,6 +152,10 @@ the next keyframe instead (at most one keyframe interval, 1 s by default; the so
   means its upload or its bitrate is the problem.
 - Since 0.3.2 the sharer's encoder also keeps its bitrate steadier (a 0.25 s rate buffer instead of 2 s) and SRT is told
   the stream's real rate, so fewer packets are lost in the first place: both sides should update.
+- Shorter freezes (0.3.3): with an NVIDIA GPU the sharer turns on **Share → More options → Keyframe on request**. HdrCast
+  then drives NVENC itself, and a viewer on 0.3.3 that loses part of the stream gets a fresh keyframe at once instead of
+  at the next scheduled one: the picture usually holds for a few tenths of a second rather than up to a second (both logs
+  get `[keyframe]` lines). Without NVENC, or when that does not work on the sharer's PC, ffmpeg encodes as before.
 
 ## Where does the sound come from? Do I need a virtual audio device?
 

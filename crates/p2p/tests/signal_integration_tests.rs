@@ -25,8 +25,8 @@ use hdrcast_core::messages::{self, JoinAnswer, JoinRequest};
 use hdrcast_core::{GroupConfig, Invite, LiveRecord, SignedEnvelope};
 use hdrcast_p2p::upnp::PortMappingState;
 use hdrcast_p2p::{
-    CancelToken, JoinTicket, LinkAddresses, P2pHost, P2pHostOptions, SignalingClient, SignalingError, SwitchableStream, ViewerLink, ViewerSession,
-    ViewerSessionOptions,
+    CancelToken, JoinTicket, LinkAddresses, P2pHost, P2pHostOptions, SideUse, SignalingClient, SignalingError, SwitchableStream, ViewerLink,
+    ViewerSession, ViewerSessionOptions,
     ViewerSessionState, ViewerState,
 };
 
@@ -316,6 +316,7 @@ fn the_server_carries_the_remote_control_flag_without_reading_it() {
         overhead_percent: 25,
         remote_control: true,
         device: None,
+        keyframes: false,
     };
     c.post_join(&host.peer_id, &SignedEnvelope::seal(&keys, messages::KIND_JOIN, &host.group_id, &host.peer_id, &asking.to_payload()), &ct).unwrap();
     let (joins, _) = c.poll_joins(&host.peer_id, 0, 0, &ct).unwrap();
@@ -847,6 +848,120 @@ fn nothing_goes_over_the_side_channel_unless_the_other_side_said_it_speaks_it() 
     assert!(!dump(&log).contains("keeps exiting"), "a remux child without input must simply wait:\n{}", dump(&log));
 }
 
+/// Keyframe requests (docs/design.md §8.12) have a flag of their own, "kf", and go only between a host whose live
+/// record has it and viewers whose join has it, independently of remote control's "rc". A viewer without it (any
+/// version before 0.3.3) never gets a keyframe answer; a host without it is never asked.
+#[test]
+fn keyframe_datagrams_go_only_between_peers_that_said_kf() {
+    const TEST: &str = "keyframe_datagrams_go_only_between_peers_that_said_kf";
+    let Some(ffmpeg) = common::find_tool("ffmpeg") else {
+        common::skip(TEST, "needs ffmpeg for the remux children (set HDRCAST_TOOLS to its directory)");
+        return;
+    };
+    let _one_at_a_time = MEDIA.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(server) = SignalServer::try_start(TEST) else { return };
+    let invite = Invite::create("keyframes", Some(&server.url())).unwrap();
+    let host_group = GroupConfig::default().normalize().adopt(&invite, "小明");
+    let log: Log = Arc::new(Mutex::new(Vec::new()));
+
+    let taking = Arc::new(AtomicBool::new(true));
+    let takes = taking.clone();
+    let ts = SwitchableStream::new();
+    let host = P2pHost::new(
+        P2pHostOptions {
+            group: host_group.clone(),
+            ffmpeg_path: ffmpeg.into_os_string(),
+            bitrate_bps: 1_000_000,
+            max_viewers: 4,
+            addresses: Some(loopback_firewalled()),
+            echo_port: server.echo_port,
+            heartbeat_ms: 500,
+            map_router_port: false, // never the real router
+            offer_keyframes: Some(Arc::new(move || takes.load(Ordering::SeqCst))),
+            ..P2pHostOptions::default()
+        },
+        Box::new(ts.clone()),
+        logger(&log),
+    );
+    let at_host: Received<(String, Vec<u8>)> = Arc::new(Mutex::new(Vec::new()));
+    let sink = at_host.clone();
+    host.set_side_handler(Arc::new(move |sid, payload| sink.lock().unwrap().push((sid.to_string(), payload.to_vec()))));
+    host.start().unwrap();
+    assert!(wait_for(|| host.status().starts_with("Live"), 8000), "{}
+{}", host.status(), dump(&log));
+    let watcher = SignalingClient::for_group(&GroupConfig::default().normalize().adopt(&invite, "list")).unwrap();
+    let live = watcher.get_live(&never()).unwrap();
+    assert!(live[0].record.keyframes && !live[0].remote_control(), "kf without rc: {:?}", live[0].record);
+
+    let watch = |name: &str, request_control: bool, request_keyframes: bool| -> (ViewerSession, Received<Vec<u8>>) {
+        let session = ViewerSession::new(
+            ViewerSessionOptions {
+                group: GroupConfig::default().normalize().adopt(&invite, name),
+                host_id: host_group.peer_id.clone(),
+                latency_ms: 300,
+                addresses: Some(loopback_firewalled()),
+                echo_port: server.echo_port,
+                map_router_port: false, // never the real router
+                request_control,
+                request_keyframes,
+                ..ViewerSessionOptions::default()
+            },
+            logger(&log),
+        );
+        assert!(!session.host_takes_keyframes() && !session.send_side_for(SideUse::Keyframes, b"K"), "not even started");
+        session.start().unwrap();
+        assert!(wait_for(|| session.state() == ViewerSessionState::Connected, 20_000), "{name}: {}
+{}", session.status(), dump(&log));
+        let received: Received<Vec<u8>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = received.clone();
+        session.set_side_handler(Arc::new(move |payload| sink.lock().unwrap().push(payload.to_vec())));
+        (session, received)
+    };
+    let sid_at_host = |name: &str| host.viewers().into_iter().find(|v| v.name == name).unwrap_or_else(|| panic!("{name} is not a viewer")).sid;
+    const SETTLE: Duration = Duration::from_millis(400);
+
+    // 1. both said kf: requests one way, answers the other; remote control stays shut (the host never said rc)
+    let (asking, asking_got) = watch("asks", true, true);
+    let sid = asking.sid().unwrap();
+    assert!(asking.host_takes_keyframes() && !asking.host_offers_control());
+    assert!(host.viewers().iter().any(|v| v.name == "asks" && v.wants_keyframes && v.wants_control));
+    assert!(asking.send_side_for(SideUse::Keyframes, b"Krequest"));
+    assert!(!asking.send_side(b"pointer"), "remote control was not offered");
+    assert!(wait_for(|| at_host.lock().unwrap().len() == 1, 2000), "the host's handler was not called");
+    assert_eq!(at_host.lock().unwrap()[0], (sid.clone(), b"Krequest".to_vec()));
+    assert!(wait_for(|| host.send_side_for(&sid, SideUse::Keyframes, b"kanswer"), 2000), "{:?}", host.viewers());
+    assert!(wait_for(|| asking_got.lock().unwrap().len() == 1, 2000));
+    assert_eq!(asking_got.lock().unwrap()[0], b"kanswer".to_vec());
+
+    // 2. a join without kf (every viewer before 0.3.3, rc or not): no keyframe answer goes to it
+    let (older, older_got) = watch("older", true, false);
+    let older_sid = sid_at_host("older");
+    assert!(host.viewers().iter().any(|v| v.name == "older" && !v.wants_keyframes && v.wants_control));
+    // (once the host's half of the session is up, so that a refusal is the flag's doing and not a missing path)
+    assert!(wait_for(|| host.send_side(&older_sid, b"control"), 2000), "its remote control is not affected: {:?}", host.viewers());
+    assert!(!host.send_side_for(&older_sid, SideUse::Keyframes, b"kanswer"), "sent to a viewer that never said kf");
+    thread::sleep(SETTLE);
+    assert_eq!(*older_got.lock().unwrap(), vec![b"control".to_vec()]);
+
+    // 3. the host stops taking requests: its record goes back to what 0.3.2 wrote, and a viewer that joins now
+    //    asks nothing
+    taking.store(false, Ordering::SeqCst);
+    assert!(common::wait_for_every(250, || watcher.get_live(&never()).is_ok_and(|live| live.len() == 1 && !live[0].record.keyframes), 5000), "still listed with kf");
+    let (late, late_got) = watch("late", true, true);
+    assert!(!late.host_takes_keyframes());
+    let before = at_host.lock().unwrap().len();
+    assert!(!late.send_side_for(SideUse::Keyframes, b"Krequest"), "sent to a host whose live record has no kf");
+    thread::sleep(SETTLE);
+    assert_eq!(at_host.lock().unwrap().len(), before);
+    assert!(late_got.lock().unwrap().is_empty());
+
+    for session in [&asking, &older, &late] {
+        session.stop();
+    }
+    host.stop();
+    ts.close();
+}
+
 // ---- device keys and the admission hook (docs/design.md §8.10) ----------------------------------------------------
 
 /// A host that decides about each join, through the real signaling server (no encoder: a remux child without
@@ -955,6 +1070,7 @@ fn a_host_lets_signed_viewers_in_when_it_decides_and_they_share_a_private_contro
         overhead_percent: 25,
         remote_control: true,
         device: None,
+        keyframes: false,
     };
     device::sign_join(&laptop, &Exchange::new(), &impostor.group_id, &host_group.peer_id, &mut forged);
     forged.session_id = keys::new_id();

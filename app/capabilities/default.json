@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "The one window of the app",
-  "windows": ["main"],
+  "description": "The main window, and the panel over the player",
+  "windows": ["main", "overlay"],
   "permissions": [
     "core:default",
     "core:window:allow-start-dragging",

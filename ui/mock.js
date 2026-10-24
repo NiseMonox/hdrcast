@@ -2,7 +2,8 @@
 // URL switches: ?fresh (no group yet), ?live (already sharing), ?watching, ?knock (somebody asks to watch),
 // ?off (not available to connect), ?mac, ?lang=zh|ja|en, ?theme=dark|light,
 // ?nohdr (the system refuses HDR capture: an HDR display is sent as SDR, as on a Mac without it),
-// ?autostart=on|disabled|other (the sign-in entry)
+// ?autostart=on|disabled|other (the sign-in entry). overlay.html?watching is the button over the player
+// (overlay.html?watching&panel the panel it opens into).
 
 const q = new URLSearchParams(location.search);
 const handlers = new Map();
@@ -16,13 +17,15 @@ export function listen(event, handler) {
 
 const mac = q.has('mac');
 const now = () => Date.now();
+const LATENCY_PRESETS = [{ name: 'Fast', latencyMs: 300 }, { name: 'Japan', latencyMs: 1500 }, { name: 'Australia', latencyMs: 2000 }, { name: 'China', latencyMs: 3500 }];
+const HWDEC_MODES = [{ id: 0, name: 'auto-safe' }, { id: 1, name: mac ? 'videotoolbox' : 'd3d11va' }, { id: 2, name: mac ? 'videotoolbox-copy' : 'd3d11va-copy' }, { id: 3, name: 'no (software)' }];
 const DEVICE = '7KQ2-M9XD-4TPA';
 
 const db = {
   ui: { language: q.get('lang') || 'auto', theme: q.get('theme') || 'auto' },
   sender: {
     outputIndex: 0, outputDeviceName: '\\\\.\\DISPLAY1', outputFriendlyName: 'AW3225QF', fps: 60, scale: 0, hdrMode: 0, cursor: true,
-    sdrWhite: 80, encoder: 0, quality: 1, bitrateMbps: 40, gopSeconds: 1, bufferSeconds: 0.25, bFrames: true, lookahead: true,
+    sdrWhite: 80, encoder: 0, quality: 1, bitrateMbps: 40, gopSeconds: 1, bufferSeconds: 0.25, bFrames: true, lookahead: true, keyframeOnRequest: false,
     audio: true, audioDevice: 'default', audioCodec: 1, audioBitrateKbps: 192, audioExcludeApp: '', maxViewers: 4, uploadMbps: 0,
     ffmpegPath: '', settingsVersion: 1,
   },
@@ -128,6 +131,7 @@ function status() {
     watch: {
       active: w.active, hostId: w.hostId, hostName: w.hostName,
       hostDeviceCode: host?.deviceCode || '', hostOnDemand: !!host?.onDemand,
+      latencyMs: w.latencyMs || db.receiver.latencyMs, overlay: !!w.overlay, muted: !!w.muted,
       session: w.active ? {
         state: connected ? 'connected' : asks ? 'approval' : wup > 1 ? 'punching' : 'joining',
         status: connected ? `Connected to ${w.hostName} (IPv6 [2400:aaaa::1]:51234, ping 38 ms)` : asks ? `Waiting for ${w.hostName} to answer` : `Connecting to ${w.hostName}`,
@@ -137,7 +141,8 @@ function status() {
       player: w.active && connected ? {
         state: playing ? 'playing' : 'waiting', text: playing ? 'Playing' : 'Connecting…', attempt: 1, uptimeSec: Math.max(0, wup - 7),
         cacheSeconds: playing ? 1.5 + wobble * 0.2 : null, drops: 0, decoderDrops: 0, fps: playing ? 60 : null,
-        bitrateMbps: playing ? 39.2 + wobble : null, hwdec: playing ? (mac ? 'videotoolbox' : 'd3d11va') : '',
+        bitrateMbps: playing ? 39.2 + wobble : null, hwdec: playing ? HWDEC_MODES[db.receiver.hwDec].name.split(' ')[0] : '',
+        width: playing ? 3840 : null, height: playing ? 2160 : null, fullscreen: false,
         source: playing ? '3840x2160 p010 bt.2020 pq' : '', output: playing ? 'SDR' : '', hdr: playing,
         guard: playing ? { frozen: wobble > 0.9, losses: 3, freezes: 2, heldBack: 95 } : null,
       } : null,
@@ -190,9 +195,9 @@ const api = {
         ? [{ id: 5, name: 'Apple VideoToolbox (HEVC)' }, { id: 4, name: 'x265 (software)' }]
         : [{ id: 0, name: 'NVIDIA NVENC (HEVC)' }, { id: 2, name: 'AMD AMF (HEVC)' }, { id: 3, name: 'Intel Quick Sync (HEVC)' }, { id: 4, name: 'x265 (software)' }],
       audioCodecs: [{ id: 1, name: 'AAC' }, { id: 2, name: 'Opus' }],
-      latencyPresets: [{ name: 'Fast', latencyMs: 300 }, { name: 'Japan', latencyMs: 1500 }, { name: 'Australia', latencyMs: 2000 }, { name: 'China', latencyMs: 3500 }],
+      latencyPresets: LATENCY_PRESETS,
       toneMappings: ['bt.2390', 'auto', 'spline', 'bt.2446a', 'st2094-40', 'st2094-10', 'hable', 'mobius', 'reinhard', 'clip'],
-      hwDecModes: [{ id: 0, name: 'auto-safe' }, { id: 1, name: mac ? 'videotoolbox' : 'd3d11va' }, { id: 2, name: mac ? 'videotoolbox-copy' : 'd3d11va-copy' }, { id: 3, name: 'no (software)' }],
+      hwDecModes: HWDEC_MODES,
       tools: { ffmpeg: { path: mac ? '/opt/homebrew/bin/ffmpeg' : 'D:\\HdrCast\\tools\\ffmpeg.exe' }, mpv: { path: mac ? null : 'D:\\HdrCast\\tools\\mpv.exe' } },
       firewall: db.firewall,
       paths: { config: mac ? '~/Library/Application Support/HdrCast' : 'C:\\Users\\me\\AppData\\Roaming\\HdrCast', logs: '' },
@@ -257,13 +262,40 @@ const api = {
   live_refresh: () => null,
   watch_start({ hostId }) {
     const h = hosts.find((x) => x.hostId === hostId);
-    db.watch = { active: true, hostId, hostName: h.name, startedMs: now(), want: null, wantAt: 0 };
+    db.watch = { active: true, hostId, hostName: h.name, startedMs: now(), want: null, wantAt: 0, latencyMs: db.receiver.latencyMs, overlay: false };
     emit('log', { lines: [`[app] watching ${h.name} (latency ${db.receiver.latencyMs} ms)`] });
     return { ok: true };
   },
   watch_stop() { db.watch = { active: false, hostId: '', hostName: '', startedMs: 0, want: null }; },
   watch_control({ want }) { db.watch.want = want; db.watch.wantAt = (now() - db.watch.startedMs) / 1000; },
   watch_fullscreen: () => null,
+  watch_set_hwdec({ hwDec }) {
+    db.receiver = { ...db.receiver, hwDec };
+    emit('receiver', db.receiver);
+    return db.receiver;
+  },
+  async watch_set_latency({ latencyMs }) {
+    db.receiver = { ...db.receiver, latencyMs };
+    emit('receiver', db.receiver);
+    const w = db.watch;
+    db.watch = { ...w, active: false };
+    await new Promise((r) => setTimeout(r, 1500));
+    db.watch = { ...w, latencyMs, startedMs: now() };
+    return { ok: true };
+  },
+  watch_set_mute({ muted }) { db.watch = { ...db.watch, muted }; },
+  overlay_init() {
+    return {
+      platform: mac ? 'macos' : 'windows', ui: db.ui, receiver: db.receiver, latencyPresets: LATENCY_PRESETS, hwDecModes: HWDEC_MODES,
+      expanded: q.has('panel') || !!db.watch.overlay, status: status(),
+    };
+  },
+  overlay_toggle() {
+    db.watch = { ...db.watch, overlay: !db.watch.overlay };
+    emit('overlay', { expanded: db.watch.overlay });
+  },
+  overlay_expand({ expanded }) { db.watch = { ...db.watch, overlay: expanded }; },
+  overlay_fit: () => null,
   group_create({ groupName, displayName }) {
     db.group = { configured: true, groupName, displayName, peerId: 'me', detectClipboard: true };
     return db.group;

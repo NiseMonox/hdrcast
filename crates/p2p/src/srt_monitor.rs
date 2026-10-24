@@ -36,6 +36,13 @@ const WINDOW: u32 = 1 << 17;
 pub const RECENT: Duration = Duration::from_secs(10);
 /// SRT's payload per packet, to turn packets per second into Mbps.
 const PAYLOAD_BITS: f64 = 1316.0 * 8.0;
+/// A gap is "lasting" (see [`SrtMonitor::take_lasting_loss`]) after twice the time SRT takes to ask for a packet
+/// again and get it (RTT + 4 × its variance, as SRT's periodic loss report), and never before this.
+const LASTING_AT_LEAST: Duration = Duration::from_millis(60);
+/// How often the gaps are looked at, at most.
+const LASTING_CHECK_EVERY: Duration = Duration::from_millis(10);
+/// Gaps remembered (a long outage is one gap).
+const MAX_HOLES: usize = 4096;
 
 /// Counts since the monitor started. Which side's figures mean what: the host's monitor sees everything its SRT
 /// sender sends; the viewer's sees everything that reaches its SRT receiver, so only it can tell what never did.
@@ -139,6 +146,22 @@ struct Inner {
     given_up: Bits,
     /// (when, counts) about once a second, for the recent figures.
     history: VecDeque<(Instant, SrtCounts)>,
+    /// Gaps in the data, oldest first: what the receiver is still waiting for.
+    holes: VecDeque<Hole>,
+    last_check: Option<Instant>,
+    /// A gap that turned lasting and was not taken yet: how long it had been open.
+    lasting: Option<Duration>,
+    /// A connection started and its first data has not been seen yet.
+    awaiting_data: bool,
+}
+
+/// Sequence numbers `first..=last` were missing when the packet after them came, at `since`.
+#[derive(Debug, Clone, Copy)]
+struct Hole {
+    first: u32,
+    last: u32,
+    since: Instant,
+    reported: bool,
 }
 
 impl Default for SrtMonitor {
@@ -163,16 +186,24 @@ impl SrtMonitor {
                 reported: Bits::new(),
                 given_up: Bits::new(),
                 history: VecDeque::new(),
+                holes: VecDeque::new(),
+                last_check: None,
+                lasting: None,
+                awaiting_data: false,
             }),
         }
     }
 
-    /// A datagram the SRT sender sent (data, or its control packets).
-    pub fn from_sender(&self, datagram: &[u8]) {
-        let Some((word0, _)) = header(datagram) else { return };
+    /// A datagram the SRT sender sent (data, or its control packets). True for the first data packet of a
+    /// connection: the receiver's stream starts here.
+    pub fn from_sender(&self, datagram: &[u8]) -> bool {
+        let Some((word0, _)) = header(datagram) else { return false };
         let mut inner = lock(&self.inner);
+        let mut first_data = false;
         if word0 & CONTROL == 0 {
+            first_data = std::mem::take(&mut inner.awaiting_data) || inner.top.is_none();
             inner.on_data(word0 & SEQ_MASK, datagram.len().saturating_sub(HEADER_BYTES));
+            inner.check_lasting(Instant::now());
         } else {
             match control_type(word0) {
                 TYPE_HANDSHAKE => inner.on_handshake(),
@@ -185,6 +216,14 @@ impl SrtMonitor {
             }
         }
         inner.sample(Instant::now());
+        first_data
+    }
+
+    /// Data the receiver has been waiting for has now been missing for longer than SRT needs to ask for it
+    /// twice and get it (docs/design.md §8.12): `Some(how long)`, once per gap. Only the receiving end sees
+    /// this; whether SRT still gets the data there in time is open, but the picture that needs it is in danger.
+    pub fn take_lasting_loss(&self) -> Option<Duration> {
+        lock(&self.inner).lasting.take()
     }
 
     /// A datagram the SRT receiver sent (its acknowledgements and loss reports).
@@ -239,6 +278,16 @@ impl Inner {
             Some(top) => after(seq, top),
         };
         if fresh {
+            if let Some(top) = self.top {
+                let next = top.wrapping_add(1) & SEQ_MASK;
+                if next != seq && (seq.wrapping_sub(next) & SEQ_MASK) < WINDOW {
+                    if self.holes.len() >= MAX_HOLES {
+                        self.holes.pop_front();
+                    }
+                    let last = seq.wrapping_sub(1) & SEQ_MASK;
+                    self.holes.push_back(Hole { first: next, last, since: Instant::now(), reported: false });
+                }
+            }
             self.advance_to(seq);
             self.counts.sent += 1;
             self.counts.sent_bytes += payload as u64;
@@ -277,6 +326,41 @@ impl Inner {
         }
         self.top = None;
         self.acked = None;
+        self.holes.clear();
+        self.lasting = None;
+        self.awaiting_data = true;
+    }
+
+    /// Drops the gaps that filled up (or that the receiver went past), and notes the first one open for too long.
+    fn check_lasting(&mut self, now: Instant) {
+        if self.last_check.is_some_and(|at| now.saturating_duration_since(at) < LASTING_CHECK_EVERY) {
+            return;
+        }
+        self.last_check = Some(now);
+        let wait = 2 * (Duration::from_micros(u64::from(self.rtt_us)) + 4 * Duration::from_micros(u64::from(self.rtt_var_us)));
+        let wait = wait.max(LASTING_AT_LEAST);
+        let mut i = 0;
+        while i < self.holes.len() {
+            let hole = &mut self.holes[i];
+            // what arrived since closes the gap from its front
+            while self.seen.get(hole.first) && hole.first != hole.last {
+                hole.first = hole.first.wrapping_add(1) & SEQ_MASK;
+            }
+            let passed = self.acked.is_some_and(|acked| after(acked, hole.last));
+            if passed || (hole.first == hole.last && self.seen.get(hole.first)) {
+                self.holes.remove(i);
+                continue;
+            }
+            let age = now.saturating_duration_since(hole.since);
+            if age < wait {
+                break; // the rest are younger
+            }
+            if !hole.reported {
+                hole.reported = true;
+                self.lasting.get_or_insert(age);
+            }
+            i += 1;
+        }
     }
 
     fn on_lost(&mut self, first: u32, last: u32) {
@@ -497,6 +581,66 @@ mod tests {
         m.from_receiver(&data(4, false)); // a receiver sends no data
         m.from_receiver(&control(TYPE_NAK, &[1 | CONTROL])); // a range without its end
         assert_eq!(m.snapshot(), SrtStats::default());
+    }
+
+    /// The sender sends these data packets for the first time.
+    fn stream(m: &SrtMonitor, seqs: impl IntoIterator<Item = u32>) {
+        for seq in seqs {
+            m.from_sender(&data(seq, false));
+        }
+    }
+
+    #[test]
+    fn a_gap_still_open_after_two_resend_rounds_is_reported_once() {
+        let m = SrtMonitor::new();
+        assert!(!m.from_sender(&control(TYPE_HANDSHAKE, &[0; 12])));
+        assert!(m.from_sender(&data(1, false)), "the first data of a connection");
+        assert!(!m.from_sender(&data(2, false)));
+        // the receiver measures a short round trip: the floor of 60 ms applies
+        m.from_receiver(&control(TYPE_ACK, &[3, 1_000, 500, 8000, 0, 0, 0]));
+        stream(&m, (3..10).chain(13..20)); // 10..=12 missing
+        assert_eq!(m.take_lasting_loss(), None, "young");
+        std::thread::sleep(Duration::from_millis(70));
+        stream(&m, [20]);
+        let missing = m.take_lasting_loss().expect("still open after 60 ms");
+        assert!(missing >= Duration::from_millis(60), "{missing:?}");
+        std::thread::sleep(Duration::from_millis(15));
+        stream(&m, [21]);
+        assert_eq!(m.take_lasting_loss(), None, "once per gap");
+
+        // a gap the resend fills in time is never reported
+        stream(&m, (22..30).chain(31..40));
+        m.from_sender(&data(30, true));
+        std::thread::sleep(Duration::from_millis(70));
+        stream(&m, [40]);
+        assert_eq!(m.take_lasting_loss(), None);
+        // nor one the receiver has gone past (it gave up: the guard sees that one)
+        stream(&m, (41..45).chain(46..50));
+        m.from_receiver(&control(TYPE_ACK, &[50, 1_000, 500, 8000, 0, 0, 0]));
+        std::thread::sleep(Duration::from_millis(70));
+        stream(&m, [50]);
+        assert_eq!(m.take_lasting_loss(), None);
+        // a new connection forgets the old gaps and starts again
+        stream(&m, (51..55).chain(56..60));
+        m.from_receiver(&control(TYPE_HANDSHAKE, &[0; 12]));
+        assert!(m.from_sender(&data(7000, false)), "the first data of the new connection");
+        std::thread::sleep(Duration::from_millis(70));
+        stream(&m, [7001]);
+        assert_eq!(m.take_lasting_loss(), None);
+    }
+
+    #[test]
+    fn the_wait_grows_with_the_round_trip() {
+        let m = SrtMonitor::new();
+        // RTT 92 ms, variance 4 ms: 2 x (92 + 16) = 216 ms
+        m.from_receiver(&ack(1));
+        stream(&m, (1..5).chain(6..10));
+        std::thread::sleep(Duration::from_millis(100));
+        stream(&m, [10]);
+        assert_eq!(m.take_lasting_loss(), None, "within twice a resend round");
+        std::thread::sleep(Duration::from_millis(130));
+        stream(&m, [11]);
+        assert!(m.take_lasting_loss().is_some_and(|d| d >= Duration::from_millis(216)));
     }
 
     #[test]

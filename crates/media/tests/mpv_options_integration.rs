@@ -255,6 +255,11 @@ fn mpv_accepts_the_generated_command_line() {
                 })
                 .cloned()
                 .collect();
+            if cfg!(windows) && !args.iter().any(|a| a == "--media-controls=no") {
+                // Another platform's list run on this Windows mpv: without the Windows media controls off, mpv 0.41
+                // stalls on its way out after the missing file (docs/design.md §3.1), and the test would time out.
+                args.push("--media-controls=no".to_string());
+            }
             args.extend(
                 [
                     "--vo=null",

@@ -4,6 +4,9 @@ Texture2D<float4> srcTex     : register(t0);   // duplicated desktop: R16G16B16A
 Texture2D<float4> cursorTex  : register(t1);   // BGRA8 straight-alpha cursor; a == 0 && r > 0.5 means 'invert desktop'
 SamplerState linearSampler   : register(s0);
 RWByteAddressBuffer dst      : register(u0);   // full raw frame: Y plane then interleaved UV plane
+// Zero copy (design.md section 2.8): the planes of the encoder's P010 / NV12 texture instead of the raw frame.
+RWTexture2D<uint>  dstLuma   : register(u1);   // Y plane: R16_UINT view (p010, value << 6) or R8_UINT (nv12)
+RWTexture2D<uint2> dstChroma : register(u2);   // interleaved UV plane, half size: R16G16_UINT or R8G8_UINT
 
 cbuffer Params : register(b0)
 {
@@ -118,33 +121,61 @@ uint luma10(float3 E)
     return (uint)round(64.0 + 876.0 * Y);
 }
 
+// The 2x2 block at (x, y) in HDR10: four 10-bit lumas (x,y / x+1,y / x,y+1 / x+1,y+1) and one Cb/Cr pair.
+void p010_block(uint x, uint y, out uint4 luma, out uint2 chroma)
+{
+    float3 E0 = encode_pq2020(pixel_linear(x,     y));
+    float3 E1 = encode_pq2020(pixel_linear(x + 1, y));
+    float3 E2 = encode_pq2020(pixel_linear(x,     y + 1));
+    float3 E3 = encode_pq2020(pixel_linear(x + 1, y + 1));
+    luma = uint4(luma10(E0), luma10(E1), luma10(E2), luma10(E3));
+    float3 Ea = (E0 + E1 + E2 + E3) * 0.25;             // chroma from the average of the 4 PQ-encoded pixels
+    float Ya = 0.2627 * Ea.r + 0.6780 * Ea.g + 0.0593 * Ea.b;
+    float Cb = (Ea.b - Ya) / 1.8814;
+    float Cr = (Ea.r - Ya) / 1.4746;
+    chroma = uint2((uint)round(512.0 + 896.0 * Cb), (uint)round(512.0 + 896.0 * Cr));
+}
+
 [numthreads(8, 8, 1)]
 void main_p010(uint3 id : SV_DispatchThreadID)
 {
     uint x = id.x * 2, y = id.y * 2;
     if (x >= dstWidth || y >= dstHeight) return;
-    float3 E0 = encode_pq2020(pixel_linear(x,     y));
-    float3 E1 = encode_pq2020(pixel_linear(x + 1, y));
-    float3 E2 = encode_pq2020(pixel_linear(x,     y + 1));
-    float3 E3 = encode_pq2020(pixel_linear(x + 1, y + 1));
-    uint y0 = luma10(E0), y1 = luma10(E1), y2 = luma10(E2), y3 = luma10(E3);
-    float3 Ea = (E0 + E1 + E2 + E3) * 0.25;             // chroma from the average of the 4 PQ-encoded pixels
-    float Ya = 0.2627 * Ea.r + 0.6780 * Ea.g + 0.0593 * Ea.b;
-    float Cb = (Ea.b - Ya) / 1.8814;
-    float Cr = (Ea.r - Ya) / 1.4746;
-    uint cb10 = (uint)round(512.0 + 896.0 * Cb);
-    uint cr10 = (uint)round(512.0 + 896.0 * Cr);
+    uint4 l; uint2 c;
+    p010_block(x, y, l, c);
     uint rowBytes = dstWidth * 2;
-    dst.Store(y * rowBytes + x * 2,       (y0 << 6) | ((y1 << 6) << 16));   // p010le: 10 bits in the high bits
-    dst.Store((y + 1) * rowBytes + x * 2, (y2 << 6) | ((y3 << 6) << 16));
+    dst.Store(y * rowBytes + x * 2,       (l.x << 6) | ((l.y << 6) << 16));   // p010le: 10 bits in the high bits
+    dst.Store((y + 1) * rowBytes + x * 2, (l.z << 6) | ((l.w << 6) << 16));
     uint uvBase = dstWidth * dstHeight * 2;
-    dst.Store(uvBase + (y >> 1) * rowBytes + x * 2, (cb10 << 6) | ((cr10 << 6) << 16));
+    dst.Store(uvBase + (y >> 1) * rowBytes + x * 2, (c.x << 6) | ((c.y << 6) << 16));
+}
+
+// Zero copy: the same block, written into the planes of a P010 texture.
+[numthreads(8, 8, 1)]
+void main_p010_planes(uint3 id : SV_DispatchThreadID)
+{
+    uint x = id.x * 2, y = id.y * 2;
+    if (x >= dstWidth || y >= dstHeight) return;
+    uint4 l; uint2 c;
+    p010_block(x, y, l, c);
+    dstLuma[uint2(x, y)]         = l.x << 6;
+    dstLuma[uint2(x + 1, y)]     = l.y << 6;
+    dstLuma[uint2(x, y + 1)]     = l.z << 6;
+    dstLuma[uint2(x + 1, y + 1)] = l.w << 6;
+    dstChroma[id.xy] = c << 6;
 }
 
 uint luma8(float3 c)
 {
     float Y = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
     return (uint)round(16.0 + 219.0 * Y);
+}
+
+// 8-bit Cb/Cr of the average c of a 2x2 block (sRGB-encoded, BT.709).
+uint2 chroma8(float3 c)
+{
+    float Y = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
+    return uint2((uint)round(128.0 + 224.0 * (c.b - Y) / 1.8556), (uint)round(128.0 + 224.0 * (c.r - Y) / 1.5748));
 }
 
 [numthreads(64, 1, 1)]
@@ -177,12 +208,23 @@ void main_nv12(uint3 id : SV_DispatchThreadID)
             uint m = m0 + k;
             if (m >= chromaPairs) break;                   // last, partially used uint of the plane
             uint cx = (m % cw) * 2, cy = (m / cw) * 2;
-            float3 c = (pixel_srgb(cx, cy) + pixel_srgb(cx + 1, cy) + pixel_srgb(cx, cy + 1) + pixel_srgb(cx + 1, cy + 1)) * 0.25;
-            float Y = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
-            uint cb8 = (uint)round(128.0 + 224.0 * (c.b - Y) / 1.8556);
-            uint cr8 = (uint)round(128.0 + 224.0 * (c.r - Y) / 1.5748);
-            v |= (cb8 << (16 * k)) | (cr8 << (16 * k + 8));
+            uint2 cbcr = chroma8((pixel_srgb(cx, cy) + pixel_srgb(cx + 1, cy) + pixel_srgb(cx, cy + 1) + pixel_srgb(cx + 1, cy + 1)) * 0.25);
+            v |= (cbcr.x << (16 * k)) | (cbcr.y << (16 * k + 8));
         }
         dst.Store(dstWidth * dstHeight + (t - ySlots) * 4, v);
     }
+}
+
+// Zero copy: one thread per 2x2 block, as main_p010 (a texture has no 4-byte store alignment to work around).
+[numthreads(8, 8, 1)]
+void main_nv12_planes(uint3 id : SV_DispatchThreadID)
+{
+    uint x = id.x * 2, y = id.y * 2;
+    if (x >= dstWidth || y >= dstHeight) return;
+    float3 c0 = pixel_srgb(x, y), c1 = pixel_srgb(x + 1, y), c2 = pixel_srgb(x, y + 1), c3 = pixel_srgb(x + 1, y + 1);
+    dstLuma[uint2(x, y)]         = luma8(c0);
+    dstLuma[uint2(x + 1, y)]     = luma8(c1);
+    dstLuma[uint2(x, y + 1)]     = luma8(c2);
+    dstLuma[uint2(x + 1, y + 1)] = luma8(c3);
+    dstChroma[id.xy] = chroma8((c0 + c1 + c2 + c3) * 0.25);
 }

@@ -283,6 +283,7 @@ fn every_encoder_option_list_is_the_one_the_csharp_built() {
 fn plan_of(v: &Value) -> FfmpegPlan {
     FfmpegPlan {
         video_pipe_name: str_of(&v["videoPipe"]).to_string(),
+        video_input: Default::default(),
         audio_pipe_name: v["audioPipe"].as_str().map(str::to_string),
         pixel_format: capture_format(str_of(&v["format"])),
         width: u32_of(&v["width"]),
@@ -484,6 +485,8 @@ fn sender_settings_files_are_read_normalised_and_used_like_the_csharp_did() {
         // (0: a file from before 0.3.2; fresh defaults, which an unreadable file gives, have the current number)
         let version = ours.as_object_mut().unwrap().remove("settingsVersion");
         assert!(version == Some(json!(0)) || version == Some(json!(SenderSettings::SETTINGS_VERSION)), "{file}: {version:?}");
+        // 0.3.3's switch for encoding inside the capture engine (§2.8): no C# file has it, so it is off
+        assert_eq!(ours.as_object_mut().unwrap().shift_remove("keyframeOnRequest"), Some(json!(false)), "{file}");
         // where the C# gave its default (a missing or unreadable value), ours is today's default
         if float_of(&theirs["gopSeconds"]) == 2.0 && s.gop_seconds == SenderSettings::DEFAULT_GOP_SECONDS {
             theirs["gopSeconds"] = json!(s.gop_seconds);
@@ -690,13 +693,33 @@ fn mpv_plan(input: &Value) -> Result<MpvLaunchPlan, String> {
     .map_err(|e| e.to_string())
 }
 
+/// Since 0.3.3 mpv shows no on-screen controller (a live stream has nothing to seek in), no OSD bar and no Windows
+/// media overlay: the three options follow `--force-window=yes`. Its own keys, mouse actions, config files, window
+/// dragging and drag and drop are off as well: those four options come before `--keep-open=no`. The rest of the line
+/// is the C#'s.
+const WITHOUT_CONTROLLER: &str = " --force-window=yes --osc=no --osd-bar=no --media-controls=no ";
+const PLAYER_ONLY: &str = " --config=no --input-default-bindings=no --window-dragging=no --drag-and-drop=no --keep-open=no ";
+
+fn without_controller(mut args: Vec<String>) -> Vec<String> {
+    let at = args.iter().position(|a| a == "--force-window=yes").expect("the C# passed --force-window=yes") + 1;
+    args.splice(at..at, ["--osc=no", "--osd-bar=no", "--media-controls=no"].map(String::from));
+    let at = args.iter().position(|a| a == "--keep-open=no").expect("the C# passed --keep-open=no");
+    args.splice(at..at, ["--config=no", "--input-default-bindings=no", "--window-dragging=no", "--drag-and-drop=no"].map(String::from));
+    args
+}
+
+/// The C#'s command line as 0.3.3 builds it (see [`without_controller`]).
+fn as_now(line: &str) -> String {
+    line.replace(" --force-window=yes ", WITHOUT_CONTROLLER).replace(" --keep-open=no ", PLAYER_ONLY)
+}
+
 #[test]
 fn every_mpv_command_line_is_the_one_the_csharp_built() {
     let (mut built, mut refused, mut command_lines) = (0, 0, 0);
     for (input, out) in section("mpv") {
         match mpv_plan(&input) {
             Ok(plan) => {
-                assert_eq!(plan.mpv_args, strings_of(&out["mpvArgs"]), "{input}");
+                assert_eq!(plan.mpv_args, without_controller(strings_of(&out["mpvArgs"])), "{input}");
                 assert_eq!(plan.url, str_of(&out["url"]), "{input}");
                 // Since 0.3.2 the pipe's ffmpeg hands over the raw SRT payload for the guard instead of remuxing
                 // it (docs/design.md §3.2): only that half of the pipe differs from what the C# built.
@@ -721,7 +744,7 @@ fn every_mpv_command_line_is_the_one_the_csharp_built() {
                 if let Some(expected) = out.get("commandLine") {
                     assert_eq!(
                         plan.mpv_command_line(),
-                        str_of(&out["mpvCommandLine"]),
+                        as_now(str_of(&out["mpvCommandLine"])),
                         "{input}"
                     );
                     if pipe {
@@ -730,7 +753,7 @@ fn every_mpv_command_line_is_the_one_the_csharp_built() {
                         assert_eq!(plan.to_command_line(), format!("{ffmpeg} | {}", plan.mpv_command_line()), "{input}");
                     } else {
                         assert_eq!(plan.ffmpeg_command_line(), None, "{input}");
-                        assert_eq!(plan.to_command_line(), str_of(expected), "{input}");
+                        assert_eq!(plan.to_command_line(), as_now(str_of(expected)), "{input}");
                     }
                     command_lines += 1;
                 }

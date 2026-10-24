@@ -13,7 +13,7 @@ use hdrcast_media::sender::settings::{HdrMode, SenderSettings};
 use hdrcast_media::sender::{encoder_probe, encoder_profiles};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 
 use crate::access::AccessSettings;
 use crate::state::{self, AppState, UiSettings};
@@ -49,11 +49,9 @@ pub fn app_init(app: State<'_, Arc<AppState>>) -> Value {
         "encoders": encoder_profiles::for_platform(platform).iter()
             .map(|e| json!({ "id": e.id.number(), "name": e.display_name })).collect::<Vec<_>>(),
         "audioCodecs": [{ "id": 1, "name": "AAC" }, { "id": 2, "name": "Opus" }],
-        "latencyPresets": ReceiverSettings::LATENCY_PRESETS.iter()
-            .map(|p| json!({ "name": p.name, "latencyMs": p.latency_ms })).collect::<Vec<_>>(),
+        "latencyPresets": latency_presets(),
         "toneMappings": ReceiverSettings::TONE_MAPPING_ALGORITHMS,
-        "hwDecModes": HwDecMode::ALL.iter()
-            .map(|m| json!({ "id": m.number(), "name": m.display_name(platform) })).collect::<Vec<_>>(),
+        "hwDecModes": hw_dec_modes(platform),
         "tools": state::tools_view(&inner.sender, &inner.receiver),
         "firewall": state::firewall_view(inner.firewall),
         "access": state::access_view(&inner.access, inner.access_rev),
@@ -67,6 +65,14 @@ pub fn app_init(app: State<'_, Arc<AppState>>) -> Value {
         "status": status,
         "startupInvite": startup_invite,
     })
+}
+
+fn latency_presets() -> Value {
+    ReceiverSettings::LATENCY_PRESETS.iter().map(|p| json!({ "name": p.name, "latencyMs": p.latency_ms })).collect()
+}
+
+fn hw_dec_modes(platform: tool_locator::Platform) -> Value {
+    HwDecMode::ALL.iter().map(|m| json!({ "id": m.number(), "name": m.display_name(platform) })).collect()
 }
 
 fn audio_devices() -> Value {
@@ -92,6 +98,8 @@ pub fn settings_save(app: Shared<'_>, handle: AppHandle, settings: AllSettings) 
     state::adopt_output(&mut sender, &inner.outputs);
     let theme_changed = ui.theme != inner.ui.theme;
     let sender_changed = sender != inner.sender;
+    let receiver_changed = receiver != inner.receiver;
+    let hw_dec_changed = receiver.hw_dec != inner.receiver.hw_dec;
     if ui != inner.ui {
         if let Err(e) = ui.save() {
             app.log(&format!("[app] could not save settings: {e}"));
@@ -117,6 +125,7 @@ pub fn settings_save(app: Shared<'_>, handle: AppHandle, settings: AllSettings) 
         "tools": state::tools_view(&inner.sender, &inner.receiver),
     });
     let theme = inner.ui.theme.clone();
+    let receiver = inner.receiver.clone();
     drop(inner);
     if theme_changed {
         window::apply_theme(&handle, &theme);
@@ -124,7 +133,32 @@ pub fn settings_save(app: Shared<'_>, handle: AppHandle, settings: AllSettings) 
     if sender_changed {
         crate::share::settings_changed(&app);
     }
+    if receiver_changed {
+        // the panel over the player shows them too
+        let _ = handle.emit_to(crate::overlay::LABEL, "receiver", &receiver);
+    }
+    if hw_dec_changed {
+        crate::watch::set_hwdec(&app, receiver.hw_dec);
+    }
     Ok(reply)
+}
+
+/// Changes the receiver settings from elsewhere than the settings page (the panel over the player), saves them and
+/// tells both pages.
+fn edit_receiver(app: &AppState, handle: &AppHandle, edit: impl FnOnce(&mut ReceiverSettings)) -> ReceiverSettings {
+    let mut inner = app.inner.lock().unwrap();
+    let mut receiver = inner.receiver.clone();
+    edit(&mut receiver);
+    let receiver = receiver.normalized();
+    if receiver != inner.receiver {
+        if let Err(e) = receiver.save(&ReceiverSettings::default_path()) {
+            app.log(&format!("[app] could not save settings: {e}"));
+        }
+        inner.receiver = receiver.clone();
+    }
+    drop(inner);
+    let _ = handle.emit("receiver", &receiver);
+    receiver
 }
 
 // ---- starting at sign-in, the notification area ------------------------------------------------------------------
@@ -531,6 +565,72 @@ pub fn watch_stop(app: Shared<'_>) {
 #[tauri::command(async)]
 pub fn watch_fullscreen(app: Shared<'_>) {
     crate::watch::toggle_fullscreen(&app);
+}
+
+/// The decoder, from the panel over the player: saved, and switched in the running player at once.
+#[tauri::command(async)]
+pub fn watch_set_hwdec(app: Shared<'_>, handle: AppHandle, hw_dec: i64) -> CmdResult {
+    let mode = HwDecMode::from_number(hw_dec).ok_or("There is no such decoder.")?;
+    let receiver = edit_receiver(&app, &handle, |r| r.hw_dec = mode);
+    crate::watch::set_hwdec(&app, mode);
+    Ok(json!(receiver))
+}
+
+/// The delay, from the panel over the player: saved, and taken by joining the host again.
+#[tauri::command(async)]
+pub fn watch_set_latency(app: Shared<'_>, handle: AppHandle, latency_ms: i32) -> Value {
+    edit_receiver(&app, &handle, |r| r.latency_ms = latency_ms);
+    refresh_firewall(&app);
+    outcome(crate::watch::rejoin(app.inner()))
+}
+
+// ---- the panel over the player ------------------------------------------------------------------------------------
+
+/// The sound, from the panel over the player: off or on at once (and for the player a new delay starts).
+#[tauri::command(async)]
+pub fn watch_set_mute(app: Shared<'_>, muted: bool) {
+    crate::watch::set_mute(&app, muted);
+}
+
+// ---- the panel over the player ------------------------------------------------------------------------------------
+// Async, all of them: laying the panel out waits for the main thread.
+
+/// What the panel needs to draw itself; the rest comes with every status.
+#[tauri::command(async)]
+pub fn overlay_init(app: Shared<'_>) -> Value {
+    let status = status::snapshot(&app);
+    let inner = app.inner.lock().unwrap();
+    json!({
+        "platform": state::platform_name(app.platform),
+        "ui": inner.ui,
+        "receiver": inner.receiver,
+        "latencyPresets": latency_presets(),
+        "hwDecModes": hw_dec_modes(app.platform),
+        "expanded": crate::overlay::is_expanded(&app),
+        "status": status,
+    })
+}
+
+/// The panel's button on the Watch page: opens or folds it.
+#[tauri::command(async)]
+pub fn overlay_toggle(app: Shared<'_>) {
+    crate::overlay::toggle(&app);
+}
+
+/// The round button opens the panel; the panel's fold button and Esc fold it, and the keyboard goes back to the
+/// player then.
+#[tauri::command(async)]
+pub fn overlay_expand(app: Shared<'_>, expanded: bool) {
+    crate::overlay::set_expanded(&app, expanded);
+    if !expanded {
+        crate::overlay::focus_player(&app);
+    }
+}
+
+/// The panel's page measured itself (CSS pixels).
+#[tauri::command(async)]
+pub fn overlay_fit(app: Shared<'_>, height: f64) {
+    crate::overlay::fit(&app, height);
 }
 
 /// Asks the signaling server for the live list now instead of at the next 10 s tick.

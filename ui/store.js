@@ -89,6 +89,11 @@ export async function boot() {
       invoke('access_get').then((access) => { if (!accessTimer) setState({ access }); }).catch(() => {});
     }
   });
+  // the panel over the player changed the delay or the decoder: keep them, so the next save does not undo them
+  listen('receiver', (receiver) => {
+    const { latencyMs, hwDec } = receiver;
+    setState({ settings: { ...state.settings, receiver: { ...state.settings.receiver, latencyMs, hwDec } } });
+  });
   listen('log', (payload) => {
     const logs = state.logs.concat(payload.lines);
     setState({ logs: logs.length > MAX_LOG_LINES ? logs.slice(logs.length - MAX_LOG_LINES) : logs });

@@ -111,6 +111,7 @@ fn a_sender_file_written_by_0_2_4_is_read_whole() {
         buffer_seconds: SenderSettings::DEFAULT_BUFFER_SECONDS,
         b_frames: false,
         lookahead: true,
+        keyframe_on_request: false,
         audio: true,
         audio_device: "{0.0.0.00000000}.{6f1b7a3c-0000-4000-8000-000000000001}".to_string(),
         audio_codec: AudioCodec::Opus,
@@ -181,10 +182,13 @@ fn a_receiver_file_written_by_0_2_4_is_read_whole() {
 #[test]
 fn the_field_names_and_their_order_are_the_data_member_names() {
     let sender = serde_json::to_value(SenderSettings::defaults_for(Platform::Windows)).unwrap();
-    // 0.2.4's members in its order, then the one 0.3.2 added
+    // 0.2.4's members in its order, with 0.3.3's switch next to the other encoder options, then the number
+    // 0.3.2 added
     let csharp = serde_json::from_str::<Value>(SENDER_0_2_4).unwrap();
     let mut expected = keys(&csharp);
-    let version = "settingsVersion".to_string();
+    let (keyframes, version) = ("keyframeOnRequest".to_string(), "settingsVersion".to_string());
+    let after = expected.iter().position(|k| *k == "lookahead").unwrap() + 1;
+    expected.insert(after, &keyframes);
     expected.push(&version);
     assert_eq!(keys(&sender), expected);
     assert_eq!(
@@ -205,6 +209,7 @@ fn the_field_names_and_their_order_are_the_data_member_names() {
             "bufferSeconds",
             "bFrames",
             "lookahead",
+            "keyframeOnRequest",
             "audio",
             "audioDevice",
             "audioCodec",
@@ -269,7 +274,7 @@ fn enums_are_written_as_their_numbers() {
         json!({
             "outputIndex": 0, "outputDeviceName": "", "outputFriendlyName": "", "fps": 60, "scale": 0, "hdrMode": 0,
             "cursor": true, "sdrWhite": 80.0, "encoder": 0, "quality": 1, "bitrateMbps": 40, "gopSeconds": 1.0,
-            "bufferSeconds": 0.25, "bFrames": true, "lookahead": true, "audio": true, "audioDevice": "default",
+            "bufferSeconds": 0.25, "bFrames": true, "lookahead": true, "keyframeOnRequest": false, "audio": true, "audioDevice": "default",
             "audioCodec": 1, "audioBitrateKbps": 192, "audioExcludeApp": "", "maxViewers": 4, "uploadMbps": 0,
             "ffmpegPath": "", "settingsVersion": 1
         })

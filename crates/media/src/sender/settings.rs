@@ -59,6 +59,10 @@ pub struct SenderSettings {
     pub buffer_seconds: f64,
     pub b_frames: bool,
     pub lookahead: bool,
+    /// Encode inside the capture engine (NVENC only) so that a viewer who lost part of the stream gets a fresh
+    /// keyframe at once instead of at the next scheduled one (docs/design.md §2.8, §8.12). Lookahead is off on
+    /// that path. Without NVENC, or when it fails, ffmpeg encodes as before.
+    pub keyframe_on_request: bool,
 
     // ---- audio ----
     pub audio: bool,
@@ -130,6 +134,7 @@ impl SenderSettings {
             buffer_seconds: Self::DEFAULT_BUFFER_SECONDS,
             b_frames: true,
             lookahead: true,
+            keyframe_on_request: false,
 
             audio: true,
             audio_device: "default".to_string(),
@@ -236,6 +241,11 @@ impl SenderSettings {
             problems.push("Pick an encoder.".to_string());
         }
         problems
+    }
+
+    /// The encoder runs inside the capture engine: asked for, and possible with this encoder.
+    pub fn encodes_in_engine(&self) -> bool {
+        self.keyframe_on_request && encoder_profiles::engine_encoder(self.encoder).is_some()
     }
 
     /// What the encoder profile needs; `mastering_max_nits` is the monitor's peak (0 = unknown).

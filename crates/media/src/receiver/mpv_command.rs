@@ -206,8 +206,26 @@ pub fn mpv_args(
     }
 
     a.push(format!("--input-ipc-server={ipc_endpoint}"));
+    // The player window shows the picture and, under remote control, passes input on to the host; nothing else.
+    // No mpv.conf / input.conf / scripts of the user's, none of mpv's own keys and mouse actions (the wheel's volume,
+    // space, q, a double click...), no moving the window by dragging the picture and no file dropped on it in place
+    // of the stream. HdrCast binds the few keys the player keeps itself, over IPC (docs/design.md §3.1).
+    a.push("--config=no".to_string());
+    a.push("--input-default-bindings=no".to_string());
+    a.push("--window-dragging=no".to_string());
+    a.push("--drag-and-drop=no".to_string());
     a.push("--keep-open=no".to_string());
     a.push("--force-window=yes".to_string());
+    // A live stream has nothing to seek in: no on-screen controller (its progress bar and buttons come up over the
+    // picture whenever the mouse moves, also while it moves the host's mouse) and no bar for volume or seeking.
+    a.push("--osc=no".to_string());
+    a.push("--osd-bar=no".to_string());
+    if platform == Platform::Windows {
+        // No Windows media overlay for a live stream (mpv 0.39+). It also keeps mpv's exit from stalling: with the
+        // on-screen controller off, a load failure left mpv 0.41 stuck in the media controls' shutdown every time
+        // (12 s until killed; 0.2 s with this), and the app restarts mpv only once it has exited.
+        a.push("--media-controls=no".to_string());
+    }
     a.push(format!("--title={WINDOW_TITLE}"));
     a.push("--msg-level=all=info".to_string());
     a.push("--term-status-msg=".to_string());

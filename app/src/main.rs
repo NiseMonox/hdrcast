@@ -8,11 +8,14 @@ mod control_host;
 mod control_viewer;
 mod instance;
 mod ipc_stream;
+mod keyframe_host;
+mod keyframe_viewer;
 mod live;
 mod logs;
 mod mpv_ipc;
 mod mpv_runner;
 mod net_report;
+mod overlay;
 mod sender_runner;
 mod share;
 mod state;
@@ -144,6 +147,13 @@ fn run_app(startup_invite: Option<String>, background: bool, instance: instance:
         .on_window_event(|window, event| {
             let tauri::WindowEvent::CloseRequested { api, .. } = event else { return };
             let Some(state) = window.try_state::<Arc<AppState>>().map(|s| s.inner().clone()) else { return };
+            if window.label() == overlay::LABEL {
+                // Alt+F4 on the panel over the player folds it, like its own button (not on this thread: laying it
+                // out waits for this one)
+                api.prevent_close();
+                std::thread::spawn(move || overlay::set_expanded(&state, false));
+                return;
+            }
             if share::stays_available(&state) && tray::exists(window.app_handle()) {
                 // Closing the window does not take this computer out of the group: it waits in the notification area.
                 api.prevent_close();
@@ -189,6 +199,13 @@ fn run_app(startup_invite: Option<String>, background: bool, instance: instance:
             commands::watch_stop,
             commands::watch_fullscreen,
             commands::watch_control,
+            commands::watch_set_hwdec,
+            commands::watch_set_latency,
+            commands::watch_set_mute,
+            commands::overlay_init,
+            commands::overlay_toggle,
+            commands::overlay_expand,
+            commands::overlay_fit,
             commands::live_refresh,
         ])
         .build(tauri::generate_context!())

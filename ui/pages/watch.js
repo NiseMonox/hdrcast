@@ -94,7 +94,7 @@ export function WatchPage() {
     </div>
     ${live.hosts.some((h) => h.onDemand) && html`<div class="section-note">${t('watch.onDemandNote')}</div>`}
 
-    <${Section} title=${t('watch.connection')} note=${t('watch.latencyNote')}>
+    <${Section} title=${t('watch.connection')} note=${watching ? t('watch.latencyNoteWatching') : t('watch.latencyNote')}>
       <${Row} name=${t('watch.latency')} hint=${t('watch.latencyHint')} disabled=${watching}>
         <${Segmented} value=${presetValue} onChange=${(v) => { setCustom(v < 0); if (v > 0) set({ latencyMs: v }); }}
           options=${presets.map((p) => ({ value: p.latencyMs, label: t('preset.' + p.name, null, p.name) })).concat([{ value: -1, label: t('watch.custom') }])} />
@@ -185,6 +185,8 @@ function NowPlaying({ watch }) {
         <div class="hero-sub">${session?.state === 'approval' ? t('watch.approvalSub', { host: watch.hostName }) : session?.status || ''}</div>
       </div>
       <span class="live-pill"><span class=${'dot' + (playing ? ' pulse' : '')}></span>${pill}${playing && player ? ' ' + formatDuration(player.uptimeSec) : ''}</span>
+      ${!refused && html`<button class="btn" title=${t('watch.overlayHint')} aria-pressed=${watch.overlay ? 'true' : 'false'}
+        onClick=${() => invoke('overlay_toggle').catch(() => {})}><${Icon} name="sliders" />${t('watch.overlay')}</button>`}
       ${!refused && html`<button class="btn" disabled=${!player || player.state === 'idle'} onClick=${() => invoke('watch_fullscreen').catch(() => {})}>
         <${Icon} name="expand" />${t('watch.fullscreenBtn')}</button>`}
       <button class="btn solid" onClick=${stopWatch}>${refused ? t('common.close') : html`<${Icon} name="stop" />${t('watch.stop')}`}</button>

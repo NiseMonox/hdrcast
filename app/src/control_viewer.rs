@@ -224,14 +224,12 @@ impl ViewerControlLink {
         if !ipc.is_connected() {
             return;
         }
+        // (a drag in the picture reaches the host: the player's window is never moved by one, --window-dragging=no)
         if granted {
             ipc.command(&[json!("define-section"), json!(keys::SECTION), json!(keys::mpv_input_section(name)), json!("force")]);
             ipc.command(&[json!("enable-section"), json!(keys::SECTION)]);
-            // a drag in the picture must reach the host, not move the player's window
-            ipc.set_property("window-dragging", false);
         } else {
             ipc.command(&[json!("disable-section"), json!(keys::SECTION)]);
-            ipc.set_property("window-dragging", true);
         }
         inner.section_on = granted;
     }

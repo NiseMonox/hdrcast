@@ -153,8 +153,27 @@ pub fn parse_mpv_key(name: &str) -> Option<(Mods, Input)> {
 /// Name of the mpv input section and of the binding its lines invoke.
 pub const SECTION: &str = "hdrcast-control";
 pub const BINDING: &str = "hdrcast-input";
-/// The one combination kept for the viewer's own player: toggles full screen locally.
+/// A combination kept for the viewer's own player: toggles full screen locally.
 pub const LOCAL_FULLSCREEN: &str = "Ctrl+Alt+ENTER";
+/// The other one: opens or folds HdrCast's panel over the player (docs/design.md §3.3), by sending
+/// [`OVERLAY_MESSAGE`] to every IPC client.
+pub const LOCAL_OVERLAY: &str = "Ctrl+Alt+o";
+pub const OVERLAY_MESSAGE: &str = "hdrcast-overlay";
+/// Sent by the player window's close button: HdrCast stops watching.
+pub const CLOSE_MESSAGE: &str = "hdrcast-close";
+
+/// What the player's window does by itself (docs/design.md §3.1): mpv's own keys and mouse actions are all off
+/// (`--input-default-bindings=no`), these are bound over IPC instead. Under remote control the input section takes
+/// every key but the first two to the host (Esc too); the close button is not a key and stays.
+pub fn player_bindings() -> [(&'static str, String); 4] {
+    [
+        (LOCAL_OVERLAY, format!("script-message {OVERLAY_MESSAGE}")),
+        (LOCAL_FULLSCREEN, "cycle fullscreen".to_string()),
+        ("ESC", "set fullscreen no".to_string()),
+        // mpv's own binding quit, and the app would have started the player again
+        ("CLOSE_WIN", format!("script-message {CLOSE_MESSAGE}")),
+    ]
+}
 
 /// The input.conf text for `define-section`: every key, button and wheel direction, with every modifier
 /// combination, bound to `script-binding <client>/hdrcast-input`. mpv then sends a `key-binding` client message
@@ -170,6 +189,9 @@ pub fn mpv_input_section(client_name: &str) -> String {
     names.extend(Button::ALL.iter().map(|(_, n)| n.to_string()));
     names.extend(WHEELS.iter().map(|(n, _, _)| n.to_string()));
 
+    // the two combinations the player keeps for itself
+    let local: Vec<_> =
+        player_bindings().into_iter().filter(|(key, _)| [LOCAL_FULLSCREEN, LOCAL_OVERLAY].contains(key)).collect();
     let mut out = String::with_capacity(names.len() * 16 * 48);
     for name in &names {
         for combo in 0u8..16 {
@@ -181,9 +203,11 @@ pub fn mpv_input_section(client_name: &str) -> String {
                 }
             }
             key.push_str(name);
-            if key == LOCAL_FULLSCREEN {
+            if let Some((_, command)) = local.iter().find(|(local, _)| *local == key) {
                 out.push_str(&key);
-                out.push_str(" cycle fullscreen\n");
+                out.push(' ');
+                out.push_str(command);
+                out.push('\n');
                 continue;
             }
             out.push_str(&key);
@@ -238,13 +262,17 @@ mod tests {
     }
 
     #[test]
-    fn the_section_binds_every_combination_and_keeps_one_for_the_player() {
+    fn the_section_binds_every_combination_and_keeps_two_for_the_player() {
         let s = mpv_input_section("ipc_0");
         assert!(s.contains("\na script-binding ipc_0/hdrcast-input\n"));
         assert!(s.contains("\nShift+Ctrl+Alt+Meta+F12 script-binding ipc_0/hdrcast-input\n"));
         assert!(s.contains("\nCtrl+MBTN_LEFT script-binding ipc_0/hdrcast-input\n"));
         assert!(s.contains("\nCtrl+Alt+ENTER cycle fullscreen\n"));
         assert!(!s.contains("\nCtrl+Alt+ENTER script-binding"));
+        assert!(s.contains("\nCtrl+Alt+o script-message hdrcast-overlay\n"));
+        assert!(!s.contains("\nCtrl+Alt+o script-binding"));
+        assert!(s.contains("\nCtrl+o script-binding ipc_0/hdrcast-input\n"), "only that combination stays local");
+        assert!(s.contains("\nESC script-binding ipc_0/hdrcast-input\n"), "Esc goes to the host under remote control");
         assert!(s.contains("\nSHARP script-binding"), "a bare # would start a comment");
         assert!(!s.lines().any(|l| l.starts_with('#')));
         // every line parses back to something we forward (or is the local one)

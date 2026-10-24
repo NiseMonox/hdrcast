@@ -309,6 +309,7 @@ mod tests {
             overhead_percent: 25,
             remote_control: true,
             device: None,
+            keyframes: true,
         }
     }
 

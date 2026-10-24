@@ -4,6 +4,10 @@
 //! Reference values (ST.2084 at sdr-white 80 nit, limited-range 10 bit): scRGB 1.0 -> Y10 490,
 //! 2.5 -> 571, 125 -> 940 (clipped at the limited-range maximum). ffmpeg's zscale with npl=80 lands within
 //! 3 code values of these; the GPU must match the reference, which is what this test checks.
+//! Then the zero-copy shader (design.md section 2.8), which writes the encoder's P010 / NV12 texture, has to
+//! produce exactly the frame the read-back path produces, byte for byte.
+
+use std::sync::Arc;
 
 use windows::core::Interface;
 use windows::Win32::Foundation::HMODULE;
@@ -12,20 +16,24 @@ use windows::Win32::Graphics::Direct3D::{
     D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
-    D3D11_SUBRESOURCE_DATA,
+    D3D11CreateDevice, ID3D11Device, ID3D11Texture2D, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11_SDK_VERSION, D3D11_SUBRESOURCE_DATA,
 };
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT;
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
+};
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1};
 
 use super::converter::{create_shader_texture, GpuConverter};
 use super::outputs::adapter_name;
+use super::surfaces::SurfaceRing;
 use super::util::error_text;
 use crate::args::CaptureFormat;
 use crate::color;
 use crate::engine::exit_codes;
 use crate::log;
 use crate::numfmt::trimmed;
+use crate::platform::FrameLayout;
 use crate::shader::{self, ShaderParams};
 
 const TEST_VALUES: [f32; 6] = [0.0, 0.5, 1.0, 2.5, 12.5, 125.0];
@@ -42,6 +50,9 @@ pub(crate) struct SelfTestResult {
     /// Chroma of the grey pattern (expected 512 / 512).
     pub cb: i32,
     pub cr: i32,
+    /// Zero copy, per format: how many bytes of the frame the shader wrote into an encoder surface differ from
+    /// the read-back frame (expected 0), or why this GPU cannot run it.
+    pub surfaces: Vec<(CaptureFormat, Result<usize, String>)>,
 }
 
 impl SelfTestResult {
@@ -59,6 +70,11 @@ impl SelfTestResult {
             .filter(|(_, gpu, reference)| !Self::luma_ok(*gpu, *reference))
             .count()
             + usize::from(!self.chroma_ok())
+            + self
+                .surfaces
+                .iter()
+                .filter(|(_, differing)| matches!(differing, Ok(n) if *n > 0))
+                .count()
     }
 }
 
@@ -103,6 +119,18 @@ pub(crate) fn run(sdr_white: f32) -> i32 {
             " MISMATCH (expected 512/512)"
         }
     ));
+    // Not indented: the lines above are what the C# engine printed too.
+    for (format, differing) in &result.surfaces {
+        out.push_str(&match differing {
+            Ok(0) => format!(
+                "zero copy: the shader writing the encoder's {format} surface gives the same frame\n"
+            ),
+            Ok(n) => format!(
+                "zero copy: the shader writing the encoder's {format} surface differs in {n} bytes: MISMATCH\n"
+            ),
+            Err(reason) => format!("zero copy: {format} not checked on this GPU ({reason})\n"),
+        });
+    }
     let failures = result.failures();
     if failures == 0 {
         out.push_str(
@@ -185,12 +213,83 @@ pub(crate) fn measure(sdr_white: f32) -> Result<SelfTestResult, String> {
 
     let uv_offset = color::uv_plane_offset(CaptureFormat::P010, WIDTH, HEIGHT);
     let uv_index = uv_offset + (HEIGHT as usize / 2 - 1) * WIDTH as usize * 2 + 16;
+
+    // Zero copy: the same gradient into a P010 surface; and an SDR pattern scaled to half size (the sampler
+    // path) into an NV12 surface, against the NV12 kernel that reads back.
+    let mut bgra = vec![0u8; (WIDTH * HEIGHT * 4) as usize];
+    for (i, pixel) in bgra.chunks_exact_mut(4).enumerate() {
+        let (x, y) = (i as u32 % WIDTH, i as u32 / WIDTH);
+        pixel.copy_from_slice(&[
+            (x * 255 / WIDTH) as u8,
+            (y * 255 / HEIGHT) as u8,
+            ((x + y) * 7 % 256) as u8,
+            255,
+        ]);
+    }
+    let initial = D3D11_SUBRESOURCE_DATA {
+        pSysMem: bgra.as_ptr().cast(),
+        SysMemPitch: WIDTH * 4,
+        SysMemSlicePitch: 0,
+    };
+    // `bgra` outlives the call that reads `initial`.
+    let (sdr, _sdr_view) = create_shader_texture(
+        &device,
+        WIDTH,
+        HEIGHT,
+        DXGI_FORMAT_B8G8R8A8_UNORM,
+        Some(&initial),
+    )?;
+    let half = ShaderParams {
+        dst_width: WIDTH / 2,
+        dst_height: HEIGHT / 2,
+        flags: 0,
+        ..params
+    };
+    let surfaces = vec![
+        (
+            CaptureFormat::P010,
+            compare_surface(&device, &source, CaptureFormat::P010, &params),
+        ),
+        (
+            CaptureFormat::Nv12,
+            compare_surface(&device, &sdr, CaptureFormat::Nv12, &half),
+        ),
+    ];
     Ok(SelfTestResult {
         device: description,
         luma,
         cb: sample(uv_index),
         cr: sample(uv_index + 2),
+        surfaces,
     })
+}
+
+/// Converts `source` with `params` into memory and into an encoder surface (zero copy) and counts the bytes in
+/// which the two frames differ. An error says why the surface cannot be written on this device.
+fn compare_surface(
+    device: &ID3D11Device,
+    source: &ID3D11Texture2D,
+    format: CaptureFormat,
+    params: &ShaderParams,
+) -> Result<usize, String> {
+    let (width, height) = (params.dst_width, params.dst_height);
+    let mut memory = GpuConverter::new(device, format, width, height)?;
+    memory.update_source(source)?;
+    let mut expected = vec![0u8; memory.frame_bytes()];
+    memory.convert(params, &mut expected)?;
+
+    let layout = FrameLayout {
+        format,
+        width,
+        height,
+    };
+    let mut planes = GpuConverter::new(device, format, width, height)?;
+    planes.update_source(source)?;
+    planes.use_surfaces(Arc::new(SurfaceRing::new(device, layout, 1)?))?;
+    planes.convert_into(params, 0)?;
+    let got = planes.read_surface(0)?;
+    Ok(expected.iter().zip(&got).filter(|(a, b)| a != b).count()
+        + expected.len().abs_diff(got.len()))
 }
 
 fn create_device_on(
@@ -306,6 +405,17 @@ mod tests {
         let y10: Vec<i32> = result.luma.iter().map(|&(_, gpu, _)| gpu).collect();
         for (got, expected) in y10.iter().zip([64, 431, 490, 571, 723, 940]) {
             assert!((got - expected).abs() <= 2, "GPU luma {y10:?}");
+        }
+        // Zero copy writes exactly what the read-back path writes (where the device can do it at all).
+        for (format, differing) in &result.surfaces {
+            match differing {
+                Ok(n) => assert_eq!(
+                    *n, 0,
+                    "zero copy, {format}: {n} bytes differ ({})",
+                    result.device
+                ),
+                Err(reason) => eprintln!("note: zero copy, {format}: not checked here ({reason})"),
+            }
         }
     }
 }

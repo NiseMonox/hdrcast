@@ -40,6 +40,10 @@ pub struct HostSessionInfo {
 /// Receives what viewers send on the side channel: (session id, payload). Runs on a network thread.
 pub type HostSideHandler = Arc<dyn Fn(&str, &[u8]) + Send + Sync>;
 
+/// Told (with the session id) when a viewer's SRT stream starts: the first data of a new SRT connection went
+/// to it. Runs on a network thread.
+pub type StreamStarted = Arc<dyn Fn(&str) + Send + Sync>;
+
 type SessionChanged = dyn Fn(&HostSessionInfo) + Send + Sync;
 
 pub struct HostLink {
@@ -51,6 +55,7 @@ struct Inner {
     sessions: Mutex<Sessions>,
     session_changed: Callbacks<SessionChanged>,
     side_handler: Mutex<Option<HostSideHandler>>,
+    stream_started: Mutex<Option<StreamStarted>>,
 }
 
 #[derive(Default)]
@@ -88,6 +93,7 @@ impl HostLink {
             sessions: Mutex::new(Sessions::default()),
             session_changed: Callbacks::new(),
             side_handler: Mutex::new(None),
+            stream_started: Mutex::new(None),
         });
         let events: Weak<dyn LinkEvents> = Arc::downgrade(&(inner.clone() as Arc<dyn LinkEvents>));
         inner.core.start(events)?;
@@ -226,6 +232,11 @@ impl HostLink {
         *lock(&self.inner.side_handler) = Some(handler);
     }
 
+    /// Who is told when a viewer's SRT stream starts (a viewer joined, or its player connected again).
+    pub fn on_stream_started(&self, handler: StreamStarted) {
+        *lock(&self.inner.stream_started) = Some(handler);
+    }
+
     /// Sends `payload` (1..=1200 bytes) to a viewer on the side channel, on the path its stream uses. False
     /// when the session is not connected or the payload is out of range. Only for viewers that asked for it:
     /// an older viewer would take the datagram for SRT.
@@ -279,10 +290,16 @@ impl Inner {
         if entry.session.is_over() {
             return;
         }
-        entry.srt.from_sender(datagram);
+        let started = entry.srt.from_sender(datagram);
         if self.core.send_wan(datagram, to) {
             entry.session.note_sent(mono_clock::now_us());
             entry.bytes_to_viewer.fetch_add(datagram.len() as u64, Ordering::Relaxed);
+        }
+        if started {
+            let handler = lock(&self.stream_started).clone();
+            if let Some(handler) = handler {
+                handler(entry.session.sid());
+            }
         }
     }
 

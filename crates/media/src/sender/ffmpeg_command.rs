@@ -16,11 +16,23 @@ int_enum! {
     }
 }
 
+/// What the capture engine puts into the video pipe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VideoInput {
+    /// Raw frames, which ffmpeg encodes (design.md §2.5).
+    #[default]
+    Raw,
+    /// An MPEG-TS of HEVC pictures the engine encoded itself (§2.8): ffmpeg only adds the sound and copies the
+    /// video.
+    EncodedTs,
+}
+
 /// Everything the ffmpeg child process needs (design.md §2.5).
 #[derive(Debug, Clone, PartialEq)]
 pub struct FfmpegPlan {
     /// Name of the capture engine's video pipe (see [`pipe_path`]).
     pub video_pipe_name: String,
+    pub video_input: VideoInput,
     /// Name of the audio pipe; `None` (or [`AudioCodec::None`]) = no audio input.
     pub audio_pipe_name: Option<String>,
     pub pixel_format: CaptureFormat,
@@ -51,12 +63,18 @@ impl FfmpegPlan {
         plan.encoder.hdr = layout.format == CaptureFormat::P010;
         plan
     }
+
+    /// This plan with the video pipe carrying `input`.
+    pub fn with_video_input(&self, input: VideoInput) -> FfmpegPlan {
+        FfmpegPlan { video_input: input, ..self.clone() }
+    }
 }
 
 impl Default for FfmpegPlan {
     fn default() -> Self {
         FfmpegPlan {
             video_pipe_name: CaptureArgs::DEFAULT_VIDEO_PIPE.to_string(),
+            video_input: VideoInput::Raw,
             audio_pipe_name: None,
             pixel_format: CaptureFormat::P010,
             width: 0,
@@ -136,31 +154,42 @@ pub fn build(p: &FfmpegPlan) -> Result<Vec<String>, FfmpegPlanError> {
         );
     }
 
-    // Video input: raw frames from the capture engine, paced by the engine itself.
     push(&mut a, &["-thread_queue_size", "1024"]);
-    push(&mut a, &["-f", "rawvideo"]);
-    push(
-        &mut a,
-        &[
-            "-pix_fmt",
-            if p.pixel_format == CaptureFormat::P010 {
-                "p010le"
-            } else {
-                "nv12"
-            },
-        ],
-    );
-    push(
-        &mut a,
-        &["-video_size", &format!("{}x{}", p.width, p.height)],
-    );
-    push(&mut a, &["-framerate", &p.fps.to_string()]);
-    // Tag the raw frames themselves. ffmpeg 7.1+ negotiates colour spaces in the filter graph and gives the
-    // encoder the frames' colour properties, so tags on the output alone went wrong twice (v0.2.1, ffmpeg 9):
-    // untagged input counted as BT.601 and was re-matrixed to BT.2020 (saturated colours shifted by up to
-    // 23 code values), and hardware encoders wrote transfer / primaries "unknown", so every player showed
-    // the PQ signal as plain SDR: wrong colours on HDR and SDR screens alike.
-    a.extend(encoder_profiles::color_tags(p.encoder.hdr));
+    match p.video_input {
+        VideoInput::Raw => {
+            // Video input: raw frames from the capture engine, paced by the engine itself.
+            push(&mut a, &["-f", "rawvideo"]);
+            push(
+                &mut a,
+                &[
+                    "-pix_fmt",
+                    if p.pixel_format == CaptureFormat::P010 {
+                        "p010le"
+                    } else {
+                        "nv12"
+                    },
+                ],
+            );
+            push(
+                &mut a,
+                &["-video_size", &format!("{}x{}", p.width, p.height)],
+            );
+            push(&mut a, &["-framerate", &p.fps.to_string()]);
+            // Tag the raw frames themselves. ffmpeg 7.1+ negotiates colour spaces in the filter graph and gives
+            // the encoder the frames' colour properties, so tags on the output alone went wrong twice (v0.2.1,
+            // ffmpeg 9): untagged input counted as BT.601 and was re-matrixed to BT.2020 (saturated colours
+            // shifted by up to 23 code values), and hardware encoders wrote transfer / primaries "unknown", so
+            // every player showed the PQ signal as plain SDR: wrong colours on HDR and SDR screens alike.
+            a.extend(encoder_profiles::color_tags(p.encoder.hdr));
+        }
+        VideoInput::EncodedTs => {
+            // HEVC the engine encoded (design.md §2.8), colour tags in its VUI. A tenth of a second is enough to
+            // find the stream (its first picture is a keyframe with the parameter sets); the frame rate is not
+            // estimated, every picture carries its time.
+            push(&mut a, &["-f", "mpegts"]);
+            push(&mut a, &["-probesize", "2000000", "-analyzeduration", "100000", "-fpsprobesize", "0"]);
+        }
+    }
     push(&mut a, &["-i", &pipe_path(&p.video_pipe_name)]);
 
     let audio_pipe = match p.audio {
@@ -177,9 +206,20 @@ pub fn build(p: &FfmpegPlan) -> Result<Vec<String>, FfmpegPlanError> {
         push(&mut a, &["-i", &pipe_path(name)]);
     }
 
-    a.extend(encoder_profiles::build_video_args(&p.encoder));
-    // The engine writes exactly `fps` frames per second; keep ffmpeg from resampling timestamps.
-    push(&mut a, &["-fps_mode", "cfr"]);
+    match p.video_input {
+        VideoInput::Raw => {
+            a.extend(encoder_profiles::build_video_args(&p.encoder));
+            // The engine writes exactly `fps` frames per second; keep ffmpeg from resampling timestamps.
+            push(&mut a, &["-fps_mode", "cfr"]);
+        }
+        VideoInput::EncodedTs => {
+            push(&mut a, &["-map", "0:v:0"]);
+            if audio_pipe.is_some() {
+                push(&mut a, &["-map", "1:a:0"]);
+            }
+            push(&mut a, &["-c:v", "copy"]);
+        }
+    }
 
     if audio_pipe.is_some() {
         push(
