@@ -19,6 +19,13 @@
 - v0.3.1（2026-10）：接近 Parsec 的用法。**被控端不用手动开播**：应用开着就以"在线"出现在组里，别人点"连接"并被放行后才开始采集，
   最后一个人离开后自动停（§8.10）。**权限按电脑授予**：每台电脑有自己的设备密钥，主播给每台电脑定"能不能直接看、能不能控制"，
   例如自己的笔记本连上即可控制、朋友只能看（§8.10、§9）。协议仍是 v1，新字段都是可选的。
+- v0.3.2（2026-10）：**丢包不再花屏**。中国观众看日本主播时，传输中丢掉的数据让画面糊成色块，一直到下一个关键帧。
+  现在观众端的守卫（§3.2）让画面停在最后一帧完好的画面上，等到关键帧再继续（Moonlight 的做法）；主播端把编码器的码率缓冲从 2 s 降到
+  0.25 s、关键帧间隔从 2 s 降到 1 s，并按线上的真实码率告诉 SRT（§2.5、§2.6），丢包本身也少了；两端都从 SRT 的包头读出丢包、重发、
+  补发不及和往返时间，写进日志、显示在界面上（§8.11）。线上协议不变。
+- v0.3.3（2026-10）：**按需关键帧**。观众丢了补不回来的数据时向主播要一个新的关键帧，不再等下一个定时关键帧（最长 1 s，丢失跨过关键帧时更久）。
+  为此编码可以搬进采集引擎：引擎自己驱动 NVENC（§2.8），ffmpeg 只加声音、原样复制视频；观众在数据还缺在路上时就经旁路通道请求，主播对所有观众
+  合起来限速（§8.12）。在 **开播 → 更多选项 → 按需关键帧** 打开，只对 NVENC；做不到时照旧由 ffmpeg 编码。新字段 `kf` 是可选的，旧版本不受影响。
 
 ## 1. 架构
 
@@ -51,9 +58,25 @@ zscale 不收打包浮点；Vulkan / CUDA 不能导入 D3D11 纹理；libplacebo
 
 ### 1.2 为什么只有 HEVC、没有 AV1
 
-ffmpeg（7.1 与 master）的 mpegts 封装器**不支持 AV1-in-MPEG-TS**（本机实测：写成 private stream，读回是 bin_data；
-`EncoderArgsIntegrationTests.Av1_really_cannot_be_muxed_into_mpegts` 盯着它）。点对点的分发靠 MPEG-TS（中途加入的观众靠 TS 的重复头恢复），
+ffmpeg 的 mpegts 封装器**不支持 AV1-in-MPEG-TS**（本机实测 7.1、master，2026-10-24 又用随包的 9.0.2 试过：`av1_nvenc` 写成 private stream
+（stream type 6），读回是 bin_data，解不了；`crates/media/tests/encoder_args_integration.rs` 的 `av1_really_cannot_be_muxed_into_mpegts` 盯着它，
+哪天它失败了就该重新考虑）。点对点的分发靠 MPEG-TS（中途加入的观众靠 TS 的重复头恢复，丢包后靠它重新对齐，守卫看的也是 TS 的连续计数），
 所以只能 **HEVC Main10**。v0.1 的直连模式可以用 Matroska 走 AV1，但直连模式已随中继一起删除。
+
+解码不是问题：随包的 mpv 能用 d3d11va / nvdec / vulkan 硬解 AV1，ffmpeg 带 dav1d。要用 AV1，除了封装，还有几处只为 HEVC 写的：守卫的 RASL 办法（§3.2，
+AV1 要换成别的，比如插一个"重复上一帧"的 show_existing_frame）、引擎里的 NVENC 编码（§2.8）、`encode/ts.rs` 的流类型，以及老版本的观众。
+一次编码给所有观众，所以每位观众都得能硬解 AV1（RTX 30、RX 6000、Intel 11 代 / Arc 起），否则主播要多编一路 HEVC。
+能省多少（2026-10-24，RTX 4090 的 NVENC，§2.5 那段合成素材，两边同样的参数：p5 hq、两个 B 帧、AQ、VBV 0.25 s、GOP 1 s；PSNR-Y / SSIM）：
+
+| 码率 | HEVC | AV1 |
+|---|---|---|
+| 10 Mbps | 28.65 / 0.659 | 28.91 / 0.664 |
+| 20 Mbps | 28.89 / 0.681 | 29.14 / 0.685 |
+| 40 Mbps | 29.26 / 0.722 | 29.51 / 0.718 |
+
+亮度上 AV1 一直高约 0.25 dB；按 SSIM 和带色度的 PSNR 看，10～20 Mbps 时略好，40 Mbps 时持平。大约是低码率时省 10～30 % 的码率，40 Mbps 时几乎没有。
+要做的话得自己在 TS 里装 AV1（主播端的 TS 是自己写的；每位观众的 ffmpeg remux 换成自己的转发；观众端的守卫把 AV1 拆出来，重新封装成 mpv 能读的，例如 Matroska），
+外加 HEVC 后备和版本协商。
 
 ## 2. 发送端
 
@@ -87,6 +110,8 @@ capture --output <idx>           DXGI 输出索引（list-outputs 给出的 inde
         --audio-pipe <name>      默认 hdrcast-audio；--audio off 则不创建
         --audio on|off           默认 on
         --audio-device default|<endpoint id>
+        --encode nvenc           在引擎里编码（§2.8）：视频管道里是 HEVC 的 MPEG-TS 而不是原始帧，stdin 收命令
+          --bitrate <kbps> --vbv <kbit> --gop <帧> --bframes <n> --preset <1..7> --multipass off|quarter|full --aq <0..15>
 ```
 
 ### 2.2 视频管道协议
@@ -172,6 +197,41 @@ ffmpeg -hide_banner -loglevel warning -nostdin -stats_period 1 -progress pipe:2
 - stdout（`pipe:1`）是 MPEG-TS 本身，进 P2P 分发（§8.8）；`-progress pipe:2` 的 `key=value` 行（fps、bitrate、speed、frame、drop_frames、
   dup_frames、out_time_us）和日志共用 stderr，按行的形状区分后给 GUI 显示。
 - 默认编码器：`hevc_nvenc`，`-profile:v main10`（HDR）/ `main`（SDR）。备选按探测结果：`hevc_amf`、`hevc_qsv`、`libx265`。
+- **关键帧间隔**默认 1 s（`-g` = fps × `gopSeconds`；0.2 / 0.3.1 是 2 s）：传输中丢掉的数据让观众的画面停到下一个关键帧（§3.2），
+  1 s 让这段时间减半，代价是多大约 3 % 码率。Moonlight 用无限 GOP、丢包时向主播要 IDR；ffmpeg 命令行没有运行中要关键帧的办法。
+  打开"按需关键帧"时编码改在采集引擎里做（§2.8），丢了数据的观众马上能拿到关键帧（§8.12），定时的关键帧照旧每秒一个。
+- 引擎自己编码时（§2.8）视频输入换成引擎写的 TS，视频原样复制，其余不变：
+  `-thread_queue_size 1024 -f mpegts -probesize 2000000 -analyzeduration 100000 -fpsprobesize 0 -i \\.\pipe\hdrcast-video-<pid>`、声音输入同上、
+  `-map 0:v:0 -map 1:a:0 -c:v copy`（没有编码器参数和 `-fps_mode`；色彩标记在码流的 VUI 里）。0.1 s 足够找到流：第一帧就是带参数集的关键帧，
+  帧率不用估计，每一帧都带时间戳。
+- **码率缓冲**（VBV，`-bufsize` = 码率 × `bufferSeconds`）默认 0.25 s（0.2 / 0.3.1 是 2 s，界面上没有这一项）。它决定 CBR 下复杂画面能超出码率多少，
+  而 SRT 给每位观众最多按 `inputbw × (1 + oheadbw)` 发（§2.6，重发也算在里面）：超出的部分在 SRT 的发送队列里排队，而 SRT 的期限从**采集时刻**算起，
+  排队用掉的正是丢包重发的时间，排得太久的包到观众那里已经过期。实测（2026-10-23，NVENC p5 CBR 40 Mbps，静止和满屏噪点每 3 s 交替，
+  按 SRT 的节流模拟发送队列，oheadbw 25 %）：
+
+  | `bufferSeconds` | 最忙的一秒 | 发送前最多排队 | PSNR |
+  |---|---|---|---|
+  | 2（旧默认） | 82 Mbps | 860 ms | 27.05 dB |
+  | 1 | 70 Mbps | 600 ms | 27.03 dB |
+  | 0.5 | 56 Mbps | 265 ms | 27.01 dB |
+  | **0.25** | 46 Mbps | 110 ms | 27.00 dB |
+
+  2 s 时平均码率也冒到 45 Mbps（设的是 40）。朋友试过的 800 ms / 1000 ms 延迟下，排队 860 ms 的包第一次发出就已经晚了。Sunshine 用一帧的 VBV（超低延迟），
+  这里是缓冲直播，0.25 s 足够平稳，画质几乎不变。
+- **和 Vibepollo（Sunshine 的分支）的默认 NVENC 设置比**（`src/nvenc/nvenc_base.cpp`、`nvenc_config.h`：P1、超低延迟调优、不用 B 帧和 AQ、一帧的 VBV、
+  只在被要求时出关键帧）。2026-10-24 实测，12 s 合成素材（分形缩放 + 测试图，1080p60 10-bit，极难压缩），同一块 RTX 4090 上 ffmpeg 的 hevc_nvenc
+  按两边的参数编，PSNR-Y / SSIM 对源：
+
+  | 设定码率 | 0.3.1（VBV 2 s，GOP 2 s） | 0.3.3 默认 | 0.3.3 按需关键帧（无前瞻） | Vibepollo 默认（P1） | Vibepollo P7 |
+  |---|---|---|---|---|---|
+  | 10 Mbps | 28.67 / 0.661 | 28.65 / 0.659 | 28.65 / 0.660 | 28.66 / 0.658 | 28.72 / 0.661 |
+  | 20 Mbps | 28.94 / 0.686 | 28.89 / 0.681 | 28.82 / 0.681 | 28.87 / 0.675 | 28.93 / 0.676 |
+  | 40 Mbps | 29.40 / 0.731（实际 43.6 Mbps） | 29.26 / 0.722（40.6） | 29.13 / 0.713（40.4） | 29.16 / 0.705（38.1） | 29.21 / 0.705（37.8） |
+
+  同码率下 HdrCast 的设置略好，码率越高差得越多（B 帧、AQ 和 0.25 s 的 VBV 要有富余的码率才用得上）；一帧的 VBV 用不满设定的码率（40 Mbps 时只用到 38）。
+  0.3.1 的画质高一点，有一部分是因为它多用了 9 % 的码率，另一部分是 2 s 的 VBV 能把码率挪给难的帧，代价就是上面那个突发。只是一段素材、一次测量：量级参考。
+- **旧设置文件**：`sender.json` 没有 `settingsVersion`（0.3.2 之前写的）时，`SenderSettings::load` 把还是旧默认值的 `gopSeconds` 2 和 `bufferSeconds` 2
+  换成新默认值，一次（之后文件里写 `"settingsVersion": 1`，再选 2 s 就是用户的选择）。`bufferSeconds` 的下限从 0.5 改成 0.25。
 - 输出像素格式按编码器显式指定：硬件编码器吃 `p010le` / `nv12`（即采集引擎的原生输出），libx265 只收平面格式，必须写 `yuv420p10le` / `yuv420p`，否则 ffmpeg 可能协商成 8 bit，HDR 精度悄悄丢失。
 - **libx265 的坑（本机实测 7.1.5）**：ffmpeg 的 libx265 封装只把 `-colorspace` 和 `-color_range` 传给 x265，`-color_primaries` 与 `-color_trc` **不会**进 VUI（ffprobe 读回是 `unknown`）。必须在 `-x265-params` 里写 `colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:range=limited`，否则观众端拿到的是无标记流，会按 SDR 显示。
 - 编码器探测：启动时运行 `ffmpeg -hide_banner -encoders`，再对候选编码器做 1 帧 `-f lavfi -i nullsrc ... -f null -` 试编码判断可用。
@@ -186,6 +246,11 @@ ffmpeg -hide_banner -loglevel warning -nostdin -stats_period 1 -progress pipe:2
 | 观众端：mpv | `srt://127.0.0.1:<L>?mode=caller&passphrase=<组派生>&pbkeylen=32&pkt_size=1316&transtype=live&latency=<地区预设>&rcvbuf=..&ffs=..&recv_buffer_size=8000000&connect_timeout=5000` |
 
 - 缓冲大小公式：`packets = latency_s × bitrate_bps / (1316×8)`；`ffs ≥ packets`，`sndbuf/rcvbuf ≥ packets × 1472`（`SrtBufferSizing`）。
+- `inputbw` 是**线上码率**（0.3.2 起，`RemuxChild::wire_bps`）：`视频码率 × 1.05 × 1360/1316 + 320 kbit/s`，即 MPEG-TS 封装和 CBR 的超出
+  （NVENC 实测：40 Mbps 的视频封装成 TS 后是 41.2 Mbps（缓冲 0.25 s）到 42.8 Mbps（缓冲 2 s），取 5 %）、每个 1316 字节载荷上
+  44 字节的 SRT / UDP / IP 头（SRT 节流时连头一起算），再加上声音。
+  0.3.1 之前只告诉 SRT 视频码率，`oheadbw` 25 % 里实际只剩不到一半留给重发。`maxbw=0` + 固定 `inputbw` 比让 SRT 自己测输入码率（`inputbw=0`）好：
+  桌面静止时 NVENC 的输出很低，测出的码率跟着变低，画面一动起来就被限在很低的速率上；`mininputbw` 能防这个，但 ffmpeg 的 `srt://` 不支持这个选项。
 - listener 只能绑具体地址：libsrt 绑 `[::]` 必须显式设 SRTO_IPV6ONLY，而 ffmpeg 没有这个选项（实测 "Operation not supported"）。这里只绑 127.0.0.1，不受影响。
 - 不用 ffmpeg 的 `mode=rendezvous`（它会 bind 到远端地址）；打洞由 HdrCast 自己做。
 
@@ -208,8 +273,9 @@ Windows 11 用 Mica、macOS 用侧边栏毛玻璃作窗口背景（没有时退�
    底部固定一条：将要发送的格式 + **开始直播**。
 2. **观看**：组里在线的电脑（每 10 s 向信令服务器要一次；不要更快，服务器按 IP 限流每秒 10 次）：开播中的标 LIVE、按钮 **观看**，
    按需的标"在线"、按钮 **连接**，都带设备码；延迟预设（快速 300 ms / 日本 / 澳大利亚 / 中国 / 自定义）；输出（自动 / HDR / SDR）。
-   观看中顶部是面板：缓冲、帧率、码率、丢帧、是否 HDR 直通，**全屏** / **停止**，以及远程控制一行（**请求控制** / **接管控制** / **只看不控**）；
-   等主播回答时显示"等待同意"，被拒绝时显示原因和 **关闭**。
+   观看中顶部是面板：缓冲、帧率、码率、丢帧、是否 HDR 直通，**悬浮窗**（打开 / 收起播放器上的面板，§3.3）/ **全屏** / **停止**，
+   以及远程控制一行（**请求控制** / **接管控制** / **只看不控**）；等主播回答时显示"等待同意"，被拒绝时显示原因和 **关闭**。
+   观看中延迟一栏不能改（说明里指向悬浮窗：在那里改会重新加入）；硬解在设置页随时可改，立即生效。
 3. **设置**：语言、外观、登录时自动启动（见下）；群组（这台电脑的设备码、我的名字、邀请码复制 / 粘贴 / 新建）；ffmpeg / mpv 路径；播放器细项（硬解、缓冲、接收缓冲按多大码率算、峰值亮度、全屏用哪块屏、追赶、ffmpeg 管道兜底）；防火墙；关于。
 4. **日志**：全部日志行（已脱敏），可筛选、复制、打开文件夹。
 
@@ -222,6 +288,15 @@ Windows 11 用 Mica、macOS 用侧边栏毛玻璃作窗口背景（没有时退�
   环境变量 `HDRCAST_DATA_ROOT` 可以把整个目录换到别处（并行跑第二份配置用）。
 - 应用一启动（有组、开放连接时）就在组里在线；这时关窗口只是把它收进通知区域（见本节末尾）。
 - 崩溃保护：ffmpeg 或采集进程意外退出 → 停止另一方，3 s 后自动重启；新编码器的 stdout 接进同一个分发器，观众不用重新加入。
+- **分享中改设置**（0.3.3 起，`share.rs` 的 `apply_while_streaming`）：开播页的设置在分享中不再锁住，改了立即生效。每次保存后按新设置重新算一份
+  `SendPlan`，和正在跑的比：一样就什么都不做；只差码率、并且编码器在采集引擎里（按需关键帧，§2.8）时，给引擎发 `bitrate <kbps> <vbv>`，不重启也不出 IDR；
+  其余任何变化（分辨率、帧率、编码器、HDR、声音、关掉按需关键帧……）在 800 ms 后让采集和编码器重启一次（这段时间里接连的改动合并成一次），
+  和崩溃保护一样，新编码器的输出接进同一个分发器，观众不断开，画面停一秒左右（守卫等下一个关键帧，§3.2）。设置不能用时（例如没有显示器）正在跑的照旧。
+  界面在画面一节下写明这一点。
+  码率**调高**时还有一件事：每位观众的 SRT 连接按他加入时的码率限速（remux 子进程的 `inputbw` = `RemuxChild::wire_bps`，§2.6），超过它的流会堵在发送队列里、
+  过了延迟被丢掉。所以 `P2pHost::set_stream` 发现新码率高于某位观众连接的规格时重建那条连接（`resize_legs`）：从分发器摘下它的 remux 子进程、关掉输入，
+  ffmpeg 正常收尾、SRT 正常关闭，观众那边立刻知道（不用等 5 s 的空闲超时），播放器照常 3 s 后重连，新的子进程按新码率建好，按需关键帧马上给它一个关键帧
+  （3 s 没退出的子进程直接结束）。实测（2026-10-24，同机，25 → 40 Mbps）：观众 0.1 s 内断开，约 9 s 后重新播放。码率调低不用重建。
 - 进程树：应用创建 **Job Object（KILL_ON_JOB_CLOSE）** 并把每个子进程加入，任务管理器强杀应用或应用崩溃时子进程一起死（macOS：退出时逐个杀进程组）。采集引擎另有 `--parent-pid`（用一个 `OpenProcess(SYNCHRONIZE)` 句柄轮询，不是每帧扫全系统进程表）。
 - **启动顺序**：采集引擎必须先把**两个**管道都建好，GUI 轮询到管道出现后才启动 ffmpeg（固定 sleep 不够：引擎要先建 D3D11 设备并编译 shader）。音频管道必须在等待视频管道客户端**之前**创建，否则两边互等。
   轮询**只能用 `WaitNamedPipe`**，不能用 `File.Exists` / `GetFileAttributes`：对 `\\.\pipe\<name>` 查属性本身就是一次客户端连接，会占掉唯一的实例，ffmpeg 随后得到 ERROR_PIPE_BUSY（CRT 译成 `Error opening input: Invalid argument`），引擎写端报 `Pipe is broken`，无限重启（v0.2.0 在 Windows 上的实际故障，`NamedPipeProbeTests` 防回归）。
@@ -253,6 +328,113 @@ Windows 11 用 Mica、macOS 用侧边栏毛玻璃作窗口背景（没有时退�
   正在运行的应用每 400 ms 的状态循环里取这个文件：显示并聚焦窗口，参数是邀请时弹出加入确认（`join-invite` 事件）。启动时先删掉没人取的旧请求。
   否则两个进程会用同一把设备密钥、同一个 peer id 在组里各宣告一次。不同的 `HDRCAST_DATA_ROOT` 各有各的锁，同机双配置测试不受影响。
 
+### 2.8 在采集引擎里编码（按需关键帧，0.3.3 起）
+
+**为什么不能只用 ffmpeg 命令行**：运行中要不来关键帧。`-force_key_frames` 只能事先写好时间表或表达式（表达式读不到外部状态）；`source` 跟随输入帧的
+关键帧标记，而 rawvideo 的每一帧都是关键帧；stdin 的交互命令只到滤镜，没有能改帧类型的滤镜。码率也不能在运行中改。要按需出 IDR，就得自己驱动编码器。
+
+**选型**：
+
+| 方案 | 能做 | 代价 | 结论 |
+|---|---|---|---|
+| ffmpeg 命令行（以前的唯一方式） | 四种编码器、参数调好了 | 运行中不能要关键帧、不能改码率 | 保留：默认，也是后备 |
+| libavcodec（FFmpeg 的 DLL：hevc_nvenc / amf / qsv） | 编码器、AAC、mpegts 封装都现成；`pict_type = I` 加 `forced-idr` 强制 IDR；nvenc 改 `bit_rate` 会重新配置（但同时出一个 IDR） | 要随包带 FFmpeg 共享库，编译时还要头文件和导入库（本机没有，要下载 BtbN 的 gpl-shared）；结构体布局绑定一个 FFmpeg 大版本（现在是 63），`get-tools force` 换了大版本就失效；进程里多一层 C | 不选 |
+| NVENC SDK 直连（驱动自带的 nvEncodeAPI64.dll，Sunshine 的 `nvenc_base.cpp` 也是这样） | IDR（`NV_ENC_PIC_FLAG_FORCEIDR`）；改码率不重置也不出 IDR（`nvEncReconfigureEncoder`）；以后可以做参考帧失效（`nvEncInvalidateRefFrames`）和 D3D11 零拷贝 | 只有 NVIDIA；结构体要自己写；TS 封装要自己写一小段 | **选它** |
+
+理由：主播是 RTX 4090；不用多发任何文件（DLL 随驱动）；控制更细（改码率不出 IDR、以后的 RFI）；仍然在采集引擎这个子进程里，出事只是重启并退回 ffmpeg。
+AMD / Intel / x265 照旧走命令行。头文件 nvEncodeAPI.h 12.1（MIT）只用来写绑定（`crates/capture/src/win/nvenc/ffi.rs`，只写用到的结构体，
+其余并入保留数组）：每个结构体的大小、每个用到的字段的偏移和每个位域的位置都用 MSVC 从头文件打印出来，写成编译期断言。
+
+**结构**（`hdrcast-capture` 的 `encode/` 和 `win/nvenc/`，应用的 `sender_runner`）：
+
+- 引擎（`HdrCast capture … --encode nvenc …`）：采集照旧。采集用的显卡就是 NVIDIA 时**零拷贝**（见下面"零拷贝"）：NVENC 开在采集的 D3D11 设备上，
+  转换 shader 直接写进 NVENC 注册的 P010 / NV12 纹理，帧不离开显存。否则（笔记本上屏幕接在核显上，或者零拷贝开不起来）走内存：每一帧（CPU 内存里的
+  P010 / NV12，就是以前写进管道的那一帧）在帧队列的写线程上复制进 NVENC 的输入缓冲，NVENC 用自己在 NVIDIA 显卡上建的 D3D11 设备。两种都在写线程上
+  同步编码；B 帧在后一个参考帧到时一起出来。
+- 输出写成只有视频的 MPEG-TS（`encode/ts.rs`）进同一个视频管道：PAT / PMT 在开头和每个关键帧前，一帧一个 PES，PTS = 帧序号，DTS 按 B 帧的重排深度
+  往前移（与 ffmpeg 的 hevc_nvenc 算 DTS 的办法相同），PCR 在视频 PID 上。ffmpeg 读它和原来的声音管道，`-c:v copy`（§2.5），所以分发器、remux 子进程和观众
+  收到的 TS 仍是 ffmpeg 的封装器写的，和以前一样。
+- 关键帧：NVENC 的 GOP 设为无限，引擎自己决定（`KeyframeClock`）：第一帧、上一个关键帧之后每 `--gop` 帧、被要求的那一帧；被要求的关键帧让计数
+  重新开始（下一个定时的在它一个间隔之后）。
+- 命令：引擎的 stdin，一行一个：`keyframe`、`bitrate <kbps> [<vbv kbit>]`。事件：stdout 上的 JSON 行
+  `{"keyframe":{"frame":1234,"asked":true,"bytes":286320,"waited_ms":4.2}}`、`{"bitrate":{"kbps":30000,"ok":true}}`（不是扁平对象，不会被当成统计行）。
+  应用的 `SenderRunner` 把引擎的 stdin 留着发命令（`request_keyframe`、`set_bitrate`），把事件交给按需关键帧的逻辑（§8.12）。
+- 参数和 `encoder_profiles` 给 hevc_nvenc 的一样（`engine_encode_args`：preset P3 / P5 / P7、HQ 调优、CBR、VBV、二次编码 off / qres / fullres、空域 AQ 8、
+  B 帧按设置且以中间帧作参考、Main10 / Main、high tier、VUI 色彩标记和 chroma 在左、每帧一个 slice、每个 IDR 前带 VPS/SPS/PPS），只有两处不同：
+  **不用前瞻**（前瞻 20 帧会把被要求的关键帧也压后 20 帧，即 333 ms），所以也没有时域 AQ（它依赖前瞻）。界面上打开开关时"前瞻"变灰。
+- 后备：引擎打不开编码器（没有 NVIDIA、驱动低于 API 12.1、画面超出编码器尺寸、编码会话已满）或编码时出错，以退出码 7（`ENCODER_UNAVAILABLE`）退出，
+  打不开时在宣告帧格式之前就退出。`SenderRunner` 立即以 ffmpeg 编码重新开始（这一场分享里不再试），日志写明原因；画面照常，只是没有按需关键帧。
+
+**零拷贝**（`win/surfaces.rs`、`win/converter.rs`、`win/nvenc/`）。以前每一帧 GPU → CPU（staging）→ NVENC 的输入缓冲（驱动再传回 GPU），4K60 P010 时
+PCIe 上两次各 1.5 GB/s，CPU 上还有两次同样大小的内存复制。现在：
+
+- 条件：采集的适配器是 NVIDIA，驱动有 D3D11.4 的 fence，P010 / NV12 纹理能当类型化 UAV 写。成功时日志 `capture: encoding here: … zero copy (N surfaces on the GPU)`；
+  不行时 `capture: no zero copy (原因): the frames go to the encoder through memory`，接着走内存那条路（本机 2 号输出接在 AMD 核显上，就是这样）。两条路都
+  开不起来才以退出码 7 退出，和以前一样。环境变量 `HDRCAST_NO_ZERO_COPY=1`（主播端，引擎继承应用的环境）强制走内存，用来对比，或者遇到处理不好共享设备的驱动时绕开。
+- 先开 NVENC 会话、初始化（尺寸、格式不支持时到此为止，不白建纹理），再在采集设备上建 N 张 P010 / NV12 纹理（只要 `BIND_UNORDERED_ACCESS`，NVENC 注册
+  不要求别的绑定）并逐张 `nvEncRegisterResource`。N = 引擎同时占着的帧（队列 4 + 最新一帧 + 正在转换的一帧 = 6）+ 编码器压着的 B 帧数。
+- shader 多两个入口 `main_p010_planes` / `main_nv12_planes`：算式不变（和原入口共用 `p010_block`、`chroma8`），一个线程一个 2×2 块，经两个类型化 UAV 写纹理的
+  两个平面（亮度 `R16_UINT` / `R8_UINT`，色度 `R16G16_UINT` / `R8G8_UINT`；P010 写 `值 << 6`）。`--selftest` 在 PASS 前多两行
+  `zero copy: the shader writing the encoder's p010 / nv12 surface gives the same frame`：同一输入经两条路（读回内存 / 写纹理）出来的帧逐字节相同
+  （P010 用原来的灰阶，NV12 用一张彩色图缩到一半，走采样器那条路）。
+- 交接：引擎的帧池照旧管"哪一帧在用"，只是缓冲不带字节，下标就是表面号（`FrameBuffer::index`）。帧池给出的表面没有人在用（不在队列里、不是最新一帧、
+  编码器没压着），转换只往这样的表面里写；重复上一帧就是把同一个表面再交一次。引擎线程 Dispatch 之后在 immediate context 上对一个 `ID3D11Fence` Signal
+  再 Flush，写线程在 `nvEncMapInputResource` 之前等到这个值（`SetEventOnCompletion`，不占 CPU），不靠 NVENC 自己的隐式同步。反方向靠帧池：编码器在图像
+  出来（`nvEncLockBitstream` 返回）、`nvEncUnmapInputResource` 之后才放开那一帧。B 帧那一次调用返回"need more input"时帧留在编码器里（同一个表面重复时
+  只映射一次、计数），下一次成功的调用把前面的图像都编出来，再一起放开。一个设备两个线程用，建表面时打开 `ID3D11Multithread::SetMultithreadProtected`。
+- 测试：`win::surfaces::tests::every_encoded_picture_is_the_one_the_shader_wrote` 照引擎的样子开两个线程（源每帧换一种灰，NV12 不带 B 帧、P010 带 2 个 B 帧，
+  各 240 帧，帧池能给多快就转换多快），ffmpeg 解出来逐帧核对亮度。故意让编码器先拿到还没写的表面时它失败（第 0 帧读出 0）；把 B 帧的输入提前放开在
+  驱动 621.01 上测不出来（二次编码关掉也一样，看样子 NVENC 提交时就取走了输入），照 API 的要求仍然压到图像出来。`tests/engine.rs` 的
+  `with_zero_copy_no_surface_is_converted_into_while_it_is_in_use` 用假屏幕和压两帧的假编码器查引擎这一侧：不往在用的表面里写、图像次序不乱、帧池够用（不丢帧）。
+
+**实测**（2026-10-24，RTX 4090，驱动 621.01，桌面；在应用里经过整条链路）：
+
+| | 1080p60 P010 20 Mbps | 4K60 P010 40 Mbps |
+|---|---|---|
+| 从命令到关键帧写进管道（2 个 B 帧） | 7～22 ms | 20～42 ms |
+| 采集 / 封装 | 60 fps，不丢帧 | 60 fps，不丢帧，ffmpeg speed 1 |
+
+4K 不用 B 帧时这个时间是 14～30 ms：强制 IDR 时 NVENC 要先把排着的两个 B 帧编出来。ffprobe 读回：HEVC Main 10、yuv420p10le、BT.2020 / PQ、chroma left，
+关键帧正好在引擎报告的帧上。画质（合成内容：分形缩放 + testsrc2，1080p60，NVENC P5 CBR 10 Mbps，VBV 0.25 s，PSNR）：前瞻 20 帧 31.27 dB，不用前瞻 31.26 dB
+（大小相同），再关掉 B 帧 31.22 dB。这个码率下去掉前瞻几乎不损画质；码率高时损失大一些：另一段更难的素材 40 Mbps 时 PSNR-Y 29.26 → 29.13 dB、
+SSIM 0.722 → 0.713，10 Mbps 时没有差别（§2.5 的对比表）。
+
+**零拷贝的实测**（2026-10-24，同一台机器；`HdrCast capture … --encode nvenc --dump …` 每次 30 s，改前 → 改后交替各跑两次取平均；屏幕角上一个 2×2 像素、
+每秒变色 250 次的窗口让桌面每帧都是新的，所以每帧都转换；CPU 是引擎进程占一个核的百分比，复制引擎和显存是 Windows GPU 计数器里这个进程的值，
+关键帧是 stdin 每 1.37 s 一次 `keyframe` 到图像写进输出的 `waited_ms`，每格 38 次）：
+
+| | 4K60 P010 40 Mbps | 1080p60 NV12 20 Mbps | 4K60 P010，2 个 B 帧 |
+|---|---|---|---|
+| 引擎 CPU（一个核的 %） | 28.9 → 2.1 | 8.3 → 2.5 | 33.3 → 2.7 |
+| GPU 复制引擎（本进程） | 6.2 % → 0 | 1.0 % → 0 | 6.2 % → 0 |
+| 引擎线程每次转换（`gpu_ms`，以前含等读回） | 3.1 → 0.08 ms | 0.49 → 0.08 ms | 3.4 → 1.4 ms |
+| 关键帧延迟中位（最短～最长） | 21.3（13～29）→ 19.8（11～28）ms | 12.3（4～22）→ 11.1（4～20）ms | 24.4（14～48）→ 20.6（11～46）ms |
+| GPU 用的系统内存 / 显存 | 281 → 162 MB / 482 → 492 MB | 55 → 40 MB / 113 → 102 MB | 475 → 308 MB / 656 → 666 MB |
+| 帧率 / 丢帧 | 60 / 0 → 60 / 0 | 60 / 0 → 60 / 0 | 60 / 0 → 60 / 0 |
+
+PCIe 上 GPU → 主机的流量（`nvidia-smi dmon` 的 txpci，整机的数）在一次后台比较安静的 4K60 对比里是 3963 → 275 MB/s，前后空闲时 209～569 MB/s；
+主机 → GPU 那一侧被别的程序（这台机器上同时有视频解码、有时还有另一个 NVENC 会话）盖住，看不出干净的差。另外 4K60 测时整机 CPU 用量随同时运行的其他程序波动，
+同样的改前程序另两次单独测是 32～38 %。关键帧只快了 1～4 ms：剩下的主要是等下一个帧节拍（最多 16.7 ms）和 IDR 本身的编码，B 帧时还要先把排着的
+B 帧编出来。带 B 帧时引擎线程每次转换平均 1.4 ms（不带时 0.08 ms），原因没有查清，大概是 NVENC 的调用占着 Direct3D 的设备锁；帧率不受影响。
+同一个程序走内存那条路（2 号输出，AMD 核显采集、RTX 4090 编码）照常 60 fps、不丢帧；`--size 8448x4752` 这种 NVENC 编不了的尺寸两条路都开不起来，
+退出码 7、不宣告帧格式。经过命名管道交给 ffmpeg（`-f mpegts … -c:v copy` 加声音，和 `SenderRunner` 的命令一样）的 4K60 HDR（2 个 B 帧）和 1080p60 SDR
+各跑了一遍：要的关键帧 14～41 ms 出来并让计数重来，`bitrate` 两次都 `ok`，ffprobe 读回 HEVC Main 10 / Main、BT.2020 PQ / BT.709，解码无错。
+
+应用里的单机回环（`docs/windows-checklist.md` 文末的做法：两个实例、本机信令；主播 4K60 HDR 40 Mbps、2 个 B 帧、按需关键帧，观众 latency 1500 ms）：
+主播日志 `zero copy (8 surfaces on the GPU)`，观众的 mpv 用 d3d11va 硬解 HEVC Main 10 3840x2160 60 fps、输出 p010（HDR 直通），观众开始看时的关键帧 34 ms 后
+出来。主播的采集引擎（应用的子进程，带声音）CPU 3.2 %、复制引擎 0；同样设置加 `HDRCAST_NO_ZERO_COPY=1` 是 39.7 %、6.2 %。观众每 4 s 丢 30 个包
+（`HDRCAST_SIMULATE_LOSS=4:30`）两种各跑约 3～4 分钟：从请求到关键帧离开编码器，零拷贝 17～43 ms（中位 32）、走内存 16～48 ms（中位 36）；画面停住
+（观众每 10 s 的 `[guard]` 汇总）零拷贝 45 次平均 320 ms、走内存 54 次平均 304 ms。停多久看丢包落在哪里（落在关键帧上就要等下一个），和走哪条路无关：
+§8.12 里 4K60 的 200～233 ms 是改之前那次（每次丢 60 个包）里短的那一簇，同一次里也有 416～583 ms 的。
+
+**还没做**：
+
+- 零拷贝只在采集和编码是同一块 NVIDIA 显卡时有效；屏幕接在核显上的笔记本仍走内存（跨适配器共享纹理也要过一次 PCIe，只能省掉 CPU 那两次复制）。
+- 自适应码率：`bitrate` 命令已经通（`nvEncReconfigureEncoder`，不重置、不出 IDR；RTX 4090 报告支持 `DYN_BITRATE_CHANGE`），`SenderRunner::set_bitrate`
+  目前只在分享中改码率时用（§2.7）。按 `SrtMonitor` 的丢包自动降码率时要注意：每位观众 remux 子进程的 `inputbw` 是开始时按码率定的，降码率没问题，
+  升高时 `resize_legs` 会重建观众的连接（§2.7，观众停约 9 s）：自动升码率要么只升回观众加入时的码率，要么接受这一下。
+- AMD（AMF）和 Intel（oneVPL）也能强制 IDR，要各自接。
+
 ## 3. 接收端
 
 ### 3.1 mpv 命令（来自 docs/research/mpv-hdr-windows，已核对 mpv 0.40/0.41 手册与源码）
@@ -264,20 +446,107 @@ mpv --vo=gpu-next --gpu-api=d3d11 --hwdec=d3d11va
     --cache=yes --demuxer-readahead-secs=3 --cache-pause-initial=yes --cache-pause-wait=1.5 --demuxer-max-bytes=256MiB
     --video-sync=audio --interpolation=no --framedrop=vo
     --demuxer-lavf-probesize=5000000 --demuxer-lavf-analyzeduration=2
-    --input-ipc-server=\\.\pipe\hdrcast-mpv --keep-open=no --force-window=yes --title="HdrCast"
-    [--fs --fs-screen=N]
+    --input-ipc-server=\\.\pipe\hdrcast-mpv --config=no --input-default-bindings=no --window-dragging=no --drag-and-drop=no
+    --keep-open=no --force-window=yes --osc=no --osd-bar=no --media-controls=no --title="HdrCast"
+    [--fs --fs-screen=N] [--mute=yes]
     "srt://127.0.0.1:<L>?mode=caller&passphrase=<组派生>&pbkeylen=32&latency=<µs>&rcvbuf=<bytes>&ffs=<n>&recv_buffer_size=8000000"
 ```
 
 - SRT 选项一律放 URL 查询串（`--demuxer-lavf-o` 到不了协议层）。
+- `--osc=no --osd-bar=no`（0.3.3 起）：直播流没有可以拖的进度，mpv 自带的屏幕控制栏（进度条和按钮，鼠标一动就盖在画面上，远程控制时也一样）和音量 / 跳转时的进度条都关掉。
+- **播放窗口只管画面和远程控制**（0.3.3 起）：`--config=no`（不读用户自己的 mpv.conf / input.conf / 脚本，HdrCast 的选项说了算）、
+  `--input-default-bindings=no`（mpv 自带的按键和鼠标动作全部不用：滚轮调音量、空格暂停、q 退出、双击全屏、9 / 0、m……）、`--window-dragging=no`
+  （拖画面不移动窗口；远程控制时拖拽本来就该给主播，以前是控制期间临时关掉）、`--drag-and-drop=no`（拖进来的文件不会顶替直播）。
+  播放器自己留下的只有 HdrCast 通过 IPC 绑定的几个（`hdrcast_control::keys::player_bindings`，mpv 的 IPC 一连上就绑，`file-loaded` 时再绑一次）：
+  `Ctrl+Alt+O` 打开 / 收起悬浮窗（§3.3），`Ctrl+Alt+Enter` 切全屏，`Esc` 退出全屏（远程控制时这两个之外的键都给主播，`Esc` 也是），
+  窗口的关闭按钮（`CLOSE_WIN`，以前是 mpv 自带的 quit，应用随后会把 mpv 再开起来）= 停止观看。全屏、静音等都在悬浮窗和观看页里。
+  `keybind` 建的绑定不是"默认"级，不受 `--input-default-bindings=no` 影响。
+- `--media-controls=no`（0.3.3 起，只在 Windows 上；mpv 0.39 起才有这个选项）：直播用不着 Windows 的媒体控制浮层。它还避免 mpv 退出时卡住：
+  关掉屏幕控制栏后，mpv 0.41 打开失败时每次都卡在媒体控制（SystemMediaTransportControls）的收尾里，直到 12 s 后被杀掉，加上这个选项后 0.2 s 就退出了
+  （2026-10-24 实测）。应用要等 mpv 退出才会重连，所以这一项不能省。
 - `rcvbuf/ffs` **必须**按 码率 × 延迟 计算（否则 > 40 Mbps + 2 s 时 libsrt 会 "No room to store incoming packet" 断线）。码率由用户在 GUI 填（或默认按 100 Mbps × 延迟上限算，宁大勿小）。
 - mpv 只在打洞路径建好后启动；之后路径断了由 ViewerSession 在同一个本地端口上重新加入，mpv 每 3 s 自己重连。
 - HDR 直通只在 `--wid` 嵌入或独立窗口下都以「窗口化 HDR」工作，静态元数据只在全屏时下发 → 提供全屏按钮（`--fs`，不用 `--d3d11-exclusive-fs`）。
 - **不嵌入 libmpv**，独立启动 mpv.exe；用 JSON IPC 命名管道读 `demuxer-cache-duration`、`frame-drop-count`、`video-params`、`video-target-params`、`hwdec-current`、`estimated-vf-fps`、`paused-for-cache` 显示状态。
-- 兜底：「用 ffmpeg 拉流」模式 = `ffmpeg -i srt://127.0.0.1:<L>?... -c copy -f mpegts - | mpv -`（万一 mpv 构建没带 libsrt）。
+- **播放方式**（`receiver.json` 的 `frontend`，0.3.2 起）：0 **自动**（默认）= 找得到 ffmpeg 就走 ffmpeg 管道，否则 mpv 直接播放；
+  1 **ffmpeg → HdrCast → mpv** = `ffmpeg -f data -i srt://127.0.0.1:<L>?... -map 0 -c copy -f data -flush_packets 1 pipe:1`，
+  stdout 经过守卫（§3.2）进 `mpv -`（`-f data` 进出：不解复用也不重新封装，SRT 的载荷原样交出来，守卫才看得到原来的连续计数器和时间戳；
+  mpv 也不需要带 libsrt）；2 **mpv 直接播放** = mpv 自己打开 `srt://`，传输中受损的画面照样显示。0 在 0.3.1 之前表示"mpv 直接播放"（当时的默认值），
+  所以旧的设置文件都自动用上守卫。
 - mpv 路径：同目录 `mpv.exe` / `tools\mpv.exe` / PATH；缺失时提示下载 shinchiro 或 zhongfly 构建（均带 libsrt）。macOS 见 §10。
 - 远程控制开着时，应用另外观察 mpv 的 `mouse-pos` 和 `osd-dimensions`，并让 mpv 把按键转给自己（§9）。
+- 观看中能直接改的：解码方式（`set_property hwdec`，同时改掉计划里的 `--hwdec=`，之后重开的 mpv 也用它）、静音（`mute`，同样写进计划，
+  延迟变了重新加入时保留，停止观看后复位）；延迟要重新加入（§3.3）。
 - 配置：`%APPDATA%\HdrCast\receiver.json`。
+
+### 3.2 画面守卫：不让受损的画面上屏（0.3.2 起）
+
+**问题**。SRT 在延迟窗口内重发丢掉的包；窗口过了还没补上的，接收端跳过去，流里就少了 7 个 TS 包。HEVC 解码器察觉不到：受损的那一帧照样解出来，
+后面所有参考它的帧（到下一个关键帧为止）都跟着花，mpv 全都显示出来——2026-10-23 中国朋友看到的大片色块就是这个。
+FFmpeg 的 HEVC 解码器把带 `AV_PKT_FLAG_CORRUPT` 的包当完好的解（libavcodec/hevc 不看这个标志），mpv 也不看。
+Moonlight 的做法是：一帧不完整就丢掉，之后的帧也全丢，直到收到关键帧（它还会马上向主播要 IDR）。
+
+**做法**（`crates/media/src/receiver/ts_guard.rs`，`TsGuard`）。播放方式为 ffmpeg 管道时（§3.1，默认），ffmpeg 把 SRT 的载荷原样交出来，
+`mpv_runner` 把它经过守卫写进 mpv 的 stdin：
+
+- 读 PAT / PMT 找到 HEVC 视频（stream_type 0x24；别的编码原样放过），按 PID 检查**连续计数器**；视频的每个 PES（一帧）先扣住，下一帧开始时再决定。
+  再用**解码时间戳**检查整帧丢失（相邻两帧的 DTS 差超过 1.5 帧；计数器正好差 16 的倍数时只有它看得出来）。
+- 完好的帧照原样放行。受损的帧，以及受损的**参考帧**之后、下一个关键帧之前的所有帧：把它们的 slice 的 NAL 类型改成 **RASL_N**，
+  并把缺口之后的起始码破坏掉（`00 00 01` → `00 00 03`，后面的字节留在前一个 slice 里，不会被读）。解码器读完一个完好的 slice 头就跳过整帧：
+  IDR 之后的 RASL 帧按标准就是不输出的。时间戳都还在，所以 mpv 看到的是一路正常的流，只是有些帧不出图像，画面停在最后一帧完好的画面上，声音照常。
+  **不能直接把帧拿掉**：实测 mpv 发现视频队列空了就暂停声音缓冲（"Enter buffering"），拿掉 2 s 的帧就卡 0.5 s。
+- 受损的帧没有完好的 slice 头（缺口在它前 128 字节以内），或受损的是关键帧本身：整帧拿掉（只空一帧，没关系）。
+  只有不被参考的帧（NAL 类型为偶数的 TRAIL_N 等，NVENC 的 P B B 里每三帧一个）受损时，只藏这一帧，画面不停。
+- 第一个完好的关键帧结束停帧。恢复点是 CRA 时改成 BLA_W_LP，它的前导帧（参考了丢掉的帧）也被跳过；流开头第一个关键帧之前的帧都不放行
+  （观众中途加入时本来就看不到）。上一个关键帧是流中间没改过的 CRA 时（开放 GOP，libx265 默认），解码器会解 RASL 帧，改类型藏不住，
+  这时受损的帧整帧拿掉。
+- 视频 PID 的连续计数器在输出里重新编号，mpv 不会再报 "Packet corrupt"。音频和表照原样立即放行（视频最多晚一帧，按时间戳播放没有影响）。
+- 日志：第一次停帧时写一行 `[guard] part of the stream was lost on the way: …`，之后最多每 10 s 一行汇总（停了几次、一共多久、拦下多少帧）。
+  观看页上显示"传输丢失 n 次 · 已拦下 n 帧受损画面 · 定格 n 次"，停帧时显示正在等关键帧。
+
+**验证**（`crates/p2p/tests/lossy_path_tests.rs`，真 libx265 + libsrt 走真的 HostLink / ViewerLink）：观众这边把 1/150 的首发数据包连同它们的所有重发都丢掉，
+每一个都补不回来。照原样解码：282 帧里 131 帧是编码器从没产生过的（花屏）；经过守卫：149 帧，每一帧都和编码器的输出逐位相同，停帧 4 次。
+对照：只给解码器加 `fflags=+discardcorrupt`（扔掉带损坏标志的包，靠 FFmpeg ≥ 8.0 的"参考帧缺失就不输出"）仍有 31 帧花屏（FFmpeg 9.0.2），
+旧版 FFmpeg 更糟（缺失的参考帧用灰色补），所以"mpv 直接播放"保持原样，不加这个选项。mpv 在 d3d11va 硬解下播放经过守卫的流：不缓冲、不报错、不退回软解。
+
+**局限**：缺口内视频包正好 16 的倍数、又没丢整帧时看不出来（极少）；停帧最长一个关键帧间隔（受损的就是关键帧时到下一个）。Moonlight 能在约一个 RTT 内
+恢复，是因为它向主播要 IDR（或用 NVENC 的参考帧失效 RFI）。0.3.3 起主播打开"按需关键帧"时也这样做（§2.8、§8.12）：观众在数据还缺在路上时就请求，
+停帧一般缩短到零点几秒。
+
+### 3.3 播放器上的悬浮窗（0.3.3 起）
+
+像 Parsec / Moonlight 那样，观看时不用切回 HdrCast 的窗口就能看状态、改观众自己能改的东西（`app/src/overlay.rs`、`ui/overlay.html` + `overlay.js`）。
+编码（码率、分辨率、帧率、编码器）是主播的事，在主播的开播页改（§2.7 的"分享中改设置"）；观众这边能改的只有延迟、解码方式和静音。
+
+- **样子**：开始观看就有一个小圆按钮（40 × 40，半透明，鼠标移上去才不透明）停在播放画面右上角；mpv 的窗口出来之前不显示。单击按钮展开成面板（宽 300，
+  高度由页面量出来交给后端，`overlay_fit`）：主播名和播放时长；收到的分辨率 / 帧率 / HDR；码率、缓冲、Ping、丢包、丢帧、实际在用的解码器；守卫的统计（§3.2）；
+  **延迟**（四个预设 + 数字框，**应用** = 重新加入，下面说明"画面会中断几秒"）；**解码方式**（四个选项，立即生效）；**全屏** / **静音**。
+  标题栏的"—"、`Esc`、`Alt+F4` 收起成按钮，键盘交还播放器。播放窗口里的 `Ctrl+Alt+O` 和观看页的 **悬浮窗** 按钮也能展开 / 收起（不抢键盘）。
+  始终是深色（画面上不刺眼），只用黑白灰，播放中的红点是唯一的颜色。
+- **独立窗口**：Tauri 的第二个窗口（标签 `overlay`），无边框、透明（页面画圆按钮和圆角面板，周围透出画面）、置顶、不进任务栏，开始观看时建好、停止观看时销毁
+  （延迟变了重新加入时保留）。它和主窗口用同一个 WebView2 数据目录和启动参数（`window::web_view_profile`）：同一个数据目录的第二个 WebView2 参数不同会建不起来。
+  权限里加了 `overlay` 窗口（`capabilities/default.json`）。命令都是 async 的：布局要等主线程（`monitor_from_point`、`hwnd()`），在主线程上做会死锁，
+  `CloseRequested`（`Alt+F4`）也是另开线程去收起。
+- **不抢键盘**：显示不经过窗口库。tao 的 `show()` 用 `SW_SHOW`，会把窗口提到前台、拿走键盘（远程控制时键盘本该给主播）；`focused(false)` 只管创建后的第一次显示。
+  所以窗口建成隐藏，之后一律 `ShowWindowAsync(SW_SHOWNOACTIVATE / SW_HIDE)`，位置和大小用 `SetWindowPos(HWND_TOPMOST, SWP_NOACTIVATE)` 一次设好（不会先变大小再挪位置）。
+  tao 以为窗口一直是隐藏的：它只在自己的窗口标志真的变了时才重新 `ShowWindow`，悬浮窗建好后就不再改标志（置顶、边框等创建时定好），所以不会打架。
+  按钮和面板被点击时照常成为前台（面板里有数字框）；收起、以及拖完按钮后把前台还给 mpv（`SetForegroundWindow`，这时 HdrCast 在前台，Windows 允许交出去），
+  全屏的播放器也就重新盖住任务栏。观看页的 **全屏** 按钮之后也这样做。
+- **跟着播放器**：每 100 ms 一次（`overlay` 线程，和命令共用一把锁）：按 mpv 的进程号枚举窗口，取最大的可见窗口，用它的客户区（`GetClientRect` + `ClientToScreen`，
+  最小化时算没有）。按钮的位置存成在画面上的比例 `Spot { x, y }`（0～1，去掉两边 12 px 的边距和按钮本身；默认 1, 0 = 右上角），所以播放器移动、改大小、
+  进出全屏时按钮按同样的比例跟过去。面板从按钮朝画面中间展开：按钮在右半边就以按钮的右边为准向左展开，在下半边就以按钮的下边为准向上展开，并且不超出屏幕的
+  工作区。新建的窗口第一次挪动之前报的边框不准（实测：按带标题栏的边框算，按钮变成 82 × 116），所以每次都核对窗口实际在不在该在的地方，不在就再放一次
+  （每次布局最多 5 次，不跟系统较劲）。缩放按目标屏幕算（150 % 时按钮 60 px）。
+- **拖动**：按钮按下后移动超过 3 px 就交给系统拖（`startDragging`），没动就是单击；面板拖标题栏（`data-tauri-drag-region`）。系统的拖动循环在跑时
+  （`GetGUIThreadInfo` 的 `GUI_INMOVESIZE`，且 `hwndMoveSize` 是悬浮窗）不去动它；松手后按落点算出新的比例（拖出画面的回到画面边上），存进配置目录的
+  `overlay.json`，下次观看还在那里。拖的是面板时，按钮跟着面板走：每个方向取面板远的一边（右 / 下）或近的一边，看哪个与按钮落到的半边一致；
+  面板横跨中线时两边都一致，保持原来展开的方向，免得收起后按钮跳到另一个角。
+- **只在播放器前面**：只有前台窗口是 mpv、HdrCast 自己的窗口（或它们拥有的弹出窗口，`GA_ROOTOWNER`）时才显示，切到别的程序就藏起来，切回来再出现；
+  前台一时没有窗口（切换过程中）时保持原样。没有 mpv 窗口时（连接中、重新加入、最小化）按钮不显示；展开的面板留在原处，好看到"正在重新连接"。
+- **能改的东西**：解码方式和静音见 §3.1；延迟（`watch_set_latency`）保存后 `watch::rejoin`：结束当前会话、用同一个主播重新 `start`（新的延迟在加入时谈好，
+  主播三分钟内自动放行刚走的观众），悬浮窗不关，面板在这几秒里显示"正在重新连接…"。设置页里改硬解也立即生效；两边的改动通过 `receiver` 事件互相同步，
+  主窗口之后保存设置时不会把悬浮窗改的值冲掉。
+- **macOS**：还没有找 mpv 窗口和判断前台的实现：按钮放在 HdrCast 窗口所在屏幕的右上角、观看期间一直显示，不跟着播放器，也不记拖动的位置（未在真机上运行）。
 
 ## 4. 信令服务器（signal/）
 
@@ -314,7 +583,8 @@ Cargo workspace（Rust 1.85+，edition 2021）。全部用普通线程和阻塞 
 - 配置存 `%APPDATA%\HdrCast\`（macOS：`~/Library/Application Support/HdrCast/`）；日志存其下的 `logs/hdrcast-yyyyMMdd.log`。
 - 界面不经打包器：`node scripts/ui-preview.mjs` 可以在浏览器里单独打开它（`ui/mock.js` 扮演后端）。
 - 调试用的环境变量：`HDRCAST_DATA_ROOT`（另一份配置）、`HDRCAST_NO_ROUTER=1`（不做 UPnP）、`HDRCAST_CONTROL_DRY_RUN=1`（远程控制只写日志）、
-  调试构建里的 `HDRCAST_DEVTOOLS_PORT`（把界面暴露给 DevTools 协议，脚本驱动真实窗口用）。
+  `HDRCAST_SIMULATE_LOSS=<秒>[:<包数>]`（观众的链路每隔这么多秒把接下来的这么多个 SRT 数据包连同它们的全部重发丢掉，默认 20 个；单机试按需关键帧用）、
+  `HDRCAST_NO_ZERO_COPY=1`（主播端引擎编码时不用零拷贝，帧经内存交给 NVENC，§2.8）、调试构建里的 `HDRCAST_DEVTOOLS_PORT`（把界面暴露给 DevTools 协议，脚本驱动真实窗口用）。
 
 ## 7. 验证
 
@@ -322,6 +592,12 @@ Cargo workspace（Rust 1.85+，edition 2021）。全部用普通线程和阻塞 
   - 协议 golden 向量（`tests/vectors/group-v1.json`，Python 测试也读它）；与 **C# 0.2.4 的真实输出**逐字节对照（core：1359 个刁钻输入；
     media：946 个向量，覆盖全部编码器参数表、ffmpeg / mpv 命令行、设置文件）；`group.json` 经真实的 .NET `DataContractJsonSerializer` 往返。
   - 打洞（模拟有状态防火墙、对称型 NAT 两个方向）、假路由器上的 UPnP、真 Python 信令服务器上的全栈（真 libx265 HDR10 编码 + P2pHost + 两个 ViewerSession + ffprobe）。
+  - 按需关键帧（0.3.3）：`kf` 只在为 true 时写在最后、不写时消息与 0.3.2 逐字节相同；真信令服务器上 `kf` 只在两边都声明时通行、与 `rc` 互不相干；
+    请求 / 回答报文与 MAC；主播的限速（300 ms、推迟、已经发过、定时的马上就来）和观众的重发；引擎的关键帧时钟、命令、事件、TS 封装（PAT / PMT / PES /
+    PCR、连续计数器）；真 ffmpeg 读 B 帧 HEVC 的 TS 加声音、`-c:v copy` 出每一帧；`SrtMonitor` 的持久缺口。NVENC 本身在本机用引擎落盘和 ffprobe 核对（§2.8）。
+  - 丢包的整条路径（0.3.2）：真 libx265 + remux 子进程 + HostLink / ViewerLink + 以 `-f data` 收流的 ffmpeg，观众这边丢掉一部分首发包和它们的全部重发；
+    两端的 `SrtMonitor` 数到的丢失与实际一致，经过守卫解出的每一帧都与编码器的输出逐位相同（§3.2）。守卫本身另有单元测试（构造的 TS：参考帧 / 非参考帧 /
+    关键帧受损、整帧丢失而计数器不变、中途加入、CRA 改 BLA、重复包、失步）。
   - 把发行版 0.2.4 的 exe 加载起来与 Rust 版**互相观看**（两个方向都出 HEVC Main10 / PQ 画面）。
   - 每一组生成的编码器参数都让真 ffmpeg 编一次；mpv 的每个选项名和取值都问过真 mpv。
   - 采集引擎：假后端上的主循环契约；真显示器上的 `list-outputs` / selftest / P010 与 NV12 落盘，与 0.2.4 的 exe 对比。
@@ -388,6 +664,7 @@ JSON = {"v":1,"s":"http://101.43.23.94:18650","g":"<gid>","k":"<b64u(32 字节�
 - `live` 可选字段 `"open4":true|false`（0.2.4 起）：主播的 IPv4 端口收不收得下任意地址端口来的包（路由器转发 + 防火墙规则，§8.7）；
   还不知道时不写，旧主播也不写。观众据此说明 IPv4 失败是哪一边的问题。
 - 0.3.1 起的可选字段：`live` 的 `"dk"`、`"od"`，`join` 与 `answer` 的 `"dk"`、`"ek"`、`"ds"`，`answer` 的 `reason` 新值 `denied` / `timeout`，见 §8.10。
+- 0.3.3 起的可选字段：`live` 与 `join` 的 `"kf":true`（按需关键帧），见 §8.12。
 - 收方先验 `m`（常量时间比较），再解 `p`；payload 里的 `host` / `sid` 必须等于信封所在的 key。
 - `t` 与本机时间相差超过 10 分钟的 `join` 丢弃；主播缓存已处理的 `sid` 10 分钟防重放。
 - `cands` 每项是 `Endpoint` 能解析的 `host:port`（IPv6 带方括号），最多 8 项。
@@ -473,10 +750,16 @@ mac   = b64u(HMAC-SHA256(serverKey, METHOD + "\n" + PATH_AND_QUERY + "\n" + ts +
 喂给每个观众自己的 remux 子进程：
 
 ```
-ffmpeg -hide_banner -loglevel warning -probesize 65536 -analyzeduration 500000 -f mpegts -i pipe:0
+ffmpeg -hide_banner -loglevel warning -probesize 2000000 -analyzeduration 500000 -fflags +discardcorrupt -f mpegts -i pipe:0
        -map 0 -c copy -f mpegts -mpegts_flags +resend_headers -muxdelay 0 -muxpreload 0
        "srt://127.0.0.1:<Y>?mode=listener&passphrase=…&pbkeylen=32&latency=<观众要求>&maxbw=0&inputbw=…&oheadbw=<观众要求>&…"
 ```
+
+- `-probesize 2000000`（0.3.2 起，原 65536）：子进程从流中间开始读，探测时必须看到一个 PMT（每 0.1 s 一个），2 MB 在 160 Mbps 以内都够，
+  0.5 s 的 `analyzeduration` 照样封顶。64 KB 时，在两个 PMT 之间启动的子进程认不出音频是什么，报 "Cannot map stream #0:1" 退出：
+  40 Mbps 下 30 次中途启动失败 13 次（2026-10-23 真实日志里中国朋友的一次加入就是这样），2 MB 时 0 次。
+- `-fflags +discardcorrupt`（0.3.2 起）：分发器队列溢出时被截断的画面在这里扔掉。重新封装后连续计数器是新的，观众端的守卫（§3.2）看不出它残缺，
+  只能从之后的时间戳空缺发现丢了帧，那时这一帧已经上屏。
 
 `HostLink` 为每个会话开一个 `127.0.0.1` 本地 socket 连到 `<Y>`，在 WAN 与子进程之间原样搬运数据报。
 观众端 `ViewerLink` 在 `127.0.0.1:<L>` 上等 mpv（`srt://127.0.0.1:<L>`，caller），搬到主播的已确认地址。
@@ -516,6 +799,9 @@ P2P 层**只搬运、不解释**：不看载荷，也不替它加密或认证。
   不带 `rc` 的消息与 0.2.4 逐字节相同，`tests/vectors/group-v1.json` 的 golden 信封不变。
 - **发送规则**：主播只向 `join` 带 `rc` 的会话发；观众只在所看主播的 `live` 记录带 `rc` 时发（以本次加入时读到的记录为准，主播中途打开开关要到下次加入才生效）。
   接收一侧不看标志（没声明的对端本来就不会发）。
+- 0.3.3 起旁路通道还有第二种用途，按需关键帧（§8.12），标志是 `kf`，与 `rc` 各管各的：只向声明了**这种用途**的对端发这种数据报
+  （`P2pHost::send_side_for(sid, SideUse, …)`、`ViewerSession::send_side_for(SideUse, …)`）。两种载荷靠第一个字节区分：远程控制是方向字节 1 / 2，
+  按需关键帧是 `K` / `k`。
 - 旧版本不受影响：C# 0.2.4 读消息时按字段名取值，未知字段忽略；信令服务器只存取 `p` / `m` 两个串，不解析载荷。
   已实测（`crates/p2p/tests/csharp_interop_tests.rs`，把发行版里的 `HdrCastReceiver.exe` / `HdrCastSender.exe` 加载进 PowerShell 5.1 直接驱动它们的
   `ViewerSession` / `P2pHost`）：带 `rc` 的 `live` 记录，0.2.4 观众照常加入并出画面；带 `rc` 的 `join`，0.2.4 主播照常接受并出画面；两个方向都没有任何旁路数据报发出。
@@ -579,6 +865,82 @@ answer: "hdrcast/v1/answer-device" gid  sid  t  ok(true|false)  reason  cands  �
 - 最后一个观众离开 20 s 后停止采集和编码（开播期间不停）；"全部断开" / "停止"会断开所有观众，各自一分钟内不能重连。
 - 码率、人数上限、ffmpeg 路径可以在运行中改（`P2pHost::set_stream` / `set_ffmpeg_path`，设置一变就生效），`announce_now` 让下一次心跳马上发出。
 
+### 8.11 SRT 链路统计（0.3.2 起）
+
+两端的转发器（`HostLink`、`ViewerLink`）把经过的每个 SRT 包交给 `SrtMonitor`（`crates/p2p/src/srt_monitor.rs`）。SRT 只加密载荷，16 字节的包头是明文，
+读包头不改动任何字节、也不需要密钥：
+
+- 数据包：序号（31 位，回绕）；序号落在已见最大序号之后是首发，否则是重发（旧版本不设 R 位，所以不靠它）。
+- ACK（类型 2）：下一个期望的序号、RTT 和它的方差（µs）、空闲缓冲、接收速率（包/s）、链路容量估计（包/s）、接收速率（字节/s）；轻 ACK 只有第一项。
+- NAK（类型 3）：丢失的序号，区间写成 `first | 0x80000000, last`。DROPREQ（类型 7）：发送端放弃的首尾序号。握手（类型 0）：新连接，序号重新开始。
+
+统计（各自去重，按序号记在 2^17 位的窗口里）：首发、重发、接收端报告丢失、发送端放弃（来不及重发）、**补不回来**（接收端的 ACK 越过了一个从没到过的序号：
+只有观众端看得到，就是让画面受损的那些）、RTT、链路容量估计；最近约 10 s 另算一份。ACK 里的接收速率是最近几个包的突发速率，不是流的码率，不拿来显示。
+
+- 主播：每位观众一份。**开播** 页"正在观看"的每一行显示"途中丢包 x %"和"n 个包来不及补发"；日志里开始 15 s 后写一行，之后丢包时每 30 s 一行：
+  `[net] <名字>, last 30 s: 43.6 Mbps sent, 2.10% lost on the way, 2.31% sent again, 0 too late to send again; round trip 92 ms; …`。
+  分发器给这位观众的队列被清空时（它的 remux 子进程跟不上，半秒的流在发出前就丢了）也写一行。
+- 观众：**观看** 页码率一格下面显示"丢包 x %"；日志同样格式：`[net] last 30 s: … Mbps arrived, …% lost on the way, n never recovered in time; …`。
+- 这些数字是排查"画面花了 / 卡了"的依据：丢包率高而补不回来的少 → 延迟够；补不回来的多 → 加延迟或降码率；主播端"来不及重发"多 → 主播上行或码率的问题。
+  `lossy_path_tests` 用真 libsrt 核对：两端数到的丢失与实际丢掉的包数一致，观众端"补不回来"的数目也一致。
+
+### 8.12 按需关键帧（0.3.3 起）
+
+观众丢了补不回来的数据时，画面停在最后一帧完好的画面上，直到下一个关键帧（§3.2）。主播的编码在采集引擎里时（§2.8）可以马上补一个关键帧。
+
+**缓冲直播里什么时候要**。Moonlight 没有缓冲，丢了就是丢了，马上要 IDR，一个 RTT 后就恢复。这里观众比主播晚一个 SRT latency（1.5～3.5 s）播放：守卫
+在播放时才看到受损的画面，那时数据离开主播已经一个 latency；这时要来的关键帧在流里比受损的画面晚一个 latency，而关键帧每秒一个，观众的缓冲里早就有
+定时的关键帧了。所以要在数据**还缺在路上**时要，而不是等画面停住：
+
+1. 观众的 `ViewerLink` 让 `SrtMonitor` 记下 SRT 数据序号里的缺口；一个缺口过了 `2 × (RTT + 4 × RTT 方差)`（SRT 已经有时间要两次重发；至少 60 ms）
+   还没补上，就请求（`Reason::Missing`，"离开主播大约是 缺口的年龄 + 半个 RTT 之前"）。这时离画面停住还有将近一个 latency；新关键帧在流里只比受损的
+   画面晚"发现的时间 + 半个 RTT + 主播的处理"。之后 SRT 还是补上了的话，这个关键帧就是多余的（随机丢包要连丢两轮重发才会这样，很少）。
+2. 守卫在播放时停帧（`GuardEvent::Froze`）也请求（`Reason::Froze`，"一个 latency 之前"）。这时一般已经有关键帧在路上，主播回答"丢失之后已经发过"；
+   latency 比关键帧间隔短（"快速" 300 ms）时它才起作用。
+3. 主播自己也会要，不用观众开口，旧版本的观众也受益：某位观众的 SRT 流开始时（加入、播放器重连：`HostLink` 看到新连接的第一个数据包），以及它在分发器
+   里的队列满了被清空时（只在它的流开始之后：之前 remux 子进程在等播放器，不读，队列每半秒满一次）。
+
+**报文**（旁路通道的载荷，26 字节；`hdrcast_media::keyframe`）：
+
+```
+偏移 长度
+ 0   1   种类  'K'（0x4B）请求，观众 → 主播；'k'（0x6B）回答，主播 → 观众
+ 1   4   seq   观众在这个会话里的请求号，从 1 起（大端）；回答照抄
+ 5   4   ms    请求：丢掉的数据大约多久之前离开主播（观众的估计）；回答：起作用的那个关键帧多久之前发出 / 多久之后发出
+ 9   1   why   请求：1 守卫停帧 / 2 数据还缺在路上；回答：1 正在做 / 2 丢失之后已经发过 / 3 定时的马上就来 / 4 推迟 ms 后做 / 5 做不到（ffmpeg 在编码）
+10  16   mac   HMAC-SHA256(keyframeKey(sid), 字节 0..9) 的前 16 字节；keyframeKey(sid) = sub("kf/" + sid)（§8.3）
+```
+
+**主播怎么决定**（`KeyframeGovernor`，一路编码给所有观众，每个关键帧对每个人都是一个大画面）：
+
+- 丢失之后已经发出过关键帧（定时的，或者别人要的）→ 回答 2，不做。
+- 定时的关键帧 150 ms 内就到（以它最近一次报告的关键帧加一个间隔计；迟了不到 50 ms 也算）→ 回答 3。
+- 离上一次被要求的关键帧不到 300 ms → 推迟到满 300 ms，回答 4；届时如果已经有关键帧在所有这些丢失之后发出，就不做。
+- 否则马上做（`keyframe` 命令给引擎），回答 1。编码器不在引擎里（开关关着、不是 NVENC、引擎退回了 ffmpeg）→ 回答 5。
+- 主播按会话记着最后一个请求号和它的回答：同一个请求再来（回答丢了）照原样再答一次，更旧的忽略。
+
+**观众**（`KeyframeAsker`）：同时只有一个请求，50 ms 没有回答就再发同一个（时间更新），最多 5 次；请求在途时又丢了，等这个了结后再问
+（前一个的回答不一定盖得住后一次丢失）。
+
+**能力标志**：`live` 的 `"kf":true` = 这个主播接受请求（设置打开、编码器是 NVENC；按每次心跳时的设置），`join` 的 `"kf":true` = 这个观众会请求、懂回答。
+都只在为 true 时写，写在最后（`live`：`…[,"dk":…][,"od":true][,"kf":true]`；`join`：`…[,"rc":true][,"dk","ek","ds"][,"kf":true]`）；缺省 = 否，
+不带 `kf` 的消息与 0.3.2 逐字节相同。主播只给 join 带 `kf` 的会话发回答，观众只向 live 带 `kf` 的主播发请求（以本次加入时读到的为准）。
+0.3.2 及更早：它们的 live 没有 `kf`，新观众不会去问；它们的 join 没有 `kf`，新主播不给它们回答，但第 3 种情况主播自己做的关键帧它们照样用上。
+
+**实测**（单机回环，2026-10-24；观众 latency 1500 ms，`HDRCAST_SIMULATE_LOSS=4:30`；1080p60 HDR 20 Mbps，桌面）：
+
+- 观众的链路丢掉 30 个包后 61～76 ms 发出请求，主播立刻回答"正在做"，7～22 ms 后关键帧写进管道：**从模拟的丢包到强制的 IDR 离开编码器 72～99 ms**
+  （之后经 ffmpeg、分发器、remux 子进程到观众的链路，本机上再几毫秒）。
+- 1.5 s 后守卫在播放时停帧，又问一次，主播回答"丢失之后已经发过"（约 0.4～0.5 s 前）。
+- 画面停住的时间（流内时间，从受损的画面到关键帧）166～183 ms（10～11 帧）。同样的丢包、开关关着：每次 1.0～1.5 s（例如 3 次共 3.0 s、180 帧），
+  这段桌面画面很静、P 帧很小，30 个包就跨过了半秒，常常连关键帧一起丢。
+- 4K60 HDR 40 Mbps（每次 60 个包）：请求 61～109 ms，关键帧 20～42 ms 后发出，停住 200～233 ms；采集和封装都是 60 fps、不丢帧。
+- 丢失持续得久一些时（另一次同样的设置，画面里东西多些，这 30 个包分散在 0.1～0.2 s 里），先要来的关键帧也可能丢在里面：之后的缺口再请求，被 300 ms 的
+  限速推迟到第一个关键帧之后 300 ms，那一个补上，这样的一次停 0.5 s 左右（516～533 ms）；丢失短的照旧 166～233 ms。
+
+**局限**：发现要等 `2 × (RTT + …)`：中国的线路（RTT 约 100 ms）上约 250～300 ms，停帧大约 0.4 s，而以前平均 0.5 s、最长 1 s 以上（丢失跨过关键帧时）。
+拥塞造成的丢包（带宽不够）时关键帧本身又加码率，300 ms 的限速只能限制它；那时真正需要的是降码率（§2.8 的"自适应码率"）。
+
 ## 9. 远程控制（0.3.0 起）
 
 观众可以请求使用主播的鼠标和键盘。输入走 §8.9 的旁路通道，所以只有双方都是 0.3+ 才有；画面延迟还是 SRT 延迟 + 播放器缓冲，
@@ -602,7 +964,8 @@ answer: "hdrcast/v1/answer-device" gid  sid  t  ok(true|false)  reason  cands  �
 - 按键 / 鼠标键 / 滚轮：应用先问 mpv 自己的客户端名（`client_name`，形如 `ipc_0`），再 `define-section` 一个输入段，把**每个键名 × 16 种修饰键组合**
   都绑定到 `script-binding <客户端名>/hdrcast-input`（mpv 对修饰键是精确匹配，所以要全列出来；约 2600 行）。之后每次按键 mpv 发来
   `client-message ["key-binding","hdrcast-input","d-|u-|r-|p-…","Ctrl+c",…]`，带按下 / 抬起 / 重复和键名。非 ASCII 字符由 `any_unicode` 兜住。
-  这个段只在主播允许期间启用（同时把 `window-dragging` 关掉，否则拖拽会拖动播放器窗口）；`Ctrl+Alt+ENTER` 留给本地切全屏。
+  这个段只在主播允许期间启用（拖拽不会拖动播放器窗口：`--window-dragging=no` 一直开着，§3.1）；`Ctrl+Alt+ENTER`（本地切全屏）和 `Ctrl+Alt+O`
+  （悬浮窗，§3.3）留给播放器自己，`Esc` 和其余的键都给主播。窗口的关闭按钮不是键，控制时也是停止观看。
 - mpv 报的字符已经带了 Shift（`A`、`!`），修饰键只作为别的键的前缀出现（`Ctrl+c`），单独按 Shift / Ctrl 不会上报。
 
 **报文**（旁路通道的载荷）：
@@ -642,7 +1005,7 @@ answer: "hdrcast/v1/answer-device" gid  sid  t  ok(true|false)  reason  cands  �
 | NVENC / AMF / QSV / x265 | `hevc_videotoolbox`（HDR：`-profile:v main10`、`p010le`；`-realtime 1 -allow_sw 0`）或 x265 |
 | mpv `--gpu-api=d3d11 --hwdec=d3d11va` | `--vo=gpu-next --hwdec=videotoolbox`（其余选项相同；HDR 直通是否还需要别的选项要在 XDR 屏上看） |
 | mpv IPC 命名管道 | 临时目录下的 Unix 套接字 |
-| 工具在 `tools\` | Homebrew：`/opt/homebrew/bin`、`/usr/local/bin`（`brew install ffmpeg-full mpv`；ffmpeg / ffprobe 先找 keg-only 的 `/opt/homebrew/opt/ffmpeg-full/bin`，在 PATH 之前，因为普通的 `ffmpeg` 不带 libsrt；Homebrew 的 mpv 也不带，所以 Mac 上播放方式默认是 ffmpeg 管道），或应用包里的 `Resources/tools` |
+| 工具在 `tools\` | Homebrew：`/opt/homebrew/bin`、`/usr/local/bin`（`brew install ffmpeg-full mpv`；ffmpeg / ffprobe 先找 keg-only 的 `/opt/homebrew/opt/ffmpeg-full/bin`，在 PATH 之前，因为普通的 `ffmpeg` 不带 libsrt；Homebrew 的 mpv 也不带，靠默认的播放方式"自动"经过 ffmpeg），或应用包里的 `Resources/tools` |
 | `%APPDATA%\HdrCast` | `~/Library/Application Support/HdrCast` |
 | Windows 防火墙规则 + **放行…** | 没有对应物（界面不显示这一栏）；UPnP 照做 |
 | 稳定 IPv6 地址：`GetAdaptersAddresses` 的 SuffixOrigin / DAD 状态 | `getifaddrs` + `SIOCGIFAFLAG_IN6`（跳过 temporary / deprecated） |

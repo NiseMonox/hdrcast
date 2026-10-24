@@ -1,6 +1,7 @@
-//! The one window: no system title bar, the system's backdrop material behind the sidebar where there is one.
+//! The main window: no system title bar, the system's backdrop material behind the sidebar where there is one.
+//! (The other one, the panel over the player, is `overlay.rs`.)
 
-use tauri::{AppHandle, Manager, Theme, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{AppHandle, Manager, Runtime, Theme, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 pub const LABEL: &str = "main";
 
@@ -16,12 +17,7 @@ pub fn create(app: &AppHandle, background: bool) -> tauri::Result<(WebviewWindow
         .visible(false)
         // A hidden window that took the keyboard would swallow what the user types right after signing in.
         .focused(!background);
-    // A separate profile (HDRCAST_DATA_ROOT) keeps its web view's data to itself too, so two profiles can run
-    // side by side.
-    let builder = match std::env::var_os(hdrcast_core::common::app_paths::ROOT_OVERRIDE_ENV) {
-        Some(root) if !root.is_empty() => builder.data_directory(hdrcast_core::common::app_paths::config_dir().join("webview")),
-        _ => builder,
-    };
+    let builder = web_view_profile(builder);
 
     #[cfg(windows)]
     let (builder, backdrop) = {
@@ -30,14 +26,6 @@ pub fn create(app: &AppHandle, background: bool) -> tauri::Result<(WebviewWindow
         // sidebar, so older systems get an opaque one.
         let mica = windows_version::OsVersion::current().build >= 22000;
         let builder = builder.decorations(false).shadow(true);
-        // Debug builds only: HDRCAST_DEVTOOLS_PORT=9333 lets a script drive the page over the DevTools protocol.
-        #[cfg(debug_assertions)]
-        let builder = match std::env::var("HDRCAST_DEVTOOLS_PORT") {
-            Ok(port) if port.parse::<u16>().is_ok() => builder.additional_browser_args(&format!(
-                "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --remote-debugging-port={port}"
-            )),
-            _ => builder,
-        };
         if mica {
             (builder.transparent(true).effects(EffectsBuilder::new().effect(Effect::Mica).build()), true)
         } else {
@@ -63,6 +51,27 @@ pub fn create(app: &AppHandle, background: bool) -> tauri::Result<(WebviewWindow
     let backdrop = false;
 
     Ok((builder.build()?, backdrop))
+}
+
+/// Where a window's web view keeps its data, and how it is started. Every window of the app gets the same (the
+/// panel over the player too): WebView2 refuses a second web view of one data folder that is started differently.
+pub fn web_view_profile<'a, R: Runtime, M: Manager<R>>(builder: WebviewWindowBuilder<'a, R, M>) -> WebviewWindowBuilder<'a, R, M> {
+    // A separate profile (HDRCAST_DATA_ROOT) keeps its web view's data to itself too, so two profiles can run
+    // side by side.
+    let builder = match std::env::var_os(hdrcast_core::common::app_paths::ROOT_OVERRIDE_ENV) {
+        Some(root) if !root.is_empty() => builder.data_directory(hdrcast_core::common::app_paths::config_dir().join("webview")),
+        _ => builder,
+    };
+    // Debug builds on Windows only: HDRCAST_DEVTOOLS_PORT=9333 lets a script drive the pages over the DevTools
+    // protocol.
+    #[cfg(all(windows, debug_assertions))]
+    let builder = match std::env::var("HDRCAST_DEVTOOLS_PORT") {
+        Ok(port) if port.parse::<u16>().is_ok() => builder.additional_browser_args(&format!(
+            "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --remote-debugging-port={port}"
+        )),
+        _ => builder,
+    };
+    builder
 }
 
 /// Brings the window back (from the notification area, the taskbar, or from behind other windows) and gives it

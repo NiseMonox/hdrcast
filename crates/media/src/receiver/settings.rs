@@ -66,12 +66,17 @@ impl HwDecMode {
 }
 
 int_enum! {
-    pub enum ReceiverFrontend (fallback = ReceiverFrontend::MpvDirect) {
-        /// mpv opens srt:// itself (needs a libsrt-enabled mpv build: shinchiro / zhongfly).
-        MpvDirect = 0,
-        /// `ffmpeg -i srt://127.0.0.1:… -c copy -f mpegts pipe:1 | mpv -` (when mpv lacks libsrt; the default on
-        /// macOS, where Homebrew's mpv does).
+    /// How the stream reaches mpv. The numbers are what receiver.json stores.
+    pub enum ReceiverFrontend (fallback = ReceiverFrontend::Auto) {
+        /// The ffmpeg pipe when ffmpeg is there, mpv direct otherwise. 0 meant "mpv direct" up to 0.3.1, where it
+        /// was the default: the settings of earlier viewers get the guard this way.
+        Auto = 0,
+        /// `ffmpeg -f data -i srt://127.0.0.1:… pipe:1`, through HdrCast's guard (docs/design.md §3.2) into
+        /// `mpv -`: pictures damaged in transport never reach the screen. mpv needs no libsrt for it.
         FfmpegPipe = 1,
+        /// mpv opens srt:// itself (needs a libsrt-enabled mpv build: shinchiro / zhongfly) and shows a picture
+        /// damaged in transport the way the decoder makes it.
+        MpvDirect = 2,
     }
 }
 
@@ -118,19 +123,7 @@ pub struct ReceiverSettings {
 }
 
 impl Default for ReceiverSettings {
-    /// [`defaults_for`](Self::defaults_for) the platform this was compiled for.
     fn default() -> Self {
-        Self::defaults_for(Platform::CURRENT)
-    }
-}
-
-impl ReceiverSettings {
-    pub const FILE_NAME: &'static str = "receiver.json";
-    pub const DEFAULT_TONE_MAPPING: &'static str = "bt.2390";
-
-    /// Fresh settings. On macOS mpv is fed through the ffmpeg pipe: Homebrew's mpv has no libsrt (its ffmpeg-full
-    /// has).
-    pub fn defaults_for(platform: Platform) -> Self {
         ReceiverSettings {
             latency_ms: 1500,
             expected_bitrate_mbps: 100,
@@ -140,10 +133,7 @@ impl ReceiverSettings {
             buffer_seconds: 1.5,
             fullscreen: false,
             fullscreen_screen: 0,
-            frontend: match platform {
-                Platform::MacOs => ReceiverFrontend::FfmpegPipe,
-                Platform::Windows | Platform::Other => ReceiverFrontend::MpvDirect,
-            },
+            frontend: ReceiverFrontend::Auto,
             mpv_path: String::new(),
             ffmpeg_path: String::new(),
             auto_catch_up: true,
@@ -151,6 +141,11 @@ impl ReceiverSettings {
             last_host: String::new(),
         }
     }
+}
+
+impl ReceiverSettings {
+    pub const FILE_NAME: &'static str = "receiver.json";
+    pub const DEFAULT_TONE_MAPPING: &'static str = "bt.2390";
 
     /// "Fast" is for watching while controlling the host's PC (remote control); the regions are sized for the
     /// retransmissions their distance from the host needs (design.md §5).

@@ -38,4 +38,6 @@ export const win = {
   close: () => (isTauri ? tauri.window.getCurrentWindow().close() : undefined),
   // The window is created hidden and shown once the first frame is drawn, so it never flashes white.
   show: () => (isTauri ? tauri.window.getCurrentWindow().show() : undefined),
+  // The system moves the window with the mouse until the button is let go (the panel over the player).
+  startDragging: () => (isTauri ? tauri.window.getCurrentWindow().startDragging() : undefined),
 };

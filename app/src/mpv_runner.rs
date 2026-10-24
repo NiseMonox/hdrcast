@@ -14,11 +14,17 @@ use hdrcast_media::receiver::mpv_command::MpvLaunchPlan;
 use hdrcast_media::receiver::mpv_ipc::{observed, MpvIpcMessage, MpvIpcMessageKind, MpvStatusModel};
 use hdrcast_media::receiver::mpv_log;
 use hdrcast_media::receiver::settings::ReceiverSettings;
+use hdrcast_media::receiver::ts_guard::{GuardEvent, GuardStats, TsGuard};
 
 use crate::mpv_ipc::{Handlers, MpvIpcClient};
+use hdrcast_control::keys::{self, CLOSE_MESSAGE, OVERLAY_MESSAGE};
+use serde_json::{json, Value};
 
 pub const RETRY_DELAY: Duration = Duration::from_millis(3000);
 const RECENT_LINES: usize = 40;
+/// The guard's freezes go into the log at most this often (each one ends at a keyframe, a second or two apart
+/// on a bad line): the first one at once, then a summary of what happened meanwhile.
+const GUARD_LOG_EVERY: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlayerState {
@@ -48,6 +54,8 @@ pub struct PlayerSnapshot {
     pub attempt: u32,
     pub uptime: Duration,
     pub status: MpvStatusModel,
+    /// What the guard did, when the stream goes through it (the ffmpeg pipe).
+    pub guard: Option<GuardStats>,
 }
 
 type LogFn = Arc<dyn Fn(&str) + Send + Sync>;
@@ -55,6 +63,8 @@ type LogFn = Arc<dyn Fn(&str) + Send + Sync>;
 pub type IpcTap = Arc<dyn Fn(&MpvIpcMessage) + Send + Sync>;
 /// Called each time a (re)started mpv's IPC is connected.
 pub type IpcReady = Arc<dyn Fn() + Send + Sync>;
+/// Sees what the guard does (freezes, recoveries), on the pump thread: keyframes on request use it.
+pub type GuardTap = Arc<dyn Fn(GuardEvent) + Send + Sync>;
 
 struct Gate {
     generation: u64,
@@ -71,7 +81,12 @@ struct Gate {
     text: String,
     status: MpvStatusModel,
     recent: VecDeque<String>,
+    guard: Option<GuardStats>,
 }
+
+/// Hears what the player's own bindings send (hdrcast_control::keys::player_bindings): the panel's key
+/// ([`OVERLAY_MESSAGE`]) and the window's close button ([`CLOSE_MESSAGE`]). Called on the IPC thread.
+pub type PlayerMessage = Arc<dyn Fn(&str) + Send + Sync>;
 
 struct Shared {
     gate: Mutex<Gate>,
@@ -79,6 +94,8 @@ struct Shared {
     log: LogFn,
     tap: Mutex<Option<IpcTap>>,
     ready: Mutex<Option<IpcReady>>,
+    guard_tap: Mutex<Option<GuardTap>>,
+    player_message: Mutex<Option<PlayerMessage>>,
 }
 
 #[derive(Clone)]
@@ -103,8 +120,58 @@ impl MpvRunner {
             text: "Idle".to_string(),
             status: MpvStatusModel::new(),
             recent: VecDeque::new(),
+            guard: None,
         };
-        Self { shared: Arc::new(Shared { gate: Mutex::new(gate), job, log, tap: Mutex::new(None), ready: Mutex::new(None) }) }
+        Self {
+            shared: Arc::new(Shared {
+                gate: Mutex::new(gate),
+                job,
+                log,
+                tap: Mutex::new(None),
+                ready: Mutex::new(None),
+                guard_tap: Mutex::new(None),
+                player_message: Mutex::new(None),
+            }),
+        }
+    }
+
+    /// Who hears the player's own bindings (the panel's key, the close button); replaces the previous one.
+    pub fn on_player_message(&self, handler: Option<PlayerMessage>) {
+        *self.shared.player_message.lock().unwrap() = handler;
+    }
+
+    /// The process id of the mpv that runs now, if any: its window is where the panel goes.
+    pub fn mpv_pid(&self) -> Option<u32> {
+        self.shared.gate.lock().unwrap().mpv.as_ref().and_then(|mpv| mpv.id())
+    }
+
+    /// Switches the running mpv to another decoder (`--hwdec` value) without a restart, and keeps it for the mpv
+    /// that a reconnect starts. False when no mpv is connected to take it now.
+    pub fn set_hwdec(&self, value: &str) -> bool {
+        self.set_live("hwdec", value, json!(value))
+    }
+
+    /// Mutes or unmutes the running mpv, and the one a reconnect starts. False when no mpv is connected to take it now.
+    pub fn set_mute(&self, muted: bool) -> bool {
+        self.set_live("mute", if muted { "yes" } else { "no" }, json!(muted))
+    }
+
+    /// Sets an mpv option for the mpv that runs (as the property `name` = `now`) and for the next one (`--name=arg`).
+    fn set_live(&self, name: &str, arg: &str, now: Value) -> bool {
+        let ipc = {
+            let mut g = self.shared.gate.lock().unwrap();
+            if let Some(plan) = g.plan.as_deref() {
+                let mut plan = plan.clone();
+                set_option(&mut plan, name, arg);
+                g.plan = Some(Arc::new(plan));
+            }
+            g.ipc.clone()
+        };
+        ipc.is_some_and(|ipc| ipc.is_connected() && ipc.set_property(name, now))
+    }
+
+    pub fn set_guard_tap(&self, tap: Option<GuardTap>) {
+        *self.shared.guard_tap.lock().unwrap() = tap;
     }
 
     pub fn set_ipc_tap(&self, tap: Option<IpcTap>, ready: Option<IpcReady>) {
@@ -124,6 +191,7 @@ impl MpvRunner {
             attempt: g.attempt,
             uptime: if g.user_stopped { Duration::ZERO } else { g.started.map(|t| t.elapsed()).unwrap_or_default() },
             status: g.status.clone(),
+            guard: g.guard,
         }
     }
 
@@ -221,6 +289,7 @@ impl Shared {
             g.attempt += 1;
             g.catching_up = false;
             g.recent.clear();
+            g.guard = None;
             (g.generation, plan, g.attempt)
         };
         let text = if attempt == 1 { "Starting mpv…".to_string() } else { format!("Reconnecting (attempt {attempt})…") };
@@ -304,6 +373,7 @@ impl Shared {
                 message: Box::new(move |msg| me2.on_ipc_message(gen, msg)),
                 connected: Box::new(move || {
                     me3.emit("[ipc] observing mpv properties");
+                    me3.bind_player_keys();
                     let ready = me3.ready.lock().unwrap().clone();
                     if let Some(ready) = ready {
                         ready();
@@ -326,35 +396,62 @@ impl Shared {
         gen == g.generation && !g.user_stopped
     }
 
-    /// The ffmpeg pipe frontend: ffmpeg's stdout into mpv's stdin.
+    /// The ffmpeg pipe: ffmpeg's stdout through the guard (docs/design.md §3.2) into mpv's stdin.
     fn start_pump(self: &Arc<Self>, gen: u64, ffmpeg: &LineProcess, mpv: &LineProcess) {
         let (Some(mut src), Some(mut dst)) = (ffmpeg.take_stdout(), mpv.take_stdin()) else { return };
         let me = self.clone();
         thread::Builder::new()
             .name("ffmpeg-to-mpv".into())
             .spawn(move || {
+                let mut guard = TsGuard::new();
+                let mut journal = GuardJournal::default();
                 let mut buf = vec![0u8; 65536];
+                let mut out = Vec::with_capacity(2 * buf.len());
                 loop {
                     if !me.current(gen) {
                         break;
                     }
-                    match src.read(&mut buf) {
+                    let n = match src.read(&mut buf) {
                         Ok(0) => break,
-                        Ok(n) => {
-                            if let Err(e) = dst.write_all(&buf[..n]) {
-                                if me.current(gen) {
-                                    me.emit(&format!("[pipe] ended: {e}"));
-                                }
-                                break;
-                            }
-                        }
+                        Ok(n) => n,
                         Err(e) => {
                             if me.current(gen) {
                                 me.emit(&format!("[pipe] ended: {e}"));
                             }
                             break;
                         }
+                    };
+                    out.clear();
+                    guard.push(&buf[..n], &mut out);
+                    let stats = guard.stats();
+                    let events = guard.take_events();
+                    if !events.is_empty() {
+                        let tap = me.guard_tap.lock().unwrap().clone();
+                        if let Some(tap) = tap {
+                            for event in &events {
+                                tap(*event);
+                            }
+                        }
                     }
+                    if let Some(line) = journal.note(&events, &stats) {
+                        me.emit(&line);
+                    }
+                    {
+                        let mut g = me.gate.lock().unwrap();
+                        if g.generation == gen {
+                            g.guard = Some(stats);
+                        }
+                    }
+                    if let Err(e) = dst.write_all(&out) {
+                        if me.current(gen) {
+                            me.emit(&format!("[pipe] ended: {e}"));
+                        }
+                        break;
+                    }
+                }
+                guard.finish();
+                if let Some(line) = journal.flush(&guard.stats()) {
+                    me.emit(&line);
                 }
                 // dropping `dst` closes mpv's stdin, which ends its playback
             })
@@ -423,6 +520,8 @@ impl Shared {
     fn on_ipc_message(&self, gen: u64, msg: &MpvIpcMessage) {
         let mut note = None;
         let mut speed = None;
+        let mut loaded = false;
+        let mut player_message = None;
         {
             let mut g = self.gate.lock().unwrap();
             if gen != g.generation {
@@ -444,6 +543,11 @@ impl Shared {
                     Some("file-loaded") => {
                         g.state = PlayerState::Playing;
                         g.text = "Playing".to_string();
+                        loaded = true;
+                    }
+                    Some("client-message") => {
+                        let first = msg.raw.get("args").and_then(Value::as_array).and_then(|a| a.first()).and_then(Value::as_str);
+                        player_message = first.filter(|m| [OVERLAY_MESSAGE, CLOSE_MESSAGE].contains(m)).map(str::to_string);
                     }
                     Some("end-file") => note = Some(format!("[ipc] end-file: {}", msg.reason.as_deref().unwrap_or("?"))),
                     Some("shutdown") => note = Some("[ipc] mpv shutdown".to_string()),
@@ -465,9 +569,28 @@ impl Shared {
         if let Some(line) = note {
             self.emit(&line);
         }
+        if loaded {
+            // again: at connection time the IPC client may not have been stored yet
+            self.bind_player_keys();
+        }
+        if let Some(message) = player_message {
+            let handler = self.player_message.lock().unwrap().clone();
+            if let Some(handler) = handler {
+                handler(&message);
+            }
+        }
         let tap = self.tap.lock().unwrap().clone();
         if let Some(tap) = tap {
             tap(msg);
+        }
+    }
+
+    /// The few bindings the player keeps (mpv's own are off, `--input-default-bindings=no`; docs/design.md §3.1).
+    fn bind_player_keys(&self) {
+        let ipc = self.gate.lock().unwrap().ipc.clone();
+        let Some(ipc) = ipc.filter(|ipc| ipc.is_connected()) else { return };
+        for (key, command) in keys::player_bindings() {
+            ipc.command(&[json!("keybind"), json!(key), json!(command)]);
         }
     }
 
@@ -492,5 +615,97 @@ impl Shared {
         } else {
             None
         }
+    }
+}
+
+/// Puts `--name=value` in the plan's mpv arguments, in place of the one there or before the input (the last one).
+pub fn set_option(plan: &mut MpvLaunchPlan, name: &str, value: &str) {
+    let prefix = format!("--{name}=");
+    let arg = format!("{prefix}{value}");
+    match plan.mpv_args.iter_mut().find(|a| a.starts_with(&prefix)) {
+        Some(existing) => *existing = arg,
+        None => {
+            let input = plan.mpv_args.len().saturating_sub(1);
+            plan.mpv_args.insert(input, arg);
+        }
+    }
+}
+
+/// Turns the guard's freezes into log lines a person can read: the first one at once, then at most one line per
+/// [`GUARD_LOG_EVERY`] summing up what happened since.
+#[derive(Default)]
+struct GuardJournal {
+    last_line: Option<Instant>,
+    /// Since the last line: freezes that ended, the frames they kept off the screen and how long (90 kHz ticks).
+    freezes: u64,
+    skipped: u64,
+    ticks: u64,
+    /// The guard's loss count at the last line.
+    losses: u64,
+}
+
+impl GuardJournal {
+    fn note(&mut self, events: &[GuardEvent], stats: &GuardStats) -> Option<String> {
+        let mut froze = false;
+        for event in events {
+            match *event {
+                GuardEvent::Froze => froze = true,
+                GuardEvent::Recovered { skipped, ticks } => {
+                    self.freezes += 1;
+                    self.skipped += skipped;
+                    self.ticks += ticks;
+                }
+            }
+        }
+        if froze && self.last_line.is_none() {
+            self.last_line = Some(Instant::now());
+            return Some(
+                "[guard] part of the stream was lost on the way: the picture holds on the last good frame until the next keyframe"
+                    .to_string(),
+            );
+        }
+        let due = self.last_line.is_none_or(|at| at.elapsed() >= GUARD_LOG_EVERY);
+        (due && self.freezes > 0).then(|| self.line(stats))
+    }
+
+    /// What is left to say when the stream ends.
+    fn flush(&mut self, stats: &GuardStats) -> Option<String> {
+        (self.freezes > 0).then(|| self.line(stats))
+    }
+
+    fn line(&mut self, stats: &GuardStats) -> String {
+        let line = format!(
+            "[guard] {} {} until a keyframe, {:.1} s in all ({} frames held back); {} losses in the stream",
+            self.freezes,
+            if self.freezes == 1 { "freeze" } else { "freezes" },
+            self.ticks as f64 / 90_000.0,
+            self.skipped,
+            stats.losses.saturating_sub(self.losses),
+        );
+        self.last_line = Some(Instant::now());
+        self.losses = stats.losses;
+        (self.freezes, self.skipped, self.ticks) = (0, 0, 0);
+        line
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_option_replaces_its_old_value_or_goes_before_the_input() {
+        let mut plan = MpvLaunchPlan {
+            mpv_exe: "mpv".into(),
+            mpv_args: ["--vo=gpu-next", "--hwdec=d3d11va", "--title=HdrCast", "-"].map(String::from).to_vec(),
+            ipc_endpoint: String::new(),
+            url: String::new(),
+            ffmpeg_exe: None,
+            ffmpeg_args: None,
+        };
+        set_option(&mut plan, "hwdec", "no");
+        set_option(&mut plan, "mute", "yes");
+        set_option(&mut plan, "mute", "no");
+        assert_eq!(plan.mpv_args, ["--vo=gpu-next", "--hwdec=no", "--title=HdrCast", "--mute=no", "-"]);
     }
 }

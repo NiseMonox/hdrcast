@@ -23,6 +23,7 @@ use hdrcast_core::{endpoint, GroupConfig, GroupKeys, LiveRecord, ProcessJob, Sig
 use crate::cancel::CancelToken;
 use crate::echo_protocol;
 use crate::host_link::{HostLink, HostSessionInfo, HostSideHandler};
+use crate::srt_monitor::SrtStats;
 use crate::link_base::{LinkAddresses, SOURCE_ECHO, SOURCE_ROUTER};
 use crate::p2p_diagnostics;
 use crate::peer_session::LinkState;
@@ -67,7 +68,31 @@ pub struct P2pHostOptions {
     /// Whether this host streams on request rather than broadcasting ("od" in the live record). Asked at every
     /// heartbeat. `None` = a broadcast.
     pub on_demand: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// Whether this host takes keyframe requests on the side channel ("kf" in the live record, docs/design.md
+    /// §8.12). Asked at every heartbeat. `None` = never.
+    pub offer_keyframes: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
+
+/// What a side datagram is for. Each use has its own flag in the live record and the join, and nothing goes to
+/// a peer that did not announce the use: an older one would take the datagram for SRT (docs/design.md §8.9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SideUse {
+    /// Remote control ("rc").
+    RemoteControl,
+    /// Keyframe requests and their answers ("kf").
+    Keyframes,
+}
+
+/// Something that happened to one viewer's stream, for whoever drives the encoder (docs/design.md §8.12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamEvent {
+    /// Its SRT stream started (it joined, or its player connected again): the picture begins at a keyframe.
+    Started,
+    /// Its queue in the fan-out overflowed after its stream had started: it lost half a second of the stream.
+    QueueCleared,
+}
+
+type StreamEventFn = Arc<dyn Fn(&str, StreamEvent) + Send + Sync>;
 
 /// Receives each join waiting to be let in (see [`P2pHostOptions::admit`]).
 pub type AdmitFn = Arc<dyn Fn(JoinTicket) + Send + Sync>;
@@ -84,6 +109,8 @@ pub struct JoinTicket {
     pub device_key: Option<String>,
     /// The join asked for remote control ("rc"), which also means the viewer speaks the side channel.
     pub wants_control: bool,
+    /// The join said "kf": the viewer asks for keyframes and understands the answers (docs/design.md §8.12).
+    pub wants_keyframes: bool,
     pub latency_ms: i32,
     pub overhead_percent: i32,
 }
@@ -108,6 +135,7 @@ impl Default for P2pHostOptions {
             device: None,
             admit: None,
             on_demand: None,
+            offer_keyframes: None,
         }
     }
 }
@@ -131,9 +159,16 @@ pub struct ViewerInfo {
     pub overhead_percent: i32,
     /// The viewer's join asked for remote control ("rc"): it speaks the side channel (docs/design.md §8.9).
     pub wants_control: bool,
+    /// The viewer's join said "kf": it asks for keyframes (docs/design.md §8.12).
+    pub wants_keyframes: bool,
     pub viewer_id: String,
     /// The viewer's device key, when its join was signed (docs/design.md §8.10).
     pub device_key: Option<String>,
+    /// What the SRT packets on the viewer's path say about it (docs/design.md §8.11); `None` before it has a path.
+    pub srt: Option<SrtStats>,
+    /// Times this viewer's remux child fell so far behind that its queue in the fan-out was emptied (half a
+    /// second of the stream each time, before SRT ever saw it).
+    pub queue_clears: u32,
 }
 
 pub struct P2pHost {
@@ -147,6 +182,8 @@ struct Viewer {
     info: Mutex<ViewerInfo>,
     child: Mutex<ChildSlot>,
     ended: AtomicBool,
+    /// Its SRT stream has started (see [`StreamEvent`]).
+    streaming: AtomicBool,
     /// The remote-control key agreed with this viewer's device; `None` = the group-derived one.
     control_key: Option<[u8; 32]>,
 }
@@ -164,6 +201,8 @@ struct ChildSlot {
     /// Which child the slot holds (or held last): an exit is only acted on by the child it belongs to.
     id: u64,
     port: u16,
+    /// The video bitrate its SRT connection was set up for (the pacing, `RemuxChild::wire_bps`).
+    sized_bps: u64,
     restarts: RestartLimiter,
 }
 
@@ -219,6 +258,7 @@ struct Inner {
     changed: Callbacks<dyn Fn() + Send + Sync>,
     input_ended: Callbacks<dyn Fn() + Send + Sync>,
     side_handler: Mutex<Option<HostSideHandler>>,
+    stream_event: Mutex<Option<StreamEventFn>>,
 }
 
 impl P2pHost {
@@ -261,6 +301,7 @@ impl P2pHost {
                 changed: Callbacks::new(),
                 input_ended: Callbacks::new(),
                 side_handler: Mutex::new(None),
+                stream_event: Mutex::new(None),
             }),
         }
     }
@@ -309,12 +350,16 @@ impl P2pHost {
         self.inner.viewers().iter().map(|v| bitrate * (1.0 + f64::from(v.overhead_percent) / 100.0)).sum()
     }
 
-    /// New settings for the stream: the bitrate (sizes the viewers' SRT buffers and goes into the live record)
-    /// and how many may watch at once. Viewers already watching keep what they started with.
+    /// New settings for the stream: the bitrate (sizes the viewers' SRT connections and goes into the live record)
+    /// and how many may watch at once. Viewers already watching keep what they started with, except a connection
+    /// set up for less than the new bitrate: that one starts again (see [`Inner::resize_legs`]).
     pub fn set_stream(&self, bitrate_bps: u64, max_viewers: u32) {
         let old = (self.inner.bitrate_bps.swap(bitrate_bps, Ordering::AcqRel), self.inner.max_viewers.swap(max_viewers, Ordering::AcqRel));
         if old != (bitrate_bps, max_viewers) {
             self.announce_now();
+        }
+        if bitrate_bps > old.0 {
+            self.inner.resize_legs(bitrate_bps);
         }
     }
 
@@ -390,15 +435,33 @@ impl P2pHost {
         *lock(&self.inner.side_handler) = Some(handler);
     }
 
-    /// Sends `payload` (1..=1200 bytes) to one viewer on the side channel. False when that viewer's join did not
-    /// ask for remote control (it may be a 0.2.4 viewer, which would hand the datagram to mpv), when its
-    /// session is not connected, or when the payload is out of range.
+    /// Sends `payload` (1..=1200 bytes) to one viewer on the side channel, for remote control. False when that
+    /// viewer's join did not ask for remote control (it may be a 0.2.4 viewer, which would hand the datagram to
+    /// mpv), when its session is not connected, or when the payload is out of range.
     pub fn send_side(&self, sid: &str, payload: &[u8]) -> bool {
+        self.send_side_for(sid, SideUse::RemoteControl, payload)
+    }
+
+    /// [`send_side`](Self::send_side) for `purpose`: only to a viewer whose join announced that use.
+    pub fn send_side_for(&self, sid: &str, purpose: SideUse, payload: &[u8]) -> bool {
         let Some(viewer) = lock(&self.inner.state).viewers.get(sid).cloned() else { return false };
-        if viewer.ended.load(Ordering::Acquire) || !lock(&viewer.info).wants_control {
+        let announced = {
+            let info = lock(&viewer.info);
+            match purpose {
+                SideUse::RemoteControl => info.wants_control,
+                SideUse::Keyframes => info.wants_keyframes,
+            }
+        };
+        if viewer.ended.load(Ordering::Acquire) || !announced {
             return false;
         }
         self.inner.link.get().is_some_and(|link| link.send_side(sid, payload))
+    }
+
+    /// Who is told what happens to each viewer's stream ([`StreamEvent`]), on a network or fan-out thread (keep
+    /// it short). May be set before or after [`start`](Self::start); replaces the previous handler.
+    pub fn on_stream_event(&self, handler: impl Fn(&str, StreamEvent) + Send + Sync + 'static) {
+        *lock(&self.inner.stream_event) = Some(Arc::new(handler));
     }
 }
 
@@ -435,6 +498,14 @@ impl Inner {
                 }
             })
         });
+        link.on_stream_started({
+            let weak = weak.clone();
+            Arc::new(move |sid| {
+                if let Some(host) = weak.upgrade() {
+                    host.on_stream_started(sid);
+                }
+            })
+        });
         self.since_ms.store(now_ms(), Ordering::Relaxed);
         (self.log)(&format!("[p2p] candidates: {}{}", link.candidates().join(", "), if link.has_ipv6() { "" } else { "  (no IPv6 on this PC)" }));
         let ipv4_port = link.ipv4_port();
@@ -460,6 +531,14 @@ impl Inner {
 
         let input = lock(&self.ts).take().ok_or(StartError::AlreadyStarted)?;
         let fan = TsFanOut::new(input);
+        fan.on_queue_cleared({
+            let weak = weak.clone();
+            move |sid| {
+                if let Some(host) = weak.upgrade() {
+                    host.on_queue_cleared(sid);
+                }
+            }
+        });
         fan.on_input_ended({
             let weak = weak.clone();
             move || {
@@ -492,6 +571,28 @@ impl Inner {
         self.link.get().is_some_and(HostLink::has_ipv6)
     }
 
+    fn stream_event(&self, sid: &str, event: StreamEvent) {
+        let handler = lock(&self.stream_event).clone();
+        if let Some(handler) = handler {
+            handler(sid, event);
+        }
+    }
+
+    fn on_stream_started(&self, sid: &str) {
+        let Some(viewer) = lock(&self.state).viewers.get(sid).cloned() else { return };
+        viewer.streaming.store(true, Ordering::Release);
+        self.stream_event(sid, StreamEvent::Started);
+    }
+
+    /// Only once the viewer's stream runs: before that its remux child waits for the player and does not read,
+    /// so its queue overflows every half second without anybody missing anything.
+    fn on_queue_cleared(&self, sid: &str) {
+        let Some(viewer) = lock(&self.state).viewers.get(sid).cloned() else { return };
+        if viewer.streaming.load(Ordering::Acquire) && !viewer.ended.load(Ordering::Acquire) {
+            self.stream_event(sid, StreamEvent::QueueCleared);
+        }
+    }
+
     fn link_candidates(&self) -> Vec<String> {
         self.link.get().map(HostLink::candidates).unwrap_or_default()
     }
@@ -514,7 +615,16 @@ impl Inner {
 
     fn viewers(&self) -> Vec<ViewerInfo> {
         let viewers: Vec<Arc<Viewer>> = lock(&self.state).viewers.values().cloned().collect();
-        let mut list: Vec<ViewerInfo> = viewers.iter().filter(|v| !v.ended.load(Ordering::Acquire)).map(|v| lock(&v.info).clone()).collect();
+        let link = self.link.get();
+        let mut list: Vec<ViewerInfo> = viewers
+            .iter()
+            .filter(|v| !v.ended.load(Ordering::Acquire))
+            .map(|v| ViewerInfo {
+                srt: link.and_then(|link| link.srt_stats(&v.sid)),
+                queue_clears: self.fan.get().and_then(|fan| fan.stats(&v.sid)).map_or(0, |(_, clears)| clears),
+                ..lock(&v.info).clone()
+            })
+            .collect();
         list.sort_by_key(|v| v.joined_utc);
         list
     }
@@ -598,6 +708,39 @@ impl Inner {
 
     fn bitrate_bps(&self) -> u64 {
         self.bitrate_bps.load(Ordering::Acquire)
+    }
+
+    /// The bitrate went up past what some viewers' SRT connections were set up for: SRT paces each one at its
+    /// `inputbw` plus the viewer's overhead (`RemuxChild::wire_bps`), so the bigger stream would wait in its queue and
+    /// be dropped there. Those connections start again, sized for the new rate. Their remux child's input is closed
+    /// so that it ends its stream properly and the viewer's player notices at once (it reconnects within a few
+    /// seconds); its exit starts the new child (`on_child_exited`). A lower bitrate fits the connections there are.
+    fn resize_legs(self: &Arc<Self>, bitrate_bps: u64) {
+        let Some(fan) = self.fan.get() else { return };
+        let viewers: Vec<Arc<Viewer>> = lock(&self.state).viewers.values().cloned().collect();
+        for viewer in viewers {
+            let child = {
+                let slot = lock(&viewer.child);
+                slot.child.clone().filter(|_| slot.sized_bps < bitrate_bps)
+            };
+            let Some(child) = child else { continue };
+            (self.log)(&format!(
+                "[p2p] {}: the bitrate went up to {} Mbps, more than their connection was set up for: it starts again",
+                viewer.name,
+                round_half_even(bitrate_bps as f64 / 1e6)
+            ));
+            fan.remove_sink(&viewer.sid);
+            child.finish();
+            // one that does not end by itself is ended (its exit starts the new one all the same)
+            let left = Arc::downgrade(&child);
+            drop(child);
+            let _ = std::thread::Builder::new().name("remux-resize".into()).spawn(move || {
+                std::thread::sleep(Duration::from_secs(3));
+                if let Some(child) = left.upgrade().filter(|c| !c.has_exited()) {
+                    child.dispose();
+                }
+            });
+        }
     }
 
     fn max_viewers(&self) -> u32 {
@@ -788,11 +931,15 @@ impl Inner {
                 latency_ms: join.latency_ms,
                 overhead_percent: join.overhead_percent,
                 wants_control: join.remote_control,
+                wants_keyframes: join.keyframes,
                 viewer_id: join.viewer_id.clone(),
                 device_key: device.as_ref().map(|d| d.key.clone()),
+                srt: None,
+                queue_clears: 0,
             }),
             child: Mutex::new(ChildSlot::default()),
             ended: AtomicBool::new(false),
+            streaming: AtomicBool::new(false),
             control_key,
         });
         let port = match self.start_child(&viewer) {
@@ -841,7 +988,8 @@ impl Inner {
             (info.latency_ms, info.overhead_percent)
         };
         let port = RemuxChild::free_loopback_udp_port().map_err(|e| e.to_string())?;
-        let url = RemuxChild::build_listener_url(port, keys.srt_passphrase(), latency_ms.max(0) as u32, overhead_percent, self.bitrate_bps())
+        let bitrate_bps = self.bitrate_bps();
+        let url = RemuxChild::build_listener_url(port, keys.srt_passphrase(), latency_ms.max(0) as u32, overhead_percent, bitrate_bps)
             .map_err(|e| e.to_string())?;
         let ffmpeg = lock(&self.ffmpeg_path).clone();
         let mut child = RemuxChild::new(&ffmpeg, &url, self.o.job.clone());
@@ -863,10 +1011,11 @@ impl Inner {
             slot.child = Some(Arc::new(child));
             slot.id = id;
             slot.port = port;
+            slot.sized_bps = bitrate_bps;
             input
         };
         let fed = match input {
-            Some(input) => fan.add_sink(&viewer.sid, Box::new(input), TsFanOut::queue_bytes_for(self.bitrate_bps())).map_err(|e| e.to_string()),
+            Some(input) => fan.add_sink(&viewer.sid, Box::new(input), TsFanOut::queue_bytes_for(bitrate_bps)).map_err(|e| e.to_string()),
             None => Err("ffmpeg has no stdin".to_string()),
         };
         if let Err(why) = fed {
@@ -1051,6 +1200,7 @@ impl Inner {
             remote_control: self.o.offer_remote_control.as_ref().is_some_and(|offers| offers()).then_some(true),
             device_key: self.o.device.as_ref().map(|d| d.public_key().to_string()),
             on_demand: self.on_demand(),
+            keyframes: self.o.offer_keyframes.as_ref().is_some_and(|offers| offers()),
         };
         let keys = self.keys.get().expect("sealed only while running");
         SignedEnvelope::seal(keys, messages::KIND_LIVE, &g.group_id, &g.peer_id, &record.to_payload())
@@ -1157,6 +1307,7 @@ fn ticket_of(pending: &PendingJoin) -> JoinTicket {
         name: join.name.clone(),
         device_key: pending.device.as_ref().map(|d| d.key.clone()),
         wants_control: join.remote_control,
+        wants_keyframes: join.keyframes,
         latency_ms: join.latency_ms,
         overhead_percent: join.overhead_percent,
     }

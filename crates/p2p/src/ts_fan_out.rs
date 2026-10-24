@@ -18,6 +18,7 @@ const SMALLEST_QUEUE_BYTES: u64 = 64 * 1024;
 
 type InputEnded = Arc<dyn Fn() + Send + Sync>;
 type SinkFailed = Arc<dyn Fn(&str) + Send + Sync>;
+type QueueCleared = Arc<dyn Fn(&str) + Send + Sync>;
 
 pub struct TsFanOut {
     shared: Arc<Shared>,
@@ -30,6 +31,7 @@ struct Shared {
     bytes_in: AtomicU64,
     input_ended: Mutex<Option<InputEnded>>,
     sink_failed: Mutex<Option<SinkFailed>>,
+    queue_cleared: Mutex<Option<QueueCleared>>,
 }
 
 struct Sink {
@@ -49,12 +51,14 @@ struct Queue {
 }
 
 impl Sink {
-    fn enqueue(&self, chunk: &Arc<[u8]>) {
+    /// True when the queue had to be cleared first.
+    fn enqueue(&self, chunk: &Arc<[u8]>) -> bool {
         let mut queue = lock(&self.queue);
         if queue.closed {
-            return;
+            return false;
         }
-        if queue.queued_bytes + chunk.len() as u64 > self.max_bytes {
+        let cleared = queue.queued_bytes + chunk.len() as u64 > self.max_bytes;
+        if cleared {
             queue.chunks.clear();
             queue.queued_bytes = 0;
             queue.clears += 1;
@@ -62,6 +66,7 @@ impl Sink {
         queue.chunks.push_back(chunk.clone());
         queue.queued_bytes += chunk.len() as u64;
         self.wake.notify_one();
+        cleared
     }
 
     fn close(&self) {
@@ -82,6 +87,7 @@ impl TsFanOut {
                 bytes_in: AtomicU64::new(0),
                 input_ended: Mutex::new(None),
                 sink_failed: Mutex::new(None),
+                queue_cleared: Mutex::new(None),
             }),
             input: Mutex::new(Some(input)),
         }
@@ -97,6 +103,12 @@ impl TsFanOut {
     /// id on that sink's writer thread.
     pub fn on_sink_failed(&self, handler: impl Fn(&str) + Send + Sync + 'static) {
         *lock(&self.shared.sink_failed) = Some(Arc::new(handler));
+    }
+
+    /// A sink's queue overflowed and was emptied: its viewer lost what was in it. Called with its id on the
+    /// reader thread (keep it short).
+    pub fn on_queue_cleared(&self, handler: impl Fn(&str) + Send + Sync + 'static) {
+        *lock(&self.shared.queue_cleared) = Some(Arc::new(handler));
     }
 
     pub fn bytes_in(&self) -> u64 {
@@ -193,7 +205,12 @@ fn read_loop(shared: &Shared, mut input: Box<dyn Read + Send>) {
         let chunk: Arc<[u8]> = Arc::from(&buffer[..n]);
         let sinks: Vec<Arc<Sink>> = lock(&shared.sinks).values().cloned().collect();
         for sink in sinks {
-            sink.enqueue(&chunk);
+            if sink.enqueue(&chunk) {
+                let handler = lock(&shared.queue_cleared).clone();
+                if let Some(handler) = handler {
+                    handler(&sink.id);
+                }
+            }
         }
     }
     drop(input);

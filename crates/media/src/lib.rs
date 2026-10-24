@@ -5,6 +5,8 @@
 //!   `sender.json`.
 //! * [`receiver`]: the `mpv` argument list for a viewer (§3.1), mpv's JSON IPC messages, the classification of
 //!   mpv's last log lines and `receiver.json`.
+//! * [`keyframe`]: keyframes on request (§8.12), the datagrams a viewer and its host exchange about them and
+//!   when the host's encoder makes one.
 //!
 //! A port of the C# `shared/Sender` and `shared/Receiver` (0.2.4). On Windows the generated argument lists are
 //! the ones 0.2.4 generated, option for option: many of them were tuned against real ffmpeg and mpv builds, and
@@ -20,6 +22,7 @@ mod numfmt;
 mod settings_file;
 mod text;
 
+pub mod keyframe;
 pub mod receiver;
 pub mod sender;
 

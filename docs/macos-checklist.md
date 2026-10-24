@@ -344,7 +344,7 @@ open dist/HdrCast.app
 - [ ] 只有 ad-hoc 签名（`tauri.conf.json` 的 `signingIdentity: "-"`），没有公证：从别处拿到的副本第一次打开要在访达里右键 → 打开
       （或 `xattr -dr com.apple.quarantine dist/HdrCast.app`）。ad-hoc 签名每次构建都不同，重新构建后录屏、辅助功能授权要重新给。
 - [ ] **设置 → 工具**：ffmpeg、mpv 都显示"已找到"：ffmpeg 是 `/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg`，mpv 是 `/opt/homebrew/bin/mpv`
-      （Intel Mac 是 `/usr/local/…`）。**播放方式** 默认是"ffmpeg 管道 → mpv"（Homebrew 的 mpv 不带 libsrt）。
+      （Intel Mac 是 `/usr/local/…`）。**播放方式** 默认是"自动（有 ffmpeg 就用）"，经过 ffmpeg-full 播放（Homebrew 的 mpv 不带 libsrt）。
 - [ ] 设置和日志在 `~/Library/Application Support/HdrCast/`；**设置 → 设置与日志 → 打开文件夹** 用访达打开它。
 - [ ] 没有"防火墙"一栏（那是 Windows 防火墙的）；**开播 → 声音** 里没有"排除程序"。
 
@@ -360,6 +360,10 @@ open dist/HdrCast.app
       不亮 → 把 mpv 的日志（**日志** 页筛"播放器"）发回来；macOS 上 mpv 的 HDR 直通可能还需要 `--gpu-api=vulkan` 之类的选项，
       现在的参数表（`crates/media/src/receiver/mpv_command.rs`）故意没加任何没把握的选项。
 - [ ] **全屏** 按钮、**停止** 按钮可用；停止后 mpv 进程消失（`pgrep mpv` 无输出）。直接退出 HdrCast 时 mpv 也跟着退出。
+- [ ] 悬浮窗（design.md §3.3，macOS 上只有最简单的做法）：观看时 HdrCast 窗口所在屏幕的右上角有个小圆按钮，单击展开成面板，"—" 收起；
+      面板里 **静音**、**解码方式** 立即生效。圆按钮的四角应该是透明的（看得到后面的东西）；是黑色方块 → 透明窗口在这里不生效，截图发回来。
+      它不跟着播放器、也拖不走（这两样只做了 Windows）。
+- [ ] 播放窗口里滚轮、空格、`q` 都没反应（`--input-default-bindings=no`）；`Ctrl+Option+Enter` 切全屏；点窗口的关闭按钮 = 停止观看。
 
 ## 14. 开播（观众是 Windows）
 

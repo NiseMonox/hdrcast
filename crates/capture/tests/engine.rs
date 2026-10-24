@@ -8,11 +8,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use hdrcast_capture::encode::{EncodedPicture, VideoEncoder};
+use hdrcast_capture::frame::SharedFrame;
 use hdrcast_capture::platform::{
     AudioSink, AudioSource, Backend, FrameLayout, FrameStatus, PipeCanceller, PipeServer,
     ProcessWatch, VideoError, VideoSource,
 };
-use hdrcast_capture::{color, exit_codes, CaptureArgs, CaptureEngine, CaptureFormat, CaptureStats};
+use hdrcast_capture::{
+    color, exit_codes, CaptureArgs, CaptureEngine, CaptureFormat, CaptureStats, EncodeArgs,
+    EngineEncoder,
+};
 
 const WIDTH: u32 = 64;
 const HEIGHT: u32 = 36;
@@ -35,19 +40,13 @@ struct FakeVideo {
     lost: bool,
     fail_recover: bool,
     events: Events,
+    /// Zero copy: the screen converts into the surfaces of an encoder it makes itself.
+    zero_copy: Option<Arc<ZeroCopy>>,
 }
 
-impl VideoSource for FakeVideo {
-    fn layout(&self) -> FrameLayout {
-        self.layout
-    }
-
-    fn next_frame(&mut self, dst: &mut [u8], timeout: Duration) -> Result<FrameStatus, VideoError> {
-        assert_eq!(
-            dst.len(),
-            self.layout.frame_bytes(),
-            "the engine hands over exactly one frame"
-        );
+impl FakeVideo {
+    /// Waits up to `timeout` for the next picture; its number when one came.
+    fn next_picture(&mut self, timeout: Duration) -> Result<Option<u64>, VideoError> {
         if self.lost {
             return Err(VideoError::Lost(None));
         }
@@ -62,12 +61,36 @@ impl VideoSource for FakeVideo {
             let wait = (next_change - elapsed).min(timeout);
             std::thread::sleep(wait);
             if self.started.elapsed() < next_change {
-                return Ok(FrameStatus::Unchanged);
+                return Ok(None);
             }
         }
         self.delivered += 1;
-        dst.fill((self.delivered % 200) as u8 + 20);
-        Ok(FrameStatus::New { gpu_ms: 1.5 })
+        Ok(Some(self.delivered))
+    }
+}
+
+impl VideoSource for FakeVideo {
+    fn layout(&self) -> FrameLayout {
+        self.layout
+    }
+
+    fn next_frame(&mut self, dst: &mut [u8], timeout: Duration) -> Result<FrameStatus, VideoError> {
+        assert_eq!(
+            dst.len(),
+            self.layout.frame_bytes(),
+            "the engine hands over exactly one frame"
+        );
+        assert!(
+            self.zero_copy.is_none(),
+            "with zero copy nothing goes to memory"
+        );
+        match self.next_picture(timeout)? {
+            Some(picture) => {
+                dst.fill((picture % 200) as u8 + 20);
+                Ok(FrameStatus::New { gpu_ms: 1.5 })
+            }
+            None => Ok(FrameStatus::Unchanged),
+        }
     }
 
     fn recover(&mut self) -> Result<(), String> {
@@ -76,6 +99,145 @@ impl VideoSource for FakeVideo {
             return Err("still gone".into());
         }
         self.lost = false;
+        Ok(())
+    }
+
+    fn surface_encoder(
+        &mut self,
+        _args: &EncodeArgs,
+        _fps: u32,
+        frames: usize,
+    ) -> Option<Box<dyn VideoEncoder>> {
+        let zero_copy = Arc::clone(self.zero_copy.as_ref()?);
+        note(&self.events, format!("surface encoder for {frames} frames"));
+        // Two more than the engine holds: the encoder keeps two frames back, like a run of B-frames.
+        let surfaces = frames + 2;
+        zero_copy
+            .contents
+            .lock()
+            .unwrap()
+            .resize(surfaces, u64::MAX);
+        Some(Box::new(SurfaceEncoder {
+            surfaces,
+            zero_copy,
+            held: std::collections::VecDeque::new(),
+        }))
+    }
+
+    fn next_surface(
+        &mut self,
+        surface: usize,
+        timeout: Duration,
+    ) -> Result<FrameStatus, VideoError> {
+        let zero_copy = Arc::clone(self.zero_copy.as_ref().expect("zero copy"));
+        match self.next_picture(timeout)? {
+            Some(picture) => {
+                zero_copy.convert(surface, picture);
+                Ok(FrameStatus::New { gpu_ms: 0.1 })
+            }
+            None => Ok(FrameStatus::Unchanged),
+        }
+    }
+
+    fn black_surface(&mut self, surface: usize) -> Result<(), String> {
+        note(&self.events, format!("black surface {surface}"));
+        self.zero_copy
+            .as_ref()
+            .expect("zero copy")
+            .convert(surface, 0);
+        Ok(())
+    }
+}
+
+/// Zero copy as the fake screen and the fake encoder see it.
+#[derive(Default)]
+struct ZeroCopy {
+    /// The picture in each surface (0 = black, `u64::MAX` = nothing yet).
+    contents: Mutex<Vec<u64>>,
+    /// Surfaces the encoder holds (received and not passed on yet).
+    held: Mutex<Vec<usize>>,
+    /// The pictures the encoder passed on, in order.
+    encoded: Mutex<Vec<u64>>,
+    /// What went wrong: a surface converted into while it was in use.
+    errors: Mutex<Vec<String>>,
+}
+
+impl ZeroCopy {
+    fn convert(&self, surface: usize, picture: u64) {
+        if self.held.lock().unwrap().contains(&surface) {
+            self.errors.lock().unwrap().push(format!(
+                "picture {picture} converted into surface {surface}, which the encoder holds"
+            ));
+        }
+        self.contents.lock().unwrap()[surface] = picture;
+    }
+}
+
+/// An encoder on surfaces that keeps the last two frames back before passing their pictures on, and checks that
+/// a held surface still has the picture it had when it was handed over.
+struct SurfaceEncoder {
+    surfaces: usize,
+    zero_copy: Arc<ZeroCopy>,
+    /// Frame, its picture when it came, its index, keyframe.
+    held: std::collections::VecDeque<(SharedFrame, u64, u64, bool)>,
+}
+
+impl SurfaceEncoder {
+    fn pass_on(&mut self, keep: usize, out: &mut Vec<EncodedPicture>) {
+        while self.held.len() > keep {
+            let (frame, picture, index, keyframe) = self.held.pop_front().unwrap();
+            let surface = frame.index();
+            let now = self.zero_copy.contents.lock().unwrap()[surface];
+            if now != picture {
+                self.zero_copy.errors.lock().unwrap().push(format!(
+                    "surface {surface} came with picture {picture} and holds {now} when encoded"
+                ));
+            }
+            let mut held = self.zero_copy.held.lock().unwrap();
+            let at = held.iter().position(|&s| s == surface).unwrap();
+            held.remove(at);
+            self.zero_copy.encoded.lock().unwrap().push(picture);
+            out.push(EncodedPicture {
+                data: vec![0, 0, 1, 0x26, 1, picture as u8],
+                pts: index as i64,
+                dts: index as i64 - 2,
+                keyframe,
+            });
+        }
+    }
+}
+
+impl VideoEncoder for SurfaceEncoder {
+    fn describe(&self) -> String {
+        "a fake encoder on surfaces".into()
+    }
+
+    fn surfaces(&self) -> usize {
+        self.surfaces
+    }
+
+    fn encode(
+        &mut self,
+        frame: &SharedFrame,
+        index: u64,
+        keyframe: bool,
+        out: &mut Vec<EncodedPicture>,
+    ) -> Result<(), String> {
+        assert!(frame.is_empty(), "a surface frame holds no bytes");
+        let picture = self.zero_copy.contents.lock().unwrap()[frame.index()];
+        self.zero_copy.held.lock().unwrap().push(frame.index());
+        self.held
+            .push_back((Arc::clone(frame), picture, index, keyframe));
+        self.pass_on(2, out);
+        Ok(())
+    }
+
+    fn set_bitrate(&mut self, _kbps: u32, _vbv_kbits: u32) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn finish(&mut self, out: &mut Vec<EncodedPicture>) -> Result<(), String> {
+        self.pass_on(0, out);
         Ok(())
     }
 }
@@ -227,6 +389,8 @@ struct FakeBackend {
     delivers: Option<CaptureFormat>,
     /// Every layout the engine announced, with the number of backend events before it.
     announced: Arc<Mutex<Vec<(FrameLayout, usize)>>>,
+    /// The screen offers an encoder on surfaces (zero copy).
+    zero_copy: Option<Arc<ZeroCopy>>,
 }
 
 impl FakeBackend {
@@ -250,6 +414,7 @@ impl FakeBackend {
             parent_gone_after: None,
             delivers: None,
             announced: Arc::default(),
+            zero_copy: None,
         }
     }
 
@@ -286,6 +451,7 @@ impl Backend for FakeBackend {
             lost: false,
             fail_recover: self.fail_recover,
             events: Arc::clone(&self.events),
+            zero_copy: self.zero_copy.clone(),
         }))
     }
 
@@ -876,4 +1042,57 @@ fn a_stalled_consumer_is_counted_once_and_not_once_per_spin() {
         backend.video_pipe.total.load(Ordering::SeqCst),
         30 * frame_bytes
     );
+}
+
+/// Zero copy (design.md section 2.8): the screen converts straight into the surfaces of an encoder it made, and
+/// the engine keeps track of them with its frame pool (one buffer without bytes per surface). It starts with a
+/// black surface, repeats a picture by handing the same surface over again, and never converts into a surface
+/// that is queued, is the latest frame or is still held by the encoder.
+#[test]
+fn with_zero_copy_no_surface_is_converted_into_while_it_is_in_use() {
+    let zero_copy = Arc::new(ZeroCopy::default());
+    let mut backend = FakeBackend::new();
+    // New pictures more often than frames go out (100 fps), and sometimes not: both, repeats and fresh ones.
+    backend.change_every = Duration::from_millis(7);
+    backend.zero_copy = Some(Arc::clone(&zero_copy));
+    let capture = CaptureArgs {
+        audio: false,
+        encode: Some(EncodeArgs::defaults(EngineEncoder::Nvenc, 100)),
+        ..args(100)
+    };
+    let (code, stats) = run_engine(&backend, capture, Some(Duration::from_millis(1500)));
+    assert_eq!(code, exit_codes::OK);
+
+    let events = backend.events();
+    assert_eq!(events[..2], ["open video", "surface encoder for 6 frames"]);
+    assert!(
+        events.contains(&"black surface 7".to_owned()),
+        "the pool hands out its last buffer first: {events:?}"
+    );
+    let errors = zero_copy.errors.lock().unwrap();
+    assert!(errors.is_empty(), "{errors:#?}");
+    let encoded = zero_copy.encoded.lock().unwrap();
+    assert_eq!(
+        encoded.first(),
+        Some(&0),
+        "the stream starts with the black surface"
+    );
+    assert!(
+        encoded.windows(2).all(|w| w[0] <= w[1]),
+        "pictures out of order: {encoded:?}"
+    );
+    // Every frame that went out was passed on by the encoder (the last two by `finish`), as MPEG-TS.
+    let last = stats.last().expect("a final statistics line");
+    assert!(
+        encoded.len() as u64 + 1 >= last.captured,
+        "{} pictures, {last:?}",
+        encoded.len()
+    );
+    assert!(
+        (120..=160).contains(&encoded.len()),
+        "{} pictures",
+        encoded.len()
+    );
+    assert_eq!(last.dropped, 0, "{last:?}");
+    assert_eq!(backend.video_pipe.total.load(Ordering::SeqCst) % 188, 0);
 }

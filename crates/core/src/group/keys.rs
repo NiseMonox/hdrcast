@@ -73,6 +73,12 @@ impl GroupKeys {
         self.sub(&format!("ctl/{sid}"))
     }
 
+    /// `sub("kf/" + sid)`: the key a session's keyframe requests and answers are signed with (docs/design.md
+    /// §8.12).
+    pub fn keyframe_key(&self, sid: &str) -> [u8; 32] {
+        self.sub(&format!("kf/{sid}"))
+    }
+
     pub fn sub(&self, label: &str) -> [u8; 32] {
         sub(&self.group_key, label)
     }
@@ -177,6 +183,10 @@ mod tests {
         assert_ne!(keys.control_key(&a), keys.control_key(&b));
         assert_ne!(keys.control_key(&a), keys.punch_key(&a));
         assert_ne!(keys.control_key(&a), GroupKeys::new(&[8u8; 32]).unwrap().control_key(&a));
+        // the keyframe requests' key is another label of the same kind
+        assert_eq!(keys.keyframe_key(&a), hmac_sha256(&[7u8; 32], format!("hdrcast/v1/kf/{a}").as_bytes()));
+        assert_ne!(keys.keyframe_key(&a), keys.control_key(&a));
+        assert_ne!(keys.keyframe_key(&a), keys.keyframe_key(&b));
     }
 
     #[test]

@@ -7,6 +7,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::Duration;
 
 use hdrcast_core::endpoint;
 use hdrcast_core::group::keys::InvalidIdError;
@@ -16,11 +17,16 @@ use crate::control_packet::{self, PeerRole};
 use crate::link_base::{LinkAddresses, LinkCore, LinkEvents};
 use crate::peer_session::{LinkState, PeerSession};
 use crate::side_channel;
+use crate::srt_monitor::{SrtMonitor, SrtStats};
 use crate::udp_channel::{mono_clock, UdpChannel};
 use crate::util::{lock, round_half_even, Callbacks};
 
 /// Receives what the host sends on the side channel. Runs on a network thread.
 pub type ViewerSideHandler = Arc<dyn Fn(&[u8]) + Send + Sync>;
+
+/// Told when data of the stream has been missing on the way in for longer than SRT needs to get it again
+/// twice, with how long that was (docs/design.md §8.12). Runs on a network thread.
+pub type LastingLossHandler = Arc<dyn Fn(Duration) + Send + Sync>;
 
 type StateChanged = dyn Fn(LinkState) + Send + Sync;
 
@@ -35,12 +41,15 @@ struct Inner {
     bytes_from_host: AtomicU64,
     state_changed: Callbacks<StateChanged>,
     side_handler: Mutex<Option<ViewerSideHandler>>,
+    lasting_loss: Mutex<Option<LastingLossHandler>>,
 }
 
 struct State {
     session: Option<Arc<PeerSession>>,
     mpv: Option<SocketAddr>,
     reported: LinkState,
+    /// The current session's SRT packets: the host's remux child is the sender, mpv (or ffmpeg) the receiver.
+    srt: Arc<SrtMonitor>,
 }
 
 impl ViewerLink {
@@ -61,10 +70,11 @@ impl ViewerLink {
         let inner = Arc::new(Inner {
             core,
             local,
-            state: Mutex::new(State { session: None, mpv: None, reported: LinkState::Punching }),
+            state: Mutex::new(State { session: None, mpv: None, reported: LinkState::Punching, srt: Arc::new(SrtMonitor::new()) }),
             bytes_from_host: AtomicU64::new(0),
             state_changed: Callbacks::new(),
             side_handler: Mutex::new(None),
+            lasting_loss: Mutex::new(None),
         });
         let _ = slot.set(Arc::downgrade(&inner));
         let events: Weak<dyn LinkEvents> = Arc::downgrade(&(inner.clone() as Arc<dyn LinkEvents>));
@@ -152,6 +162,11 @@ impl ViewerLink {
         self.inner.session().map_or(-1.0, |s| s.rtt_ms())
     }
 
+    /// What the current session's SRT packets say about the path (docs/design.md §8.11).
+    pub fn srt_stats(&self) -> SrtStats {
+        lock(&self.inner.state).srt.snapshot()
+    }
+
     pub fn bytes_from_host(&self) -> u64 {
         self.inner.bytes_from_host.load(Ordering::Relaxed)
     }
@@ -163,6 +178,9 @@ impl ViewerLink {
         let previous = {
             let mut state = lock(&self.inner.state);
             state.reported = LinkState::Punching;
+            if state.session.as_ref().is_none_or(|s| s.sid() != sid) {
+                state.srt = Arc::new(SrtMonitor::new());
+            }
             state.session.replace(Arc::new(next))
         };
         if let Some(previous) = previous.filter(|p| p.sid() != sid) {
@@ -189,6 +207,11 @@ impl ViewerLink {
     /// Who gets what the host sends on the side channel (docs/design.md §8.9). Replaces the previous handler.
     pub fn set_side_handler(&self, handler: ViewerSideHandler) {
         *lock(&self.inner.side_handler) = Some(handler);
+    }
+
+    /// Who is told when data of the stream stays missing on the way in (see [`LastingLossHandler`]).
+    pub fn on_lasting_loss(&self, handler: LastingLossHandler) {
+        *lock(&self.inner.lasting_loss) = Some(handler);
     }
 
     /// Sends `payload` (1..=1200 bytes) to the host on the side channel, on the path the stream uses. False
@@ -248,16 +271,17 @@ impl Inner {
         if from.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
             return;
         }
-        let session = {
+        let (session, srt) = {
             let mut state = lock(&self.state);
             state.mpv = Some(from); // a restarted mpv comes from a new port: follow it
-            state.session.clone()
+            (state.session.clone(), state.srt.clone())
         };
         let Some(session) = session else { return };
         let Some(to) = session.selected() else { return };
         if session.is_over() {
             return;
         }
+        srt.from_receiver(datagram);
         if self.core.send_wan(datagram, to) {
             session.note_sent(mono_clock::now_us());
         }
@@ -305,17 +329,24 @@ impl LinkEvents for Inner {
     }
 
     fn on_wan_data(&self, datagram: &[u8], from: SocketAddr) {
-        let (session, mpv) = {
+        let (session, mpv, srt) = {
             let state = lock(&self.state);
-            (state.session.clone(), state.mpv)
+            (state.session.clone(), state.mpv, state.srt.clone())
         };
         let Some(session) = session else { return };
         if !session.on_data(from, mono_clock::now_us()) {
             return;
         }
         let Some(mpv) = mpv else { return };
+        srt.from_sender(datagram);
         if self.local.send(datagram, mpv) {
             self.bytes_from_host.fetch_add(datagram.len() as u64, Ordering::Relaxed);
+        }
+        if let Some(missing) = srt.take_lasting_loss() {
+            let handler = lock(&self.lasting_loss).clone();
+            if let Some(handler) = handler {
+                handler(missing);
+            }
         }
     }
 

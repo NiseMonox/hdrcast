@@ -636,7 +636,9 @@ impl SignalServer {
                 .expect("python starts");
             let mut server = SignalServer { process, state_dir, http_port, echo_port };
             let client = SignalingClient::new(&server.url(), &keys::new_id(), &random_keys(), 1000);
-            let deadline = Instant::now() + Duration::from_millis(8000);
+            // Generous: with a dozen tests starting servers at once (the script on a network share) one start took
+            // over 8 s here. A server that exits is noticed at once anyway.
+            let deadline = Instant::now() + Duration::from_millis(20_000);
             while Instant::now() < deadline {
                 if !matches!(server.process.try_wait(), Ok(None)) {
                     break; // it exited: the port was taken after all

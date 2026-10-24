@@ -34,6 +34,10 @@ sharer's computer. No relay server, no public IPv4 address, no port forwarding t
   may watch without asking and who may control: your own laptop gets control as soon as it connects, friends only watch,
   anybody else has to ask every time. Input takes the same peer-to-peer path, end-to-end encrypted with a key only those
   two computers can work out.
+- **No smeared picture after packet loss (0.3.2).** When a lossy line (across the border into China, say) loses part of
+  the stream for good, the viewer holds the last good picture until the next keyframe instead of showing colourful
+  blocks, like Moonlight; the sound goes on. The sharer's encoder keeps its bitrate steadier, so less is lost in the
+  first place, and both ends show and log how lossy the path is ([docs/faq.md](docs/faq.md)).
 - **English, Chinese and Japanese** in the app (**Settings → Language**; Automatic follows the system).
 
 > **Status (0.3.1):** on Windows, capture, encoding, peer-to-peer, playback and the UI have been tested on real machines.
@@ -85,6 +89,11 @@ sharer's computer. No relay server, no public IPv4 address, no port forwarding t
 3. On an **HDR display**, switch HDR on first (Windows: `Win + Alt + B`). On an SDR display, set **Output** to SDR.
 4. When it does not connect, the panel says why, for example "This PC has no IPv6 internet connection". See
    [If something is wrong](#if-something-is-wrong).
+5. While you watch, a small round button sits on the picture (top right; drag it anywhere and it stays there next time).
+   Click it, or press `Ctrl + Alt + O` in the player, for the **overlay**: what arrives (resolution, frame rate, bitrate,
+   ping, loss), the **Delay** (**Apply** connects again with it: the picture stops for a few seconds), the **Decoder** and
+   **Mute** (both at once), and **Full Screen**. The player window has no controls or shortcuts of its own:
+   `Ctrl + Alt + Enter` switches full screen, `Esc` leaves it, and closing the window stops watching.
 
 The delay is there on purpose: this is a broadcast that rides out a bumpy connection, not a remote desktop. For remote
 control, use the **Fast** preset (see below).
@@ -96,9 +105,12 @@ control, use the **Fast** preset (see below).
    Every viewer costs one full stream of your upload: 3 viewers at 40 Mbps need about 150 Mbps up, retransmission included.
 2. The panel at the top shows the bitrate, frame rate and dropped frames. The list below shows who is watching, over IPv6 or
    IPv4, their network ping (not the picture delay) and each viewer's delay setting.
-3. In a voice chat with the group? On Windows, pick it under **Sound → Leave out** (for example `Discord.exe`) so
+3. Settings can be changed while you share: they apply at once and viewers stay connected. The encoder restarts for about
+   a second; with **Keyframe on request** a new bitrate does not even do that. A bitrate higher than a viewer started with
+   makes that viewer connect again once (about ten seconds).
+4. In a voice chat with the group? On Windows, pick it under **Sound → Leave out** (for example `Discord.exe`) so
    your friends do not hear themselves come back through the stream. Needs Windows 10 21H1 or newer; one app at a time.
-4. You do not have to go live at all: see the next section.
+5. You do not have to go live at all: see the next section.
 
 ## Connect any time, and remote control
 
@@ -143,7 +155,8 @@ nobody answers is turned down after 50 s.
    closed): turn on **Start HdrCast when I sign in** there, and it is, after every restart.
 
 **As a viewer:** where the sharer gives you control automatically, you are in control as soon as you connect: the player
-window sends your mouse and keyboard to their computer (`Ctrl + Alt + Enter` stays with your player: full screen on/off).
+window sends your mouse and keyboard to their computer (`Ctrl + Alt + Enter`, full screen on/off, and `Ctrl + Alt + O`,
+the overlay, stay with your player).
 **Just Watch** hands control back, **Take Control** takes it again. Where the sharer set Ask Me, click **Request Control**
 and wait for them to allow it. The sharer can **Take Back** control or **Disconnect** you at any time (after a disconnect
 you cannot connect again for a minute).
@@ -175,7 +188,7 @@ The panel on the Watch page says what happened. The usual ones:
 | The signaling server cannot be reached | Your internet is down, or the signaling server is. People already watching keep watching. |
 | Picture stutters, then recovers every few seconds | Raise the delay (China: try a custom 4000-5000 ms), or ask for a lower bitrate. |
 | Colours look grey and flat on an HDR display | HDR is off in the system (Windows: `Win + Alt + B`). |
-| mpv says it cannot open `srt://` | Your mpv has no libsrt: on Windows use the zhongfly / shinchiro build (get-tools.cmd does). Homebrew's mpv has none either: on a Mac keep **Settings → Player input** at **ffmpeg pipe → mpv** (the default there). |
+| mpv says it cannot open `srt://` | Your mpv has no libsrt: on Windows use the zhongfly / shinchiro build (get-tools.cmd does). Homebrew's mpv has none either: on a Mac install `ffmpeg-full` and leave **Settings → Player input** at **Automatic** (or **ffmpeg → HdrCast → mpv**). |
 
 More in [docs/faq.md](docs/faq.md). When you ask a friend for help, send them what **Activity → Copy** gives you:
 passwords and invites are masked in it.
@@ -234,8 +247,8 @@ On Windows, `scripts\get-tools.cmd` downloads or updates ffmpeg and mpv (`sender
 download again), and `scripts\check-tools.cmd` checks the encoders and `srt://` support.
 
 On a Mac, HdrCast finds Homebrew's `ffmpeg-full` by itself (it is keg-only, so it is on no PATH) and takes it over a plain
-`ffmpeg`. Homebrew's mpv has no libsrt, so on a Mac **Settings → Player input** is **ffmpeg pipe → mpv** by default:
-ffmpeg-full receives the stream and hands it to mpv.
+`ffmpeg`. Homebrew's mpv has no libsrt, which does not matter while **Settings → Player input** is **Automatic** (the
+default): ffmpeg-full receives the stream and hands it to mpv.
 
 Settings and logs are in `%APPDATA%\HdrCast\` (macOS: `~/Library/Application Support/HdrCast/`). `group.json` is the same
 file 0.2 used, so an upgrade keeps you in your group. 0.3.1 adds `device.json` (this computer's private device key: never
@@ -296,4 +309,5 @@ design.md and the two checklists are in Chinese for now; network.md and faq.md h
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE). `crates/capture/src/win/nvenc/ffi.rs` carries declarations from NVIDIA's `nvEncodeAPI.h`
+(MIT, © NVIDIA Corporation); its notice is in that file.

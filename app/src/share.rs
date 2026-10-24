@@ -5,7 +5,8 @@
 //! not blocked may watch), or on request, while somebody the rules let in is watching. A join waits for the
 //! rules (`access.rs`), for the user's answer when the rules say to ask, and for the stream to flow before it is
 //! answered, so that the viewer's player finds the stream at once. Remote control is registered per session,
-//! with the key agreed with the viewer's device and the rule of that device.
+//! with the key agreed with the viewer's device and the rule of that device. With "keyframe on request" the
+//! capture engine encodes, and viewers who lose part of the stream get a fresh keyframe (§2.8, §8.12).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,14 +19,18 @@ use hdrcast_core::common::firewall::row as firewall_row;
 use hdrcast_core::group::device;
 use hdrcast_core::group::keys::GroupKeys;
 use hdrcast_core::messages::JoinAnswer;
+use hdrcast_media::keyframe;
+use hdrcast_media::sender::encoder_profiles;
 use hdrcast_media::sender::ffmpeg_command::{self, AudioCodec, FfmpegPlan};
 use hdrcast_media::sender::settings::HdrMode;
-use hdrcast_p2p::{JoinTicket, P2pHost, P2pHostOptions, SwitchableStream, ViewerState};
+use hdrcast_p2p::{JoinTicket, P2pHost, P2pHostOptions, SideUse, SwitchableStream, ViewerState};
 use serde_json::{json, Value};
 
 use crate::access::{AccessSettings, Connect, Control};
 use crate::commands;
 use crate::control_host::ControlHub;
+use crate::keyframe_host::KeyframeHub;
+use crate::net_report::{self, End, NetReport};
 use crate::sender_runner::{self, RunnerState, SendPlan, SenderRunner};
 use crate::state::{self, AppState, Inner};
 
@@ -42,6 +47,9 @@ const RECENTLY_REFUSED: Duration = Duration::from_secs(120);
 const DISCONNECTED_FOR: Duration = Duration::from_secs(60);
 /// How long a viewer let in on request waits for the stream before being told it cannot be served.
 const STREAM_WAIT: Duration = Duration::from_secs(25);
+/// A change of the stream's settings while it runs restarts capture and encoder this long after the last edit:
+/// dragging the bitrate slider or trying out frame rates restarts once, not at every step.
+const RESTART_SETTLE: Duration = Duration::from_millis(800);
 
 /// Who a viewer is, as far as the rules go.
 #[derive(Debug, Clone)]
@@ -89,6 +97,7 @@ struct Session {
     host: Arc<P2pHost>,
     ts: SwitchableStream,
     hub: Arc<ControlHub>,
+    keyframes: Arc<KeyframeHub>,
     runner: SenderRunner,
     keys: GroupKeys,
     /// Broadcasting: the encoder runs regardless of viewers, and asking is skipped (only blocked devices stay out).
@@ -106,6 +115,10 @@ struct Session {
     problem: Mutex<Option<String>>,
     /// Viewers whose request for control the user has been told about.
     control_asks: Mutex<HashSet<String>>,
+    /// Each viewer's network report in the log (by session id).
+    net_reports: Mutex<HashMap<String, NetReport>>,
+    /// The settings changed while streaming in a way only a restart applies: when to do it.
+    restart_due: Mutex<Option<Instant>>,
 }
 
 #[derive(Default)]
@@ -179,7 +192,14 @@ fn build_plan(app: &AppState, inner: &Inner) -> Result<SendPlan, Vec<String>> {
     if sender.audio {
         pipe_names.push(audio_pipe);
     }
-    Ok(SendPlan { capture_exe: state::current_exe(), capture_argv, ffmpeg_exe: ffmpeg, ffmpeg: plan, pipe_names })
+    // keyframe on request: the engine encodes with NVENC itself, ffmpeg adds the sound (§2.8)
+    let engine_encode = if sender.encodes_in_engine() { encoder_profiles::engine_encode_args(&plan.encoder) } else { None };
+    Ok(SendPlan { capture_exe: state::current_exe(), capture_argv, ffmpeg_exe: ffmpeg, ffmpeg: plan, pipe_names, engine_encode })
+}
+
+/// The interval of the keyframes nobody asks for.
+fn gop_of(app: &AppState) -> Duration {
+    Duration::from_secs_f64(app.inner.lock().unwrap().sender.gop_seconds.max(0.1))
 }
 
 // ---- the host session ------------------------------------------------------------------------------------------
@@ -203,6 +223,7 @@ fn start_hosting(app: &Arc<AppState>) -> Result<Arc<Session>, Vec<String>> {
     let session = Arc::new_cyclic(|me: &Weak<Session>| {
         let (firewall_app, rules_app, admit_app, admit_session, demand_session) =
             (weak_app.clone(), weak_app.clone(), weak_app.clone(), me.clone(), me.clone());
+        let keyframes_app = weak_app.clone();
         let host = Arc::new(P2pHost::new(
             P2pHostOptions {
                 group,
@@ -224,6 +245,7 @@ fn start_hosting(app: &Arc<AppState>) -> Result<Arc<Session>, Vec<String>> {
                     }
                 })),
                 on_demand: Some(Arc::new(move || demand_session.upgrade().is_some_and(|s| !s.live.load(Ordering::Acquire)))),
+                offer_keyframes: Some(Arc::new(move || keyframes_app.upgrade().is_some_and(|app| app.inner.lock().unwrap().sender.encodes_in_engine()))),
                 ..P2pHostOptions::default()
             },
             Box::new(ts.clone()),
@@ -236,10 +258,19 @@ fn start_hosting(app: &Arc<AppState>) -> Result<Arc<Session>, Vec<String>> {
         );
         let attach = ts.clone();
         let runner = SenderRunner::new(app.job.clone(), app.logger(), Arc::new(move |stdout| attach.attach(Box::new(stdout))));
+        let (sender, forcer, group_keys) = (me.clone(), me.clone(), keys.clone());
+        let keyframes = KeyframeHub::start(
+            gop_of(app),
+            Arc::new(move |sid, payload| sender.upgrade().is_some_and(|s| s.host.send_side_for(sid, SideUse::Keyframes, payload))),
+            Arc::new(move || forcer.upgrade().is_some_and(|s| s.runner.request_keyframe())),
+            Arc::new(move |sid| group_keys.keyframe_key(sid)),
+            app.logger(),
+        );
         Session {
             host,
             ts,
             hub,
+            keyframes,
             runner,
             keys,
             live: AtomicBool::new(false),
@@ -252,10 +283,23 @@ fn start_hosting(app: &Arc<AppState>) -> Result<Arc<Session>, Vec<String>> {
             starting: Mutex::new(()),
             problem: Mutex::new(None),
             control_asks: Mutex::new(HashSet::new()),
+            net_reports: Mutex::new(HashMap::new()),
+            restart_due: Mutex::new(None),
         }
     });
-    let hub = session.hub.clone();
-    session.host.set_side_handler(Arc::new(move |sid, payload| hub.on_datagram(sid, payload)));
+    // the side channel carries remote control and keyframe requests: they tell themselves apart by their first byte
+    let (hub, keyframes) = (session.hub.clone(), session.keyframes.clone());
+    session.host.set_side_handler(Arc::new(move |sid, payload| {
+        if keyframe::is_keyframe_datagram(payload) {
+            keyframes.on_datagram(sid, payload);
+        } else {
+            hub.on_datagram(sid, payload);
+        }
+    }));
+    let keyframes = session.keyframes.clone();
+    session.host.on_stream_event(move |sid, event| keyframes.stream_event(sid, event));
+    let keyframes = session.keyframes.clone();
+    session.runner.on_news(move |news| keyframes.encoder_news(news));
 
     if let Err(e) = session.host.start() {
         app.log(&format!("[app] cannot start the group session: {e}"));
@@ -271,6 +315,7 @@ impl Session {
     fn shut_down(&self) {
         self.runner.stop();
         self.hub.stop();
+        self.keyframes.stop();
         self.host.stop();
         self.ts.close();
     }
@@ -329,6 +374,63 @@ pub fn settings_changed(app: &AppState) {
     session.host.set_stream(bitrate, max);
     if let Some(ffmpeg) = ffmpeg {
         session.host.set_ffmpeg_path(ffmpeg.into_os_string());
+    }
+    session.keyframes.set_gop(gop_of(app));
+    // "kf" in the live record follows the switch (it applies to the next stream that starts)
+    session.host.announce_now();
+    apply_while_streaming(app, &session);
+}
+
+/// What a change of the settings means for the stream that runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlanChange {
+    Same,
+    /// Only the bitrate moved, and the engine encodes: it takes the new rate (and its buffer) without a restart.
+    Bitrate { kbps: u32, vbv_kbits: u32 },
+    /// Anything else (or a bitrate ffmpeg encodes with): capture and encoder start again with the new plan.
+    Restart,
+}
+
+fn plan_change(running: &SendPlan, wanted: &SendPlan) -> PlanChange {
+    if running == wanted {
+        return PlanChange::Same;
+    }
+    let (Some(now), Some(next)) = (&running.engine_encode, &wanted.engine_encode) else { return PlanChange::Restart };
+    // the wanted plan at the running bitrate: the same as the running one when nothing else changed
+    let mut at_running_rate = wanted.clone();
+    at_running_rate.ffmpeg.encoder.bitrate_kbps = running.ffmpeg.encoder.bitrate_kbps;
+    if let Some(encode) = &mut at_running_rate.engine_encode {
+        (encode.bitrate_kbps, encode.vbv_kbits) = (now.bitrate_kbps, now.vbv_kbits);
+    }
+    if at_running_rate == *running {
+        PlanChange::Bitrate { kbps: next.bitrate_kbps, vbv_kbits: next.vbv_kbits }
+    } else {
+        PlanChange::Restart
+    }
+}
+
+/// The settings changed while the stream runs (docs/design.md §2.7): a new bitrate goes to an engine that encodes,
+/// without a break; any other change of the stream restarts capture and encoder a moment later. The viewers stay
+/// connected through a restart: the new encoder's stream joins the same fan-out, as after a crash.
+fn apply_while_streaming(app: &AppState, session: &Session) {
+    if !matches!(session.runner.state(), RunnerState::Starting | RunnerState::Streaming) {
+        return; // the next start takes the settings as they are
+    }
+    let Some(running) = session.runner.plan() else { return };
+    let wanted = {
+        let inner = app.inner.lock().unwrap();
+        build_plan(app, &inner)
+    };
+    let Ok(wanted) = wanted else { return }; // settings that cannot stream: the running stream goes on as it is
+    let mut due = session.restart_due.lock().unwrap();
+    match plan_change(&running, &wanted) {
+        PlanChange::Same => *due = None, // changed back before the restart came
+        PlanChange::Bitrate { kbps, vbv_kbits } if session.runner.set_bitrate(kbps, vbv_kbits) => {
+            session.runner.adopt_plan(wanted);
+            *due = None;
+            app.log(&format!("[app] bitrate now {} Mbps: the running encoder took it, no restart", kbps / 1000));
+        }
+        _ => *due = Some(Instant::now() + RESTART_SETTLE),
     }
 }
 
@@ -445,6 +547,7 @@ fn admit_in_background(app: &Arc<AppState>, session: &Arc<Session>, ticket: Join
                 let control = control_rule(&app.inner.lock().unwrap().access, &admitted);
                 let key = device_key.unwrap_or_else(|| session.keys.control_key(&ticket.sid));
                 session.hub.register(&ticket.sid, &who.name, &key, control.policy());
+                session.keyframes.register(&ticket.sid, &who.name);
                 session.admitted.lock().unwrap().insert(ticket.sid.clone(), admitted);
                 session.recent_ok.lock().unwrap().insert(who.id.clone(), Instant::now());
             }
@@ -606,6 +709,28 @@ pub fn housekeeping(app: &Arc<AppState>) {
     let viewers = session.host.viewers();
     let sids: Vec<String> = viewers.iter().map(|v| v.sid.clone()).collect();
     session.hub.keep_only(&sids);
+    session.keyframes.keep_only(&sids);
+    let restart = {
+        let mut due = session.restart_due.lock().unwrap();
+        if due.is_some_and(|at| Instant::now() >= at) {
+            due.take()
+        } else {
+            None
+        }
+    };
+    if restart.is_some() {
+        let (app, session) = (app.clone(), session.clone());
+        thread::spawn(move || {
+            let _one_at_a_time = session.starting.lock().unwrap();
+            // looked at again under the lock: the stream may have stopped meanwhile
+            if matches!(session.runner.state(), RunnerState::Starting | RunnerState::Streaming) {
+                app.log("[app] the stream's settings changed: starting capture and encoder again (viewers stay connected)");
+                if let Err(problems) = start_runner(&app, &session) {
+                    app.log(&format!("[app] the new settings cannot stream ({}); the stream goes on as it was", problems.join(" ")));
+                }
+            }
+        });
+    }
     // A viewer asks for control: like a request to watch, it reaches the user even with the window out of sight.
     let asking: HashSet<String> = sids.iter().filter(|sid| session.hub.state_of(sid) == "requested").cloned().collect();
     let newly_asked = {
@@ -628,6 +753,21 @@ pub fn housekeeping(app: &Arc<AppState>) {
     }
     session.recent_no.lock().unwrap().retain(|_, at| at.elapsed() < RECENTLY_REFUSED);
     session.disconnected.lock().unwrap().retain(|_, at| at.elapsed() < DISCONNECTED_FOR);
+    {
+        let mut reports = session.net_reports.lock().unwrap();
+        reports.retain(|sid, _| sids.contains(sid));
+        for viewer in &viewers {
+            let report = reports.entry(viewer.sid.clone()).or_insert_with(|| NetReport::new(End::Host));
+            let flowing = viewer.srt.as_ref().is_some_and(|s| s.total.sent > 0);
+            if let Some(line) = report.queue_line(viewer.queue_clears, flowing) {
+                app.log(&format!("[net] {}: {line}", viewer.name));
+            }
+            let Some(stats) = &viewer.srt else { continue };
+            if let Some(line) = report.line(stats) {
+                app.log(&format!("[net] {}, {line}", viewer.name));
+            }
+        }
+    }
 
     let expired: Vec<Knock> = {
         let mut knocks = session.knocks.lock().unwrap();
@@ -717,6 +857,7 @@ pub fn status(app: &AppState) -> Value {
                 "rttMs": v.rtt_ms,
                 "latencyMs": v.latency_ms,
                 "overheadPercent": v.overhead_percent,
+                "net": v.srt.as_ref().map(|s| net_report::status(s, End::Host)),
                 "control": session.hub.state_of(&v.sid),
             })
         })
@@ -749,6 +890,7 @@ pub fn status(app: &AppState) -> Value {
         })),
         "encode": run.progress.map(|p| json!({
             "fps": p.fps, "frame": p.frame, "bitrateKbps": p.bitrate_kbps, "speed": p.speed, "dropFrames": p.drop_frames,
+            "inEngine": run.in_engine,
         })),
         // What is really being sent, as the engine announced it; the plan only says what was expected.
         "video": run.layout.map(|l| {
@@ -772,4 +914,42 @@ pub fn status(app: &AppState) -> Value {
         "problem": session.problem.lock().unwrap().clone(),
         "device": device,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hdrcast_capture::{EncodeArgs, EngineEncoder};
+
+    /// A plan whose engine encodes at `kbps` (with the quarter second of VBV the settings give it).
+    fn engine_plan(kbps: u32) -> SendPlan {
+        let mut plan = SendPlan::default();
+        plan.ffmpeg.encoder.bitrate_kbps = kbps;
+        plan.engine_encode =
+            Some(EncodeArgs { bitrate_kbps: kbps, vbv_kbits: kbps / 4, ..EncodeArgs::defaults(EngineEncoder::Nvenc, 60) });
+        plan
+    }
+
+    #[test]
+    fn a_new_bitrate_goes_to_an_engine_that_encodes_anything_else_restarts() {
+        let running = engine_plan(40_000);
+        assert!(matches!(plan_change(&running, &running.clone()), PlanChange::Same));
+        assert!(matches!(
+            plan_change(&running, &engine_plan(25_000)),
+            PlanChange::Bitrate { kbps: 25_000, vbv_kbits: 6_250 }
+        ));
+        // the bitrate and anything else: a restart
+        let mut more = engine_plan(25_000);
+        more.ffmpeg.fps = 120;
+        assert!(matches!(plan_change(&running, &more), PlanChange::Restart));
+        // from the engine to ffmpeg (Keyframe on request switched off), and back
+        let mut by_ffmpeg = running.clone();
+        by_ffmpeg.engine_encode = None;
+        assert!(matches!(plan_change(&running, &by_ffmpeg), PlanChange::Restart));
+        assert!(matches!(plan_change(&by_ffmpeg, &running), PlanChange::Restart));
+        // ffmpeg cannot change its bitrate while it runs
+        let mut lower = by_ffmpeg.clone();
+        lower.ffmpeg.encoder.bitrate_kbps = 25_000;
+        assert!(matches!(plan_change(&by_ffmpeg, &lower), PlanChange::Restart));
+    }
 }

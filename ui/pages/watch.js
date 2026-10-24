@@ -94,7 +94,7 @@ export function WatchPage() {
     </div>
     ${live.hosts.some((h) => h.onDemand) && html`<div class="section-note">${t('watch.onDemandNote')}</div>`}
 
-    <${Section} title=${t('watch.connection')} note=${t('watch.latencyNote')}>
+    <${Section} title=${t('watch.connection')} note=${watching ? t('watch.latencyNoteWatching') : t('watch.latencyNote')}>
       <${Row} name=${t('watch.latency')} hint=${t('watch.latencyHint')} disabled=${watching}>
         <${Segmented} value=${presetValue} onChange=${(v) => { setCustom(v < 0); if (v > 0) set({ latencyMs: v }); }}
           options=${presets.map((p) => ({ value: p.latencyMs, label: t('preset.' + p.name, null, p.name) })).concat([{ value: -1, label: t('watch.custom') }])} />
@@ -128,10 +128,11 @@ function displayHint(mode, platform) {
 }
 
 // "IPv6 [2400:…]:51234, ping 38 ms" -> "IPv6 · ping 38 ms" (the full address is in the line above)
-function shortPath(path) {
+function shortPath(path, net) {
   if (!path) return ' ';
   const ping = /ping [\d.]+ ms/.exec(path);
-  return path.split(' ')[0] + (ping ? ' · ' + ping[0] : '');
+  const loss = net?.lossPercent >= 0.05 ? ' · ' + t('watch.loss', { p: net.lossPercent.toFixed(1) }) : '';
+  return path.split(' ')[0] + (ping ? ' · ' + ping[0] : '') + loss;
 }
 
 function pillOf(session, playing) {
@@ -160,6 +161,15 @@ function ControlLine({ watch }) {
   </div>`;
 }
 
+/** What the guard did with pictures damaged on the way (null when mpv receives the stream itself). */
+function GuardLine({ guard }) {
+  if (!guard) return null;
+  if (guard.frozen) return html`<div class="hero-sub" style="margin-top:-6px">${t('watch.guardFrozen')}</div>`;
+  if (!guard.losses && !guard.heldBack) return null;
+  return html`<div class="hero-sub" style="margin-top:-6px">
+    ${t('watch.guardSummary', { losses: guard.losses, held: guard.heldBack, freezes: guard.freezes })}</div>`;
+}
+
 function NowPlaying({ watch }) {
   const session = watch.session;
   const player = watch.player;
@@ -175,6 +185,8 @@ function NowPlaying({ watch }) {
         <div class="hero-sub">${session?.state === 'approval' ? t('watch.approvalSub', { host: watch.hostName }) : session?.status || ''}</div>
       </div>
       <span class="live-pill"><span class=${'dot' + (playing ? ' pulse' : '')}></span>${pill}${playing && player ? ' ' + formatDuration(player.uptimeSec) : ''}</span>
+      ${!refused && html`<button class="btn" title=${t('watch.overlayHint')} aria-pressed=${watch.overlay ? 'true' : 'false'}
+        onClick=${() => invoke('overlay_toggle').catch(() => {})}><${Icon} name="sliders" />${t('watch.overlay')}</button>`}
       ${!refused && html`<button class="btn" disabled=${!player || player.state === 'idle'} onClick=${() => invoke('watch_fullscreen').catch(() => {})}>
         <${Icon} name="expand" />${t('watch.fullscreenBtn')}</button>`}
       <button class="btn solid" onClick=${stopWatch}>${refused ? t('common.close') : html`<${Icon} name="stop" />${t('watch.stop')}`}</button>
@@ -188,12 +200,13 @@ function NowPlaying({ watch }) {
         <div class="s">${player?.hwdec || ' '}</div></div>
       <div class="tile"><div class="k">${t('watch.tBitrate')}</div>
         <div class="v">${player?.bitrateMbps != null ? player.bitrateMbps.toFixed(1) : '—'}<small>Mbps</small></div>
-        <div class="s">${shortPath(session?.path)}</div></div>
+        <div class="s">${shortPath(session?.path, session?.net)}</div></div>
       <div class="tile"><div class="k">${t('watch.tDropped')}</div>
         <div class="v">${player ? player.drops + player.decoderDrops : '—'}</div>
         <div class="s">${player?.hdr ? t('watch.hdrActive') : (player?.output || ' ')}</div></div>
     </div>`}
     ${!refused && html`<${ControlLine} watch=${watch} />`}
+    ${!refused && html`<${GuardLine} guard=${player?.guard} />`}
     ${!refused && player?.source && html`<div class="hero-sub" style="margin-top:-6px">${player.source}</div>`}
   </div>`;
 }

@@ -24,3 +24,5 @@ libc = "0.2.190"
 
 [dev-dependencies]
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
+# the guard, for the test of the whole viewer path under loss (tests/lossy_path_tests.rs)
+hdrcast-media = { path = "../media" }

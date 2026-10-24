@@ -101,7 +101,7 @@ mod receiver_settings_clamp {
                 "0123456789abcdef",
                 "ipc",
                 Path::new("mpv"),
-                Some(Path::new("ffmpeg")), // a Mac's default player input is the ffmpeg pipe
+                None,
                 platform,
             )
             .unwrap();

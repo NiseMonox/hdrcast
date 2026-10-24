@@ -1,10 +1,12 @@
 //! HLSL source of the desktop -> P010 / NV12 conversion compute shader (design.md section 2.3), compiled at
-//! runtime with d3dcompiler_47 (cs_5_0). Two entry points share the helpers:
+//! runtime with d3dcompiler_47 (cs_5_0). The entry points share the helpers:
 //!   main_p010 - one thread per 2x2 block (8x8 groups): 4 luma + 1 averaged chroma pair, 4-byte stores.
 //!   main_nv12 - one thread per 4 Y bytes / per 2 chroma pairs (linear addressing): RWByteAddressBuffer
 //!               stores are 4-byte aligned, and an NV12 row is W bytes, so 2x2 blocks cannot be written
 //!               directly when W % 4 == 2 (e.g. 1366-wide displays). Colour maths is cheap for SDR, so the
 //!               2x recompute of the chroma path does not matter.
+//!   main_p010_planes, main_nv12_planes - zero copy (design.md section 2.8): the same values, one thread per
+//!               2x2 block, written into the two planes of the encoder's P010 / NV12 texture (typed UAVs).
 //! Constant buffer layout must match [`ShaderParams`] (64 bytes).
 
 pub const FLAG_CURSOR_VISIBLE: u32 = 1;
@@ -17,9 +19,12 @@ pub const FLAG_SOURCE_IS_HDR_FORCED_SDR: u32 = 8;
 
 pub const ENTRY_P010: &str = "main_p010";
 pub const ENTRY_NV12: &str = "main_nv12";
+/// Zero copy: into the planes of a P010 / NV12 texture (luma view at u1, chroma view at u2).
+pub const ENTRY_P010_PLANES: &str = "main_p010_planes";
+pub const ENTRY_NV12_PLANES: &str = "main_nv12_planes";
 pub const PROFILE: &str = "cs_5_0";
 
-/// Threads per group in X and Y for main_p010 (each thread = one 2x2 block).
+/// Threads per group in X and Y for main_p010 and both `_planes` entry points (each thread = one 2x2 block).
 pub const P010_GROUP_SIZE: u32 = 8;
 /// Threads per group for main_nv12 (1-D, folded into a 2-D dispatch of [`NV12_GROUPS_X`] columns).
 pub const NV12_GROUP_SIZE: u32 = 64;
@@ -93,9 +98,10 @@ mod tests {
     }
 
     #[test]
-    fn both_entry_points_are_in_the_source() {
-        assert!(SOURCE.contains("void main_p010("));
-        assert!(SOURCE.contains("void main_nv12("));
+    fn every_entry_point_is_in_the_source() {
+        for entry in [ENTRY_P010, ENTRY_NV12, ENTRY_P010_PLANES, ENTRY_NV12_PLANES] {
+            assert!(SOURCE.contains(&format!("void {entry}(")), "{entry}");
+        }
         assert!(SOURCE.trim_end().ends_with('}'));
     }
 }

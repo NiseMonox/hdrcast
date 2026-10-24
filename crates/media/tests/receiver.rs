@@ -22,8 +22,6 @@ fn settings(display: DisplayMode) -> ReceiverSettings {
         latency_ms: 1500,
         expected_bitrate_mbps: 60,
         display_mode: display,
-        // mpv opening srt:// itself on every machine (a Mac's default is the pipe, which has tests of its own)
-        frontend: ReceiverFrontend::MpvDirect,
         ..ReceiverSettings::default()
     }
     .normalized()
@@ -232,19 +230,18 @@ mod mpv_command_line {
     }
 
     #[test]
-    fn ffmpeg_fallback_pipes_a_copy_into_mpv_stdin() {
+    fn the_ffmpeg_pipe_hands_the_raw_stream_to_the_guard_and_mpv_stdin() {
         let mut s = settings(DisplayMode::Auto);
         s.frontend = ReceiverFrontend::FfmpegPipe;
         let plan = build_on(Platform::Windows, &s, 1, "mpv", Some(r"C:\ff\ffmpeg.exe"));
         assert!(plan.uses_ffmpeg_pipe());
         let ffmpeg_args = plan.ffmpeg_args.as_ref().unwrap();
-        assert!(ffmpeg_args.iter().any(|a| a == "-c"));
-        assert!(ffmpeg_args.iter().any(|a| a == "copy"));
         assert_eq!(plan.mpv_args.last().unwrap(), "-"); // mpv reads stdin
         assert!(plan.to_command_line().contains(" | "));
+        // -f data in and out: the SRT payload byte for byte, continuity counters and all (docs/design.md §3.2)
         assert_eq!(
             ffmpeg_args.join(" "),
-            format!("-hide_banner -loglevel warning -nostdin -fflags nobuffer -flags low_delay -i {} -c copy -f mpegts -muxdelay 0 -muxpreload 0 pipe:1", plan.url)
+            format!("-hide_banner -loglevel warning -nostdin -f data -i {} -map 0 -c copy -f data -flush_packets 1 pipe:1", plan.url)
         );
         // stdin is not a terminal and not a seekable file: mpv is told both
         assert_eq!(flag(&plan.mpv_args, "demuxer-lavf-format"), "mpegts");
@@ -257,6 +254,17 @@ mod mpv_command_line {
         );
         assert_eq!(direct.ffmpeg_command_line(), None);
         assert_eq!(direct.to_command_line(), direct.mpv_command_line());
+    }
+
+    #[test]
+    fn automatic_uses_the_pipe_whenever_ffmpeg_is_there() {
+        let auto = settings(DisplayMode::Auto);
+        assert_eq!(auto.frontend, ReceiverFrontend::Auto, "the default");
+        assert!(build_on(Platform::Windows, &auto, 1, "mpv", Some("ffmpeg")).uses_ffmpeg_pipe());
+        assert!(!build_on(Platform::Windows, &auto, 1, "mpv", None).uses_ffmpeg_pipe(), "no ffmpeg: mpv direct");
+        assert!(!build_on(Platform::Windows, &auto, 1, "mpv", Some("")).uses_ffmpeg_pipe());
+        let direct = ReceiverSettings { frontend: ReceiverFrontend::MpvDirect, ..auto };
+        assert!(!build_on(Platform::Windows, &direct, 1, "mpv", Some("ffmpeg")).uses_ffmpeg_pipe(), "asked for");
     }
 
     #[test]
@@ -333,8 +341,15 @@ mod mpv_command_line {
             "--demuxer-lavf-probesize=5000000",
             "--demuxer-lavf-analyzeduration=2",
             r"--input-ipc-server=\\.\pipe\hdrcast-mpv-4321",
+            "--config=no",
+            "--input-default-bindings=no",
+            "--window-dragging=no",
+            "--drag-and-drop=no",
             "--keep-open=no",
             "--force-window=yes",
+            "--osc=no",
+            "--osd-bar=no",
+            "--media-controls=no",
             "--title=HdrCast",
             "--msg-level=all=info",
             "--term-status-msg=",
@@ -378,8 +393,15 @@ mod mpv_command_line {
             "--demuxer-lavf-analyzeduration=2",
             "--demuxer-lavf-format=mpegts",
             r"--input-ipc-server=\\.\pipe\hdrcast-mpv-7",
+            "--config=no",
+            "--input-default-bindings=no",
+            "--window-dragging=no",
+            "--drag-and-drop=no",
             "--keep-open=no",
             "--force-window=yes",
+            "--osc=no",
+            "--osd-bar=no",
+            "--media-controls=no",
             "--title=HdrCast",
             "--msg-level=all=info",
             "--term-status-msg=",
@@ -430,8 +452,14 @@ mod macos {
             "--demuxer-lavf-probesize=5000000",
             "--demuxer-lavf-analyzeduration=2",
             "--input-ipc-server=/tmp/hdrcast-mpv-9.sock",
+            "--config=no",
+            "--input-default-bindings=no",
+            "--window-dragging=no",
+            "--drag-and-drop=no",
             "--keep-open=no",
             "--force-window=yes",
+            "--osc=no",
+            "--osd-bar=no",
             "--title=HdrCast",
             "--msg-level=all=info",
             "--term-status-msg=",
@@ -439,7 +467,8 @@ mod macos {
         ];
         assert_eq!(mac.mpv_args, expected);
 
-        // the same settings on Windows: one argument more, one different, the rest identical
+        // the same settings on Windows: two arguments more (the D3D11 API, no Windows media overlay), one
+        // different, the rest identical
         let windows = mpv_command::build(
             &s,
             LOCAL_PORT,
@@ -453,7 +482,7 @@ mod macos {
         let without: Vec<&String> = windows
             .mpv_args
             .iter()
-            .filter(|a| *a != "--gpu-api=d3d11")
+            .filter(|a| *a != "--gpu-api=d3d11" && *a != "--media-controls=no")
             .collect();
         assert_eq!(without.len(), mac.mpv_args.len());
         let different: Vec<_> = without
@@ -935,25 +964,6 @@ mod receiver_settings {
         assert!(s.validate().is_empty());
         assert_eq!(s.clone().normalized(), s);
         assert_eq!(s.hw_dec, HwDecMode::D3d11va); // = the platform's hardware decoder
-    }
-
-    #[test]
-    fn a_mac_plays_through_the_ffmpeg_pipe_by_default() {
-        // Homebrew's mpv cannot open srt:// (no libsrt); its ffmpeg-full can
-        assert_eq!(ReceiverSettings::defaults_for(Platform::MacOs).frontend, ReceiverFrontend::FfmpegPipe);
-        for platform in [Platform::Windows, Platform::Other] {
-            assert_eq!(ReceiverSettings::defaults_for(platform).frontend, ReceiverFrontend::MpvDirect, "{platform:?}");
-        }
-        // and that is the only difference
-        let mac = ReceiverSettings {
-            frontend: ReceiverFrontend::MpvDirect,
-            ..ReceiverSettings::defaults_for(Platform::MacOs)
-        };
-        assert_eq!(mac, ReceiverSettings::defaults_for(Platform::Windows));
-        // a file without the field gets this platform's default; what a file says is kept
-        assert_eq!(ReceiverSettings::from_json("{}"), Some(ReceiverSettings::default()));
-        assert_eq!(ReceiverSettings::from_json(r#"{"frontend":0}"#).unwrap().frontend, ReceiverFrontend::MpvDirect);
-        assert_eq!(ReceiverSettings::from_json(r#"{"frontend":1}"#).unwrap().frontend, ReceiverFrontend::FfmpegPipe);
     }
 
     #[test]

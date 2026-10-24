@@ -107,9 +107,11 @@ fn a_sender_file_written_by_0_2_4_is_read_whole() {
         quality: QualityPreset::Quality,
         bitrate_mbps: 80,
         gop_seconds: 1.5,
-        buffer_seconds: 2.0,
+        // 2 s was the default buffer, which no page ever offered: it becomes today's (0.3.2)
+        buffer_seconds: SenderSettings::DEFAULT_BUFFER_SECONDS,
         b_frames: false,
         lookahead: true,
+        keyframe_on_request: false,
         audio: true,
         audio_device: "{0.0.0.00000000}.{6f1b7a3c-0000-4000-8000-000000000001}".to_string(),
         audio_codec: AudioCodec::Opus,
@@ -118,8 +120,38 @@ fn a_sender_file_written_by_0_2_4_is_read_whole() {
         max_viewers: 6,
         upload_mbps: 1000,
         ffmpeg_path: r"D:\HdrCast-0.2.4\tools\ffmpeg.exe".to_string(),
+        settings_version: SenderSettings::SETTINGS_VERSION,
     };
     assert_eq!(s, expected);
+}
+
+#[test]
+fn the_old_default_keyframe_interval_and_buffer_become_todays_once() {
+    let dir = TempDir::new("sender-0-3-1");
+    let path = dir.file(SenderSettings::FILE_NAME);
+    let load = |text: &str| {
+        std::fs::write(&path, text).unwrap();
+        SenderSettings::load(&path)
+    };
+    // what 0.3.1 wrote with its defaults
+    let s = load(r#"{"bitrateMbps":40,"gopSeconds":2.0,"bufferSeconds":2.0}"#);
+    assert_eq!((s.gop_seconds, s.buffer_seconds, s.settings_version), (1.0, 0.25, SenderSettings::SETTINGS_VERSION));
+    // other values were chosen: they stay
+    let s = load(r#"{"gopSeconds":3.0,"bufferSeconds":1.0}"#);
+    assert_eq!((s.gop_seconds, s.buffer_seconds), (3.0, 1.0));
+    // written since: 2 s is a choice now
+    let s = load(r#"{"gopSeconds":2.0,"bufferSeconds":2.0,"settingsVersion":1}"#);
+    assert_eq!((s.gop_seconds, s.buffer_seconds), (2.0, 2.0));
+    // saved and read back: the number goes into the file
+    s.save(&path).unwrap();
+    assert!(std::fs::read_to_string(&path).unwrap().contains("\"settingsVersion\": 1"));
+    assert_eq!(SenderSettings::load(&path), s);
+    // fresh settings have today's values; a file without the two has them too
+    let fresh = SenderSettings::default();
+    assert_eq!((fresh.gop_seconds, fresh.buffer_seconds, fresh.settings_version), (1.0, 0.25, 1));
+    assert_eq!(load("{}").gop_seconds, 1.0);
+    // the buffer may go down to a quarter of a second now (0.5 s before)
+    assert_eq!(load(r#"{"bufferSeconds":0.1,"settingsVersion":1}"#).buffer_seconds, 0.25);
 }
 
 #[test]
@@ -150,10 +182,15 @@ fn a_receiver_file_written_by_0_2_4_is_read_whole() {
 #[test]
 fn the_field_names_and_their_order_are_the_data_member_names() {
     let sender = serde_json::to_value(SenderSettings::defaults_for(Platform::Windows)).unwrap();
-    assert_eq!(
-        keys(&sender),
-        keys(&serde_json::from_str::<Value>(SENDER_0_2_4).unwrap())
-    );
+    // 0.2.4's members in its order, with 0.3.3's switch next to the other encoder options, then the number
+    // 0.3.2 added
+    let csharp = serde_json::from_str::<Value>(SENDER_0_2_4).unwrap();
+    let mut expected = keys(&csharp);
+    let (keyframes, version) = ("keyframeOnRequest".to_string(), "settingsVersion".to_string());
+    let after = expected.iter().position(|k| *k == "lookahead").unwrap() + 1;
+    expected.insert(after, &keyframes);
+    expected.push(&version);
+    assert_eq!(keys(&sender), expected);
     assert_eq!(
         keys(&sender),
         [
@@ -172,6 +209,7 @@ fn the_field_names_and_their_order_are_the_data_member_names() {
             "bufferSeconds",
             "bFrames",
             "lookahead",
+            "keyframeOnRequest",
             "audio",
             "audioDevice",
             "audioCodec",
@@ -180,6 +218,7 @@ fn the_field_names_and_their_order_are_the_data_member_names() {
             "maxViewers",
             "uploadMbps",
             "ffmpegPath",
+            "settingsVersion",
         ]
     );
     let receiver = serde_json::to_value(ReceiverSettings::default()).unwrap();
@@ -227,16 +266,17 @@ fn enums_are_written_as_their_numbers() {
         (&sender["quality"], &sender["audioCodec"]),
         (&json!(2), &json!(2))
     );
-    // the defaults of a Windows sender, as 0.2.4 would have written them
+    // the defaults of a Windows sender, as 0.2.4 would have written them but for 0.3.2's keyframe interval and
+    // buffer, and the number that says so
     let defaults = serde_json::to_value(SenderSettings::defaults_for(Platform::Windows)).unwrap();
     assert_eq!(
         defaults,
         json!({
             "outputIndex": 0, "outputDeviceName": "", "outputFriendlyName": "", "fps": 60, "scale": 0, "hdrMode": 0,
-            "cursor": true, "sdrWhite": 80.0, "encoder": 0, "quality": 1, "bitrateMbps": 40, "gopSeconds": 2.0,
-            "bufferSeconds": 2.0, "bFrames": true, "lookahead": true, "audio": true, "audioDevice": "default",
+            "cursor": true, "sdrWhite": 80.0, "encoder": 0, "quality": 1, "bitrateMbps": 40, "gopSeconds": 1.0,
+            "bufferSeconds": 0.25, "bFrames": true, "lookahead": true, "keyframeOnRequest": false, "audio": true, "audioDevice": "default",
             "audioCodec": 1, "audioBitrateKbps": 192, "audioExcludeApp": "", "maxViewers": 4, "uploadMbps": 0,
-            "ffmpegPath": ""
+            "ffmpegPath": "", "settingsVersion": 1
         })
     );
 
@@ -255,9 +295,8 @@ fn enums_are_written_as_their_numbers() {
         ),
         (&json!(1), &json!(3), &json!(1))
     );
-    // the defaults of a Windows viewer, as 0.2.4 would have written them (a Mac's player input is the pipe)
     assert_eq!(
-        serde_json::to_value(ReceiverSettings::defaults_for(Platform::Windows)).unwrap(),
+        serde_json::to_value(ReceiverSettings::default()).unwrap(),
         json!({
             "latencyMs": 1500, "expectedBitrateMbps": 100, "displayMode": 0, "toneMapping": "bt.2390", "hwDec": 1,
             "bufferSeconds": 1.5, "fullscreen": false, "fullscreenScreen": 0, "frontend": 0, "mpvPath": "",
@@ -274,12 +313,13 @@ fn missing_fields_are_defaults_and_unknown_ones_are_ignored() {
         s,
         SenderSettings {
             bitrate_mbps: 25,
+            settings_version: 0, // no number: a file from before 0.3.2
             ..SenderSettings::default()
         }
     );
     assert_eq!(
         serde_json::from_str::<SenderSettings>("{}").unwrap(),
-        SenderSettings::default()
+        SenderSettings { settings_version: 0, ..SenderSettings::default() }
     );
 
     let r: ReceiverSettings =
@@ -316,14 +356,14 @@ fn numbers_that_name_no_enum_value_do_not_cost_the_other_settings() {
     assert_eq!(s.normalized().encoder, SenderSettings::default().encoder);
 
     let r: ReceiverSettings =
-        serde_json::from_str(r#"{"displayMode":9,"hwDec":42,"frontend":2,"latencyMs":2000}"#)
+        serde_json::from_str(r#"{"displayMode":9,"hwDec":42,"frontend":7,"latencyMs":2000}"#)
             .unwrap();
     assert_eq!(
         (r.display_mode, r.hw_dec, r.frontend),
         (
             DisplayMode::Auto,
             HwDecMode::D3d11va,
-            ReceiverFrontend::MpvDirect
+            ReceiverFrontend::Auto
         )
     );
     assert_eq!(r.latency_ms, 2000);

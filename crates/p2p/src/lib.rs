@@ -24,7 +24,9 @@ pub mod peer_session;
 pub mod remux_child;
 mod router_http;
 pub mod side_channel;
+pub mod simulated_loss;
 pub mod signaling_client;
+pub mod srt_monitor;
 pub mod switchable_stream;
 pub mod ts_fan_out;
 pub mod udp_channel;
@@ -39,16 +41,18 @@ pub use control_packet::{ControlType, PeerRole};
 pub use host_link::{HostLink, HostSessionInfo, HostSideHandler};
 pub use link_base::{LinkAddresses, SOURCE_ECHO, SOURCE_ROUTER};
 pub use local_addresses::AddressCandidate;
-pub use p2p_host::{AdmitFn, JoinTicket, P2pHost, P2pHostOptions, ViewerInfo, ViewerState};
+pub use p2p_host::{AdmitFn, JoinTicket, P2pHost, P2pHostOptions, SideUse, StreamEvent, ViewerInfo, ViewerState};
 pub use peer_session::{LinkState, Outgoing, PeerSession};
 pub use remux_child::{RemuxChild, RemuxInput};
 pub use signaling_client::{LiveEntry, SignalingClient, SignalingError};
+pub use simulated_loss::SimulatedLoss;
+pub use srt_monitor::{SrtCounts, SrtMonitor, SrtStats};
 pub use switchable_stream::SwitchableStream;
 pub use ts_fan_out::TsFanOut;
 pub use udp_channel::{mono_clock, ChannelIo, PacketFilter, UdpChannel};
 pub use upnp::{PortMappingOptions, PortMappingState, RouterPortMapping, UpnpError, UpnpGateway};
 pub use util::LogFn;
-pub use viewer_link::{ViewerLink, ViewerSideHandler};
+pub use viewer_link::{LastingLossHandler, ViewerLink, ViewerSideHandler};
 pub use viewer_session::{ViewerSession, ViewerSessionOptions, ViewerSessionState};
 
 /// Why a [`P2pHost`] or a [`ViewerSession`] could not start. The text goes into the app's log after
@@ -88,6 +92,7 @@ mod tests {
         shared::<TsFanOut>();
         shared::<RemuxChild>();
         shared::<PeerSession>();
+        shared::<SrtMonitor>();
         shared::<UdpChannel>();
         shared::<CancelToken>();
         shared::<P2pHostOptions>();

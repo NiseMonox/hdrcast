@@ -15,7 +15,7 @@ use hdrcast_media::receiver::mpv_ipc::{
     self, observed, MpvIpcMessage, MpvStatusModel, MpvVideoParams,
 };
 use hdrcast_media::receiver::mpv_log;
-use hdrcast_media::receiver::{DisplayMode, HwDecMode, MpvExitReason, ReceiverSettings};
+use hdrcast_media::receiver::{DisplayMode, HwDecMode, MpvExitReason, ReceiverFrontend, ReceiverSettings};
 use hdrcast_media::sender::encoder_probe;
 use hdrcast_media::sender::encoder_profiles::{self, EncoderSettings, QualityPreset, VideoEncoder};
 use hdrcast_media::sender::ffmpeg_command::{self, AudioCodec, FfmpegPlan};
@@ -283,6 +283,7 @@ fn every_encoder_option_list_is_the_one_the_csharp_built() {
 fn plan_of(v: &Value) -> FfmpegPlan {
     FfmpegPlan {
         video_pipe_name: str_of(&v["videoPipe"]).to_string(),
+        video_input: Default::default(),
         audio_pipe_name: v["audioPipe"].as_str().map(str::to_string),
         pixel_format: capture_format(str_of(&v["format"])),
         width: u32_of(&v["width"]),
@@ -476,8 +477,31 @@ fn sender_settings_files_are_read_normalised_and_used_like_the_csharp_did() {
 
         let mut s = raw;
         s.normalize_for(Platform::Windows);
-        let ours = serde_json::to_value(&s).unwrap();
-        let theirs: Value = serde_json::from_str(str_of(&out["normalized"])).unwrap();
+        let mut ours = serde_json::to_value(&s).unwrap();
+        let mut theirs: Value = serde_json::from_str(str_of(&out["normalized"])).unwrap();
+        // What 0.3.2 changed on purpose (docs/design.md §2.5): the defaults of the keyframe interval (2 s -> 1 s)
+        // and of the encoder's buffer (2 s -> 0.25 s), which may now go down to 0.25 s instead of 0.5 s, and the
+        // number that tells files with the old defaults apart. The rest is compared with the C#'s own values.
+        // (0: a file from before 0.3.2; fresh defaults, which an unreadable file gives, have the current number)
+        let version = ours.as_object_mut().unwrap().remove("settingsVersion");
+        assert!(version == Some(json!(0)) || version == Some(json!(SenderSettings::SETTINGS_VERSION)), "{file}: {version:?}");
+        // 0.3.3's switch for encoding inside the capture engine (§2.8): no C# file has it, so it is off
+        assert_eq!(ours.as_object_mut().unwrap().shift_remove("keyframeOnRequest"), Some(json!(false)), "{file}");
+        // where the C# gave its default (a missing or unreadable value), ours is today's default
+        if float_of(&theirs["gopSeconds"]) == 2.0 && s.gop_seconds == SenderSettings::DEFAULT_GOP_SECONDS {
+            theirs["gopSeconds"] = json!(s.gop_seconds);
+        }
+        let their_buffer = float_of(&theirs["bufferSeconds"]);
+        if (their_buffer == 2.0 && s.buffer_seconds == SenderSettings::DEFAULT_BUFFER_SECONDS)
+            || (their_buffer == 0.5 && s.buffer_seconds < 0.5 && s.buffer_seconds >= 0.25)
+        {
+            theirs["bufferSeconds"] = json!(s.buffer_seconds);
+        }
+        let csharp_values = SenderSettings {
+            gop_seconds: float_of(&serde_json::from_str::<Value>(str_of(&out["normalized"])).unwrap()["gopSeconds"]),
+            buffer_seconds: float_of(&serde_json::from_str::<Value>(str_of(&out["normalized"])).unwrap()["bufferSeconds"]),
+            ..s.clone()
+        };
         assert_eq!(
             keys(&ours),
             keys(&theirs),
@@ -515,12 +539,12 @@ fn sender_settings_files_are_read_normalised_and_used_like_the_csharp_did() {
             "{file}"
         );
         assert_eq!(
-            encoder_profiles::build_video_args(&s.to_encoder_settings(true, 1015)),
+            encoder_profiles::build_video_args(&csharp_values.to_encoder_settings(true, 1015)),
             strings_of(&out["videoArgsHdr1015"]),
             "{file}"
         );
         assert_eq!(
-            encoder_profiles::build_video_args(&s.to_encoder_settings(false, 0)),
+            encoder_profiles::build_video_args(&csharp_values.to_encoder_settings(false, 0)),
             strings_of(&out["videoArgsSdr"]),
             "{file}"
         );
@@ -592,12 +616,7 @@ fn receiver_settings_files_are_read_and_normalised_like_the_csharp_did() {
             "{file}: only the C# read it"
         );
 
-        // What `load` gives: the file's settings or the defaults. (Windows: the C# knew no other. A file without
-        // "frontend" gets this platform's player input, which on a Mac is the ffmpeg pipe.)
-        let mut raw = read.unwrap_or_else(|| ReceiverSettings::defaults_for(Platform::Windows));
-        if !file.contains("\"frontend\"") {
-            raw.frontend = ReceiverSettings::defaults_for(Platform::Windows).frontend;
-        }
+        let raw = read.unwrap_or_default();
         let out = if csharp_read { out } else { &csharp_defaults };
         assert_eq!(
             raw.validate(),
@@ -612,7 +631,11 @@ fn receiver_settings_files_are_read_and_normalised_like_the_csharp_did() {
 
         let s = raw.normalized();
         let ours = serde_json::to_value(&s).unwrap();
-        let theirs: Value = serde_json::from_str(str_of(&out["normalized"])).unwrap();
+        let mut theirs: Value = serde_json::from_str(str_of(&out["normalized"])).unwrap();
+        if s.frontend == ReceiverFrontend::MpvDirect {
+            // 2 is "mpv direct" since 0.3.2; the C# had no such number and fell back to its 0
+            theirs["frontend"] = Value::from(2);
+        }
         assert_eq!(
             keys(&ours),
             keys(&theirs),
@@ -647,6 +670,11 @@ fn mpv_plan(input: &Value) -> Result<MpvLaunchPlan, String> {
     if bool_of(&input["normalize"]) {
         s.normalize();
     }
+    // 0 is "automatic" since 0.3.2 (the guarded ffmpeg pipe whenever ffmpeg is there); for the C# it was mpv
+    // direct, so that is what these lines were built with
+    if s.frontend == ReceiverFrontend::Auto {
+        s.frontend = ReceiverFrontend::MpvDirect;
+    }
     let pid = u32_of(&input["pid"]);
     let endpoint = format!(
         "{}{}",
@@ -665,19 +693,40 @@ fn mpv_plan(input: &Value) -> Result<MpvLaunchPlan, String> {
     .map_err(|e| e.to_string())
 }
 
+/// Since 0.3.3 mpv shows no on-screen controller (a live stream has nothing to seek in), no OSD bar and no Windows
+/// media overlay: the three options follow `--force-window=yes`. Its own keys, mouse actions, config files, window
+/// dragging and drag and drop are off as well: those four options come before `--keep-open=no`. The rest of the line
+/// is the C#'s.
+const WITHOUT_CONTROLLER: &str = " --force-window=yes --osc=no --osd-bar=no --media-controls=no ";
+const PLAYER_ONLY: &str = " --config=no --input-default-bindings=no --window-dragging=no --drag-and-drop=no --keep-open=no ";
+
+fn without_controller(mut args: Vec<String>) -> Vec<String> {
+    let at = args.iter().position(|a| a == "--force-window=yes").expect("the C# passed --force-window=yes") + 1;
+    args.splice(at..at, ["--osc=no", "--osd-bar=no", "--media-controls=no"].map(String::from));
+    let at = args.iter().position(|a| a == "--keep-open=no").expect("the C# passed --keep-open=no");
+    args.splice(at..at, ["--config=no", "--input-default-bindings=no", "--window-dragging=no", "--drag-and-drop=no"].map(String::from));
+    args
+}
+
+/// The C#'s command line as 0.3.3 builds it (see [`without_controller`]).
+fn as_now(line: &str) -> String {
+    line.replace(" --force-window=yes ", WITHOUT_CONTROLLER).replace(" --keep-open=no ", PLAYER_ONLY)
+}
+
 #[test]
 fn every_mpv_command_line_is_the_one_the_csharp_built() {
     let (mut built, mut refused, mut command_lines) = (0, 0, 0);
     for (input, out) in section("mpv") {
         match mpv_plan(&input) {
             Ok(plan) => {
-                assert_eq!(plan.mpv_args, strings_of(&out["mpvArgs"]), "{input}");
+                assert_eq!(plan.mpv_args, without_controller(strings_of(&out["mpvArgs"])), "{input}");
                 assert_eq!(plan.url, str_of(&out["url"]), "{input}");
+                // Since 0.3.2 the pipe's ffmpeg hands over the raw SRT payload for the guard instead of remuxing
+                // it (docs/design.md §3.2): only that half of the pipe differs from what the C# built.
+                let pipe = out["ffmpegArgs"].as_array().is_some();
                 assert_eq!(
                     plan.ffmpeg_args,
-                    out["ffmpegArgs"]
-                        .as_array()
-                        .map(|_| strings_of(&out["ffmpegArgs"])),
+                    pipe.then(|| mpv_command::ffmpeg_pipe_args(&plan.url)),
                     "{input}"
                 );
                 assert_eq!(
@@ -695,15 +744,17 @@ fn every_mpv_command_line_is_the_one_the_csharp_built() {
                 if let Some(expected) = out.get("commandLine") {
                     assert_eq!(
                         plan.mpv_command_line(),
-                        str_of(&out["mpvCommandLine"]),
+                        as_now(str_of(&out["mpvCommandLine"])),
                         "{input}"
                     );
-                    assert_eq!(
-                        plan.ffmpeg_command_line().as_deref(),
-                        out["ffmpegCommandLine"].as_str(),
-                        "{input}"
-                    );
-                    assert_eq!(plan.to_command_line(), str_of(expected), "{input}");
+                    if pipe {
+                        assert_eq!(plan.ffmpeg_exe.as_deref(), input["ffmpeg"].as_str().map(Path::new), "{input}");
+                        let ffmpeg = plan.ffmpeg_command_line().expect("the pipe's ffmpeg");
+                        assert_eq!(plan.to_command_line(), format!("{ffmpeg} | {}", plan.mpv_command_line()), "{input}");
+                    } else {
+                        assert_eq!(plan.ffmpeg_command_line(), None, "{input}");
+                        assert_eq!(plan.to_command_line(), as_now(str_of(expected)), "{input}");
+                    }
                     command_lines += 1;
                 }
             }

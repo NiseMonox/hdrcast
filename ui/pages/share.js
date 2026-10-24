@@ -59,7 +59,6 @@ export function SharePage() {
   const share = status.share;
   const plan = status.plan;
   const sharing = isSharing(status);
-  const locked = sharing;
   const viewers = share.p2p?.viewers || [];
   const knocks = share.knocks || [];
   const [advanced, setAdvanced] = useState(false);
@@ -121,7 +120,7 @@ export function SharePage() {
 
     <div class="section-title">
       <span>${t('share.display')}</span><span class="spacer"></span>
-      <button class="btn small plain" disabled=${locked} onClick=${refreshOutputs}><${Icon} name="refresh" />${t('common.refresh')}</button>
+      <button class="btn small plain" onClick=${refreshOutputs}><${Icon} name="refresh" />${t('common.refresh')}</button>
     </div>
     <div class="card">
       ${s.outputs.length === 0
@@ -129,7 +128,7 @@ export function SharePage() {
         : html`<div class="displays">
             ${s.outputs.map((o, i) => html`
               <button class=${'display' + (o.hdr ? ' hdr' : '') + (selected && o.index === selected.index ? ' selected' : '')}
-                disabled=${locked}
+               
                 onClick=${() => set({ outputIndex: o.index, outputDeviceName: o.deviceName, outputFriendlyName: o.friendlyName })}>
                 <div class="screen"><span class="num">${i + 1}</span>${o.hdr && html`<span class="badge hdr">HDR</span>`}</div>
                 <div class="dname">${o.friendlyName || o.deviceName}</div>
@@ -139,27 +138,27 @@ export function SharePage() {
     </div>
     ${plan?.note && html`<div class="section-note">${plan.note}</div>`}
 
-    <${Section} title=${t('share.picture')}>
-      <${Row} name=${t('share.bitrate')} hint=${t('share.bitrateHint')} wide disabled=${locked}>
+    <${Section} title=${t('share.picture')} note=${sharing ? t('share.liveChanges') : null}>
+      <${Row} name=${t('share.bitrate')} hint=${t('share.bitrateHint')} wide>
         <div class="slider-wrap">
           <${Slider} value=${Math.min(150, sender.bitrateMbps)} min=${5} max=${150} step=${1} onChange=${(v) => set({ bitrateMbps: v })} />
           <${NumberField} value=${sender.bitrateMbps} min=${1} max=${500} onChange=${(v) => set({ bitrateMbps: v })} width=${56} />
           <span class="unit">Mbps</span>
         </div>
       <//>
-      <${Row} name=${t('share.fps')} disabled=${locked}>
+      <${Row} name=${t('share.fps')}>
         <${Segmented} value=${sender.fps} onChange=${(v) => set({ fps: v })}
           options=${[30, 48, 60, 90, 120].map((v) => ({ value: v, label: String(v) }))} />
       <//>
-      <${Row} name=${t('share.resolution')} disabled=${locked}>
+      <${Row} name=${t('share.resolution')}>
         <${Segmented} value=${sender.scale} onChange=${(v) => set({ scale: v })}
           options=${[{ value: 0, label: t('share.native') }, { value: 1, label: '1440p' }, { value: 2, label: '1080p' }, { value: 3, label: '720p' }]} />
       <//>
-      <${Row} name="HDR" hint=${t('share.hdrHint')} disabled=${locked}>
+      <${Row} name="HDR" hint=${t('share.hdrHint')}>
         <${Segmented} value=${sender.hdrMode} onChange=${(v) => set({ hdrMode: v })}
           options=${[{ value: 0, label: t('share.hdrAuto') }, { value: 1, label: t('share.hdrOff') }]} />
       <//>
-      <${Row} name=${t('share.encoder')} disabled=${locked}>
+      <${Row} name=${t('share.encoder')}>
         <${Select} value=${sender.encoder} onChange=${(v) => set({ encoder: v })}
           options=${s.init.encoders.map((e) => ({ value: e.id, label: e.name }))} />
         <button class="btn" disabled=${probing} onClick=${probe}>
@@ -167,36 +166,39 @@ export function SharePage() {
         </button>
       <//>
       ${advanced && html`
-        <${Row} name=${t('share.quality')} hint=${t('share.qualityHint')} disabled=${locked}>
+        <${Row} name=${t('share.quality')} hint=${t('share.qualityHint')}>
           <${Segmented} value=${sender.quality} onChange=${(v) => set({ quality: v })}
             options=${[{ value: 0, label: t('share.qSpeed') }, { value: 1, label: t('share.qBalanced') }, { value: 2, label: t('share.qQuality') }]} />
         <//>
-        <${Row} name=${t('share.gop')} disabled=${locked}>
+        <${Row} name=${t('share.gop')}>
           <${NumberField} value=${sender.gopSeconds} min=${0.5} max=${10} step=${0.5} onChange=${(v) => set({ gopSeconds: v })} />
           <span class="unit">${t('unit.s')}</span>
         <//>
-        <${Row} name=${t('share.bframes')} disabled=${locked}><${Switch} on=${sender.bFrames} onChange=${(v) => set({ bFrames: v })} /><//>
-        <${Row} name=${t('share.lookahead')} disabled=${locked}><${Switch} on=${sender.lookahead} onChange=${(v) => set({ lookahead: v })} /><//>
-        <${Row} name=${t('share.cursor')} disabled=${locked}><${Switch} on=${sender.cursor} onChange=${(v) => set({ cursor: v })} /><//>`}
+        <${Row} name=${t('share.bframes')}><${Switch} on=${sender.bFrames} onChange=${(v) => set({ bFrames: v })} /><//>
+        ${sender.encoder === 0 && html`<${Row} name=${t('share.keyframeOnRequest')} hint=${t('share.keyframeOnRequestHint')}>
+          <${Switch} on=${sender.keyframeOnRequest} onChange=${(v) => set({ keyframeOnRequest: v })} />
+        <//>`}
+        <${Row} name=${t('share.lookahead')} disabled=${sender.encoder === 0 && sender.keyframeOnRequest}><${Switch} on=${sender.lookahead} onChange=${(v) => set({ lookahead: v })} /><//>
+        <${Row} name=${t('share.cursor')}><${Switch} on=${sender.cursor} onChange=${(v) => set({ cursor: v })} /><//>`}
       <${Disclosure} label=${advanced ? t('common.less') : t('share.advanced')} open=${advanced} onToggle=${() => setAdvanced(!advanced)} />
     <//>
 
     <${Section} title=${t('share.sound')}>
-      <${Row} name=${t('share.audio')} hint=${t('share.audioHint')} disabled=${locked}>
+      <${Row} name=${t('share.audio')} hint=${t('share.audioHint')}>
         <${Switch} on=${sender.audio} onChange=${(v) => set({ audio: v })} />
       <//>
       ${sender.audio && html`
-        ${s.audioDevices.length > 0 && html`<${Row} name=${t('share.audioDevice')} disabled=${locked}>
+        ${s.audioDevices.length > 0 && html`<${Row} name=${t('share.audioDevice')}>
           <${Select} value=${sender.audioDevice} onChange=${(v) => set({ audioDevice: v })} style="max-width:300px"
             options=${[{ value: 'default', label: t('share.audioDefault') }].concat(s.audioDevices.map((d) => ({ value: d.id, label: d.name })))} />
         <//>`}
-        <${Row} name=${t('share.audioCodec')} disabled=${locked}>
+        <${Row} name=${t('share.audioCodec')}>
           <${Segmented} value=${sender.audioCodec} onChange=${(v) => set({ audioCodec: v })}
             options=${s.init.audioCodecs.map((c) => ({ value: c.id, label: c.name }))} />
           <${NumberField} value=${sender.audioBitrateKbps} min=${32} max=${512} onChange=${(v) => set({ audioBitrateKbps: v })} width=${56} />
           <span class="unit">kbps</span>
         <//>
-        ${s.init.caps.audioExclude && html`<${Row} name=${t('share.leaveOut')} hint=${t('share.leaveOutHint')} disabled=${locked}>
+        ${s.init.caps.audioExclude && html`<${Row} name=${t('share.leaveOut')} hint=${t('share.leaveOutHint')}>
           <input class="field" style="width:190px" list="audio-apps" placeholder=${t('share.leaveOutNone')} spellcheck=${false}
             value=${sender.audioExcludeApp}
             onFocus=${async () => { try { setAudioApps(await invoke('audio_apps')); } catch (e) { /* the list is a convenience */ } }}
@@ -208,7 +210,7 @@ export function SharePage() {
     <${AccessSection} access=${s.access} group=${s.group} device=${share.device} candidates=${status.deviceCandidates || []} />
 
     <${Section} title=${t('share.viewers')} note=${plan ? uploadNote(plan, sender) : ''} noteWarn=${plan?.uploadTooMuch}>
-      <${Row} name=${t('share.maxViewers')} hint=${t('share.maxViewersHint')} disabled=${locked}>
+      <${Row} name=${t('share.maxViewers')} hint=${t('share.maxViewersHint')}>
         <${Stepper} value=${sender.maxViewers} min=${1} max=${16} onChange=${(v) => set({ maxViewers: v })} />
       <//>
       <${Row} name=${t('share.upload')} hint=${t('share.uploadHint')}>
@@ -391,7 +393,9 @@ function Viewers({ share }) {
                 ${v.state === 'watching'
                   ? html`<span class=${'badge ' + (v.ipv6 ? 'blue' : '')}>${v.ipv6 ? 'IPv6' : 'IPv4'}</span>
                       ${v.rttMs >= 0 && html`<span>${t('share.ping', { ms: Math.round(v.rttMs) })}</span>`}
-                      <span>· ${t('share.srtLatency', { s: (v.latencyMs / 1000).toFixed(1).replace(/\.0$/, '') })}</span>`
+                      <span>· ${t('share.srtLatency', { s: (v.latencyMs / 1000).toFixed(1).replace(/\.0$/, '') })}</span>
+                      ${v.net?.lossPercent >= 0.05 && html`<span>· ${t('share.loss', { p: v.net.lossPercent.toFixed(1) })}</span>`}
+                      ${v.net?.lostForGood > 0 && html`<span>· ${t('share.lostForGood', { n: v.net.lostForGood })}</span>`}`
                   : html`<span class="spinner"></span><span>${t('share.connecting')}</span>`}
                 ${v.control === 'granted' && html`<span class="badge orange"><${Icon} name="cursor" style="width:11px;height:11px" />${t('control.active')}</span>`}
               </div>

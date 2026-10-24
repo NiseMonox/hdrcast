@@ -133,7 +133,9 @@ fn remux_child_arguments_copy_and_listen_on_loopback_only() {
     let p = srt_url::parse(&url).unwrap();
     assert_eq!(p.get("latency"), Some("3500000"));
     assert_eq!(p.get("oheadbw"), Some("50"));
-    assert_eq!(p.get("inputbw"), Some("5000000"));
+    // SRT is told what the stream takes on the wire, not the video bitrate alone (40 Mbps of video: 43.7 Mbps)
+    assert_eq!(RemuxChild::wire_bps(40_000_000), 43_724_255);
+    assert_eq!(p.get("inputbw"), Some("5465531"));
     assert_eq!(p.get("pbkeylen"), Some("32"));
     assert_eq!(p.get("listen_timeout"), Some("-1"));
     let args = RemuxChild::build_arguments(&url);
@@ -144,8 +146,8 @@ fn remux_child_arguments_copy_and_listen_on_loopback_only() {
     // the whole command line, as docs/design.md §8.8 has it
     assert_eq!(
         args[..args.len() - 1].join(" "),
-        "-hide_banner -loglevel warning -probesize 65536 -analyzeduration 500000 -f mpegts -i pipe:0 -map 0 -c copy \
-         -f mpegts -mpegts_flags +resend_headers -muxdelay 0 -muxpreload 0"
+        "-hide_banner -loglevel warning -probesize 2000000 -analyzeduration 500000 -fflags +discardcorrupt -f mpegts -i pipe:0 \
+         -map 0 -c copy -f mpegts -mpegts_flags +resend_headers -muxdelay 0 -muxpreload 0"
     );
     // an overhead outside what SRT takes is brought into range rather than refused
     let low = RemuxChild::build_listener_url(40000, "a77MWmBi3_603E3kH2abfOI5O-dIU5dn", 1500, 1, 40_000_000).unwrap();

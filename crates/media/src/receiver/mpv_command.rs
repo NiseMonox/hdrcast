@@ -24,7 +24,7 @@ pub struct MpvLaunchPlan {
     /// Windows (`\\.\pipe\hdrcast-mpv-<pid>`), the path of a Unix socket elsewhere.
     pub ipc_endpoint: String,
     pub url: String,
-    /// Set for the ffmpeg pipe fallback; ffmpeg's stdout feeds mpv's stdin.
+    /// Set for the ffmpeg pipe: ffmpeg's stdout goes through the guard into mpv's stdin.
     pub ffmpeg_exe: Option<PathBuf>,
     pub ffmpeg_args: Option<Vec<String>>,
 }
@@ -94,7 +94,7 @@ pub fn build_url(
 
 /// Builds the launch plan for the local end of a P2P session (`local_port` on 127.0.0.1, the group's
 /// `passphrase`). `ipc_endpoint` is where mpv serves its JSON IPC (see [`default_ipc_endpoint`]); `ffmpeg_exe`
-/// is only needed for [`ReceiverFrontend::FfmpegPipe`].
+/// is needed for [`ReceiverFrontend::FfmpegPipe`], and [`ReceiverFrontend::Auto`] uses the pipe when it is given.
 pub fn build(
     s: &ReceiverSettings,
     local_port: u16,
@@ -109,10 +109,13 @@ pub fn build(
     }
     let url = build_url(s, local_port, passphrase)?;
 
-    if s.frontend == ReceiverFrontend::FfmpegPipe {
-        let ffmpeg_exe = ffmpeg_exe
-            .filter(|exe| !exe.as_os_str().is_empty())
-            .ok_or(MpvPlanError::FfmpegPathRequired)?;
+    let ffmpeg_exe = ffmpeg_exe.filter(|exe| !exe.as_os_str().is_empty());
+    let pipe = match s.frontend {
+        ReceiverFrontend::Auto => ffmpeg_exe,
+        ReceiverFrontend::FfmpegPipe => Some(ffmpeg_exe.ok_or(MpvPlanError::FfmpegPathRequired)?),
+        ReceiverFrontend::MpvDirect => None,
+    };
+    if let Some(ffmpeg_exe) = pipe {
         return Ok(MpvLaunchPlan {
             mpv_exe: mpv_exe.to_path_buf(),
             mpv_args: mpv_args(s, ipc_endpoint, "-", true, platform),
@@ -133,12 +136,12 @@ pub fn build(
     })
 }
 
-/// ffmpeg side of the fallback: pull SRT, remux to MPEG-TS on stdout without re-encoding.
+/// ffmpeg's side of the pipe: receive SRT and write its payload to stdout as it came (`-f data` in and out:
+/// nothing is demuxed or remuxed), so that the guard sees the stream's own continuity counters and timestamps.
 pub fn ffmpeg_pipe_args(url: &str) -> Vec<String> {
-    let mut a =
-        words("-hide_banner -loglevel warning -nostdin -fflags nobuffer -flags low_delay -i");
+    let mut a = words("-hide_banner -loglevel warning -nostdin -f data -i");
     a.push(url.to_string());
-    a.extend(words("-c copy -f mpegts -muxdelay 0 -muxpreload 0 pipe:1"));
+    a.extend(words("-map 0 -c copy -f data -flush_packets 1 pipe:1"));
     a
 }
 
@@ -203,8 +206,26 @@ pub fn mpv_args(
     }
 
     a.push(format!("--input-ipc-server={ipc_endpoint}"));
+    // The player window shows the picture and, under remote control, passes input on to the host; nothing else.
+    // No mpv.conf / input.conf / scripts of the user's, none of mpv's own keys and mouse actions (the wheel's volume,
+    // space, q, a double click...), no moving the window by dragging the picture and no file dropped on it in place
+    // of the stream. HdrCast binds the few keys the player keeps itself, over IPC (docs/design.md §3.1).
+    a.push("--config=no".to_string());
+    a.push("--input-default-bindings=no".to_string());
+    a.push("--window-dragging=no".to_string());
+    a.push("--drag-and-drop=no".to_string());
     a.push("--keep-open=no".to_string());
     a.push("--force-window=yes".to_string());
+    // A live stream has nothing to seek in: no on-screen controller (its progress bar and buttons come up over the
+    // picture whenever the mouse moves, also while it moves the host's mouse) and no bar for volume or seeking.
+    a.push("--osc=no".to_string());
+    a.push("--osd-bar=no".to_string());
+    if platform == Platform::Windows {
+        // No Windows media overlay for a live stream (mpv 0.39+). It also keeps mpv's exit from stalling: with the
+        // on-screen controller off, a load failure left mpv 0.41 stuck in the media controls' shutdown every time
+        // (12 s until killed; 0.2 s with this), and the app restarts mpv only once it has exited.
+        a.push("--media-controls=no".to_string());
+    }
     a.push(format!("--title={WINDOW_TITLE}"));
     a.push("--msg-level=all=info".to_string());
     a.push("--term-status-msg=".to_string());

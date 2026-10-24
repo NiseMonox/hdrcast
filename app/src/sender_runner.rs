@@ -5,18 +5,23 @@
 //! on them for exactly those frames and its stdout, the MPEG-TS, is handed to the P2P fan-out. If either
 //! process exits the other is stopped and, when asked to, the pair is started again after a pause; viewers
 //! stay connected across that.
+//!
+//! When the plan says so the engine encodes itself (§2.8): ffmpeg then only adds the sound and copies the video,
+//! and the engine's stdin takes commands (a keyframe now, another bitrate). An engine that cannot encode here
+//! exits with `ENCODER_UNAVAILABLE`; the session goes on at once with ffmpeg encoding, as before.
 
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::ChildStdout;
+use std::process::{ChildStdin, ChildStdout};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hdrcast_capture::{CaptureFormat, CaptureStats, FrameLayout};
+use hdrcast_capture::{exit_codes, CaptureFormat, CaptureStats, EncodeArgs, EncoderEvent, FrameLayout};
 use hdrcast_core::common::line_process::LineProcess;
 use hdrcast_core::common::process_job::ProcessJob;
 use hdrcast_media::sender::encoder_profiles;
-use hdrcast_media::sender::ffmpeg_command::{self, FfmpegPlan};
+use hdrcast_media::sender::ffmpeg_command::{self, FfmpegPlan, VideoInput};
 use hdrcast_media::sender::ffmpeg_progress::{FfmpegProgress, FfmpegProgressParser};
 
 const RESTART_DELAY: Duration = Duration::from_millis(3000);
@@ -47,7 +52,7 @@ impl RunnerState {
 }
 
 /// Everything needed for one session; built from the settings plus the chosen display.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct SendPlan {
     pub capture_exe: PathBuf,
     pub capture_argv: Vec<String>,
@@ -57,6 +62,9 @@ pub struct SendPlan {
     pub ffmpeg: FfmpegPlan,
     /// Pipes the capture engine creates and ffmpeg opens; ffmpeg is not started until they listen.
     pub pipe_names: Vec<String>,
+    /// The engine encodes itself with these options (`capture_argv` gets them appended, and ffmpeg copies the
+    /// video). `None` = ffmpeg encodes.
+    pub engine_encode: Option<EncodeArgs>,
 }
 
 /// What the status display reads.
@@ -72,7 +80,20 @@ pub struct RunnerSnapshot {
     pub layout: Option<FrameLayout>,
     /// The session was planned as HDR (the display was in HDR mode and HDR was not switched off).
     pub planned_hdr: bool,
+    /// The capture engine encodes (and makes keyframes on request); false while ffmpeg does.
+    pub in_engine: bool,
 }
+
+/// What the runner tells about its encoder, on one of its threads.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EncoderNews {
+    /// An encoder started: inside the capture engine (keyframes on request work) or in ffmpeg.
+    Started { in_engine: bool },
+    /// The engine's encoder said something (a keyframe went out, a bitrate was taken or not).
+    Event(EncoderEvent),
+}
+
+type NewsFn = Arc<dyn Fn(&EncoderNews) + Send + Sync>;
 
 /// "HEVC (NVIDIA NVENC) 40 Mbps 3840x2160@60 HDR10": what is being sent, for the log.
 pub fn summary(plan: &FfmpegPlan) -> String {
@@ -109,13 +130,20 @@ struct Gate {
     parser: FfmpegProgressParser,
     /// What the engine of the current generation announced; `None` until it did.
     layout: Option<FrameLayout>,
+    /// The current generation's engine encodes.
+    in_engine: bool,
+    /// The engine said it cannot encode here: ffmpeg encodes for the rest of this session.
+    engine_unavailable: bool,
 }
 
 struct Shared {
     gate: Mutex<Gate>,
+    /// The stdin of the engine that encodes, where the commands go. A lock of its own: a write never holds the gate.
+    commands: Mutex<Option<ChildStdin>>,
     job: Arc<ProcessJob>,
     log: LogFn,
     ts_started: TsFn,
+    news: Mutex<Option<NewsFn>>,
 }
 
 #[derive(Clone)]
@@ -142,8 +170,40 @@ impl SenderRunner {
             progress: None,
             parser: FfmpegProgressParser::new(),
             layout: None,
+            in_engine: false,
+            engine_unavailable: false,
         };
-        Self { shared: Arc::new(Shared { gate: Mutex::new(gate), job, log, ts_started }) }
+        Self { shared: Arc::new(Shared { gate: Mutex::new(gate), commands: Mutex::new(None), job, log, ts_started, news: Mutex::new(None) }) }
+    }
+
+    /// Who hears about the encoder ([`EncoderNews`]); replaces the previous listener.
+    pub fn on_news(&self, listener: impl Fn(&EncoderNews) + Send + Sync + 'static) {
+        *self.shared.news.lock().unwrap() = Some(Arc::new(listener));
+    }
+
+    /// Asks the engine for a keyframe now. False when no engine that encodes is running.
+    pub fn request_keyframe(&self) -> bool {
+        self.shared.command("keyframe")
+    }
+
+    /// Asks the engine to encode at `kbps` with a buffer of `vbv_kbits` from now on, without a restart (the answer
+    /// comes as an [`EncoderNews::Event`]). False when no engine that encodes is running.
+    pub fn set_bitrate(&self, kbps: u32, vbv_kbits: u32) -> bool {
+        self.shared.command(&format!("bitrate {kbps} {vbv_kbits}"))
+    }
+
+    /// The plan of the session that runs (or last ran).
+    pub fn plan(&self) -> Option<SendPlan> {
+        self.shared.gate.lock().unwrap().plan.as_deref().cloned()
+    }
+
+    /// The running session took a change without a restart (a bitrate the engine applied): `plan` describes it now,
+    /// and an automatic restart after a crash starts from it.
+    pub fn adopt_plan(&self, plan: SendPlan) {
+        let mut g = self.shared.gate.lock().unwrap();
+        if g.plan.is_some() {
+            g.plan = Some(Arc::new(plan));
+        }
     }
 
     pub fn snapshot(&self) -> RunnerSnapshot {
@@ -158,6 +218,7 @@ impl SenderRunner {
             progress: g.progress.clone(),
             layout: g.layout,
             planned_hdr: g.plan.as_ref().is_some_and(|p| p.ffmpeg.encoder.hdr),
+            in_engine: running && g.in_engine,
         }
     }
 
@@ -176,6 +237,7 @@ impl SenderRunner {
             g.attempt = 0;
             g.capture_stats = None;
             g.progress = None;
+            g.engine_unavailable = false;
         }
         self.shared.set_state(RunnerState::Starting, "Starting…");
         let shared = self.shared.clone();
@@ -190,6 +252,7 @@ impl SenderRunner {
             g.generation += 1;
             (g.capture.take(), g.ffmpeg.take(), g.state == RunnerState::Idle)
         };
+        *self.shared.commands.lock().unwrap() = None;
         if capture.is_none() && ffmpeg.is_none() {
             if !was_idle {
                 self.shared.set_state(RunnerState::Idle, "Stopped");
@@ -224,6 +287,24 @@ impl Shared {
         (self.log)(line);
     }
 
+    fn tell(&self, news: &EncoderNews) {
+        let listener = self.news.lock().unwrap().clone();
+        if let Some(listener) = listener {
+            listener(news);
+        }
+    }
+
+    /// One line to the engine's stdin; false when there is no engine that takes commands.
+    fn command(&self, line: &str) -> bool {
+        let mut commands = self.commands.lock().unwrap();
+        let Some(stdin) = commands.as_mut() else { return false };
+        if stdin.write_all(format!("{line}\n").as_bytes()).and_then(|()| stdin.flush()).is_ok() {
+            return true;
+        }
+        *commands = None; // the engine is gone; its exit is dealt with elsewhere
+        false
+    }
+
     fn set_state(&self, state: RunnerState, detail: &str) {
         {
             let mut g = self.gate.lock().unwrap();
@@ -242,7 +323,7 @@ impl Shared {
     }
 
     fn launch(self: &Arc<Self>) {
-        let (plan, gen, attempt) = {
+        let (plan, gen, attempt, in_engine) = {
             let mut g = self.gate.lock().unwrap();
             let Some(plan) = g.plan.clone() else { return };
             if g.user_stopped {
@@ -251,13 +332,19 @@ impl Shared {
             g.generation += 1;
             g.attempt += 1;
             g.layout = None;
-            (plan, g.generation, g.attempt)
+            g.in_engine = plan.engine_encode.is_some() && !g.engine_unavailable;
+            (plan, g.generation, g.attempt, g.in_engine)
         };
         let text = if attempt == 1 { "Starting…".to_string() } else { format!("Restarting (attempt {attempt})…") };
         self.set_state(RunnerState::Starting, &text);
 
-        let mut capture = LineProcess::new(&plan.capture_exe, &plan.capture_argv);
-        capture.job(Some(self.job.clone()));
+        let mut argv = plan.capture_argv.clone();
+        if let (true, Some(encode)) = (in_engine, &plan.engine_encode) {
+            argv.extend(encode.to_argv());
+        }
+        let mut capture = LineProcess::new(&plan.capture_exe, &argv);
+        // the engine that encodes takes its commands on stdin
+        capture.job(Some(self.job.clone())).redirect_stdin(in_engine);
         let me = self.clone();
         capture.on_stdout_line(move |line| me.on_capture_line(gen, line));
         let me = self.clone();
@@ -278,6 +365,8 @@ impl Shared {
             capture.stop();
             return;
         }
+        // commands from now on go to this engine (none when ffmpeg encodes: its stdin was not taken)
+        *self.commands.lock().unwrap() = capture.take_stdin();
 
         self.set_state(RunnerState::Starting, "Waiting for the capture engine…");
         let layout = match self.wait_for_engine(&plan, &capture, gen) {
@@ -295,7 +384,8 @@ impl Shared {
 
         // ffmpeg reads what the engine announced, not what was planned: with `--format auto` the engine chose,
         // and a Mac whose system refuses HDR capture sends SDR from a display in HDR mode.
-        let encode = plan.ffmpeg.for_frames(layout);
+        let input = if in_engine { VideoInput::EncodedTs } else { VideoInput::Raw };
+        let encode = plan.ffmpeg.with_video_input(input).for_frames(layout);
         let argv = match ffmpeg_command::build(&encode) {
             Ok(argv) => argv,
             Err(e) => {
@@ -304,7 +394,11 @@ impl Shared {
                 return;
             }
         };
-        self.emit(&format!("[run] sending {}", summary(&encode)));
+        self.emit(&format!(
+            "[run] sending {}{}",
+            summary(&encode),
+            if in_engine { " (encoded by HdrCast itself: keyframes on request)" } else { "" }
+        ));
         if plan.ffmpeg.encoder.hdr && !encode.encoder.hdr {
             self.emit(
                 "[run] the display is in HDR mode, but it could not be captured as HDR here (the capture lines above say why): sending SDR",
@@ -342,6 +436,7 @@ impl Shared {
         if let Some(stdout) = ffmpeg.take_stdout() {
             (self.ts_started)(stdout);
         }
+        self.tell(&EncoderNews::Started { in_engine });
         if self.current(gen) {
             self.set_state(RunnerState::Streaming, "Streaming");
         }
@@ -396,6 +491,12 @@ impl Shared {
             }
             return;
         }
+        if let Some(event) = EncoderEvent::try_parse(line) {
+            if gen == self.gate.lock().unwrap().generation {
+                self.tell(&EncoderNews::Event(event));
+            }
+            return;
+        }
         match CaptureStats::try_parse(line) {
             Some(stats) => {
                 let mut g = self.gate.lock().unwrap();
@@ -435,12 +536,42 @@ impl Shared {
     }
 
     fn on_capture_exited(self: &Arc<Self>, gen: u64, code: i32) {
-        if gen != self.gate.lock().unwrap().generation {
-            return;
+        {
+            let mut g = self.gate.lock().unwrap();
+            if gen != g.generation {
+                return;
+            }
+            *self.commands.lock().unwrap() = None;
+            if code == exit_codes::ENCODER_UNAVAILABLE && g.in_engine && !g.user_stopped {
+                // not a failure of the session: ffmpeg encodes from here on, at once
+                g.engine_unavailable = true;
+                drop(g);
+                self.emit("[capture] exited: it cannot encode here (the lines above say why); ffmpeg encodes instead, keyframes on request are off");
+                self.stop_peer_and_restart_now(gen);
+                return;
+            }
         }
         let reason = describe_capture_exit(code);
         self.emit(&format!("[capture] exited: {reason}"));
         self.stop_peer_and_maybe_restart(gen, &format!("capture engine stopped: {reason}"));
+    }
+
+    /// The engine could not encode: the same session again at once, with ffmpeg encoding.
+    fn stop_peer_and_restart_now(self: &Arc<Self>, gen: u64) {
+        let ffmpeg = {
+            let mut g = self.gate.lock().unwrap();
+            if gen != g.generation || g.user_stopped || g.exit_handled == gen {
+                return;
+            }
+            g.exit_handled = gen;
+            g.capture = None;
+            g.ffmpeg.take()
+        };
+        if let Some(p) = &ffmpeg {
+            p.stop();
+        }
+        let me = self.clone();
+        thread::Builder::new().name("sender-restart".into()).spawn(move || Shared::launch(&me)).ok();
     }
 
     fn on_ffmpeg_exited(self: &Arc<Self>, gen: u64, code: i32) {
@@ -504,6 +635,7 @@ fn describe_capture_exit(code: i32) -> String {
         4 => "the pipe consumer went away (ffmpeg stopped)".to_string(),
         5 => "desktop duplication lost".to_string(),
         6 => "ffmpeg never connected to the capture pipe".to_string(),
+        7 => "the encoder inside the engine failed".to_string(),
         other => format!("exit code {other}"),
     }
 }

@@ -1,14 +1,22 @@
 //! The Windows [`VideoSource`]: Desktop Duplication feeding the conversion shader.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::converter::GpuConverter;
 use super::duplicator::{AcquireResult, DesktopDuplicator};
+use super::nvenc::{self, NvencEncoder};
+use super::surfaces::SurfaceRing;
 use super::util::DpiAwareThread;
-use crate::args::{CaptureArgs, CaptureFormat};
+use crate::args::{CaptureArgs, CaptureFormat, EncodeArgs, EngineEncoder};
+use crate::encode::VideoEncoder;
 use crate::log;
 use crate::platform::{FrameLayout, FrameStatus, VideoError, VideoSource};
 use crate::shader::{self, ShaderParams};
+
+/// Switches zero copy off (design.md section 2.8): the frames go to the encoder through memory as before, for a
+/// comparison or a driver that gets the shared device wrong.
+const NO_ZERO_COPY_ENV: &str = "HDRCAST_NO_ZERO_COPY";
 
 pub(crate) struct DxgiVideoSource {
     // Field order is drop order: the converter's views and buffers go before the device owner.
@@ -129,14 +137,42 @@ impl DxgiVideoSource {
             ..ShaderParams::default()
         }
     }
-}
 
-impl VideoSource for DxgiVideoSource {
-    fn layout(&self) -> FrameLayout {
-        self.layout
+    /// NVENC on the capture device, reading the surfaces the shader writes. Possible when the screen is on the
+    /// NVIDIA GPU (on a laptop it is often the integrated one, whose pictures have to cross into the NVIDIA GPU's
+    /// memory anyway: that is the path through memory).
+    fn open_surface_encoder(
+        &mut self,
+        args: &EncodeArgs,
+        fps: u32,
+        frames: usize,
+    ) -> Result<NvencEncoder, String> {
+        match args.encoder {
+            EngineEncoder::Nvenc => {}
+        }
+        if std::env::var_os(NO_ZERO_COPY_ENV).is_some() {
+            return Err(format!("{NO_ZERO_COPY_ENV} is set"));
+        }
+        let device = self.duplicator.device().clone();
+        if !nvenc::is_nvidia_device(&device) {
+            return Err(format!("the screen is on {}", self.duplicator.info.adapter));
+        }
+        // The session first: it says whether NVENC takes this size and format at all.
+        let mut encoder = NvencEncoder::open(args, self.layout, fps, Some(&device))?;
+        // What the engine holds plus the pictures a run of B-frames keeps in the encoder.
+        let count = frames + encoder.frames_held();
+        let ring = Arc::new(SurfaceRing::new(&device, self.layout, count)?);
+        encoder.register(Arc::clone(&ring))?;
+        self.converter.use_surfaces(ring)?;
+        Ok(encoder)
     }
 
-    fn next_frame(&mut self, dst: &mut [u8], timeout: Duration) -> Result<FrameStatus, VideoError> {
+    /// Waits for the screen and converts the newest picture with `convert`, as [`VideoSource::next_frame`] says.
+    fn next(
+        &mut self,
+        timeout: Duration,
+        convert: impl FnOnce(&mut GpuConverter, &ShaderParams) -> Result<(), String>,
+    ) -> Result<FrameStatus, VideoError> {
         let timeout_ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
         let acquired = self
             .duplicator
@@ -158,17 +194,56 @@ impl VideoSource for DxgiVideoSource {
         if (acquired == AcquireResult::NewFrame || pointer_moved) && self.converter.has_source() {
             let started = Instant::now();
             let params = self.build_params();
-            self.converter
-                .convert(&params, dst)
-                .map_err(VideoError::Fatal)?;
+            convert(&mut self.converter, &params).map_err(VideoError::Fatal)?;
             return Ok(FrameStatus::New {
                 gpu_ms: started.elapsed().as_secs_f64() * 1000.0,
             });
         }
         Ok(FrameStatus::Unchanged)
     }
+}
+
+impl VideoSource for DxgiVideoSource {
+    fn layout(&self) -> FrameLayout {
+        self.layout
+    }
+
+    fn next_frame(&mut self, dst: &mut [u8], timeout: Duration) -> Result<FrameStatus, VideoError> {
+        self.next(timeout, |converter, params| converter.convert(params, dst))
+    }
 
     fn recover(&mut self) -> Result<(), String> {
         self.duplicator.recreate()
+    }
+
+    fn surface_encoder(
+        &mut self,
+        args: &EncodeArgs,
+        fps: u32,
+        frames: usize,
+    ) -> Option<Box<dyn VideoEncoder>> {
+        match self.open_surface_encoder(args, fps, frames) {
+            Ok(encoder) => Some(Box::new(encoder)),
+            Err(reason) => {
+                log::info(format!(
+                    "capture: no zero copy ({reason}): the frames go to the encoder through memory"
+                ));
+                None
+            }
+        }
+    }
+
+    fn next_surface(
+        &mut self,
+        surface: usize,
+        timeout: Duration,
+    ) -> Result<FrameStatus, VideoError> {
+        self.next(timeout, |converter, params| {
+            converter.convert_into(params, surface)
+        })
+    }
+
+    fn black_surface(&mut self, surface: usize) -> Result<(), String> {
+        self.converter.clear_surface(surface)
     }
 }

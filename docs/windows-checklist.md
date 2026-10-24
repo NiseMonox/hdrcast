@@ -68,6 +68,8 @@ idx  device         name                      size        pos          hz     hd
 | 125 | 10000 nit | 940（限幅） |
 
 - [ ] 中性灰的 Cb/Cr ≈ 512。
+- [ ] 0.3.3 起 PASS 前多两行 `zero copy: the shader writing the encoder's p010 surface gives the same frame`（nv12 一行同样）：零拷贝写 NVENC 纹理的
+      shader 和读回内存的结果逐字节相同（design.md §2.8）。显卡或驱动做不了时这两行写 `zero copy: … not checked on this GPU (原因)`，不算失败。
 
 ## 4. `scripts\dump-check.cmd`
 
@@ -186,9 +188,65 @@ shader 里 90° 与 270° 的映射（`desk_to_src`）互为逆运算，DXGI 文
 ## 11. 出问题时看哪里
 
 - 日志：应用里的 **日志** 页（**复制** 得到的内容已打码，可以直接发人），文件在 `%APPDATA%\HdrCast\logs\hdrcast-yyyyMMdd.log`。
-  `[p2p]` 开头的行是打洞与信令，`[remux 名字]` 是那位观众的 ffmpeg，`[capture]` 是采集引擎，`[mpv]` / `[ipc]` 是播放器，`[control]` 是远程控制。
+  `[p2p]` 开头的行是打洞与信令，`[remux 名字]` 是那位观众的 ffmpeg，`[capture]` 是采集引擎，`[mpv]` / `[ipc]` 是播放器，`[control]` 是远程控制，
+  `[net]` 是线路丢包统计（0.3.2，两端都有），`[guard]` 是观众端拦下受损画面的记录（0.3.2），`[keyframe]` 是按需关键帧（0.3.3，两端都有）。
 - 配置：`%APPDATA%\HdrCast\sender.json`、`receiver.json`、`app.json`（删掉即恢复默认）、`group.json`（组和密钥，删掉即退出组）。
 - 连不上：先看观看页面板的原话，对照 `docs/network.zh-CN.md` §1.2；画面卡顿 / 断线的排查顺序见 `docs/faq.zh-CN.md`。
+
+## 12. 丢包时画面定格、线路统计（0.3.2）
+
+主播和中国的朋友都装 0.3.2。单机回环（2026-10-23）已经核对过：旧的 `sender.json`（2 s / 2 s、没有 `settingsVersion`）读入后编码器参数是 `-bufsize 10000k -g 60`（40 Mbps、60 fps），
+remux 子进程的 `inputbw=5465531`，观众走 `ffmpeg -f data` → 守卫 → mpv，d3d11va 硬解、HDR 直通。没有真实跨境线路，下面这些要和朋友一起看：
+
+- [ ] 主播日志里 `[run]` 的 ffmpeg 命令行有 `-bufsize` = 码率的四分之一、`-g` = 帧率（关键帧 1 s）。
+- [ ] 观众日志里有 `[app] ffmpeg receives the stream and HdrCast passes it on to mpv`；**设置 → 播放方式** 是 **自动（有 ffmpeg 就用）**。
+- [ ] 看 15 s 后两边日志各有一行 `[net]`；之后丢包时每 30 s 一行。记下高峰时段（晚上）的 `lost on the way` 和观众那行的 `never recovered in time`。
+- [ ] 线路丢包时观众的画面**停住**（最多约 1 s），然后从关键帧继续，**不再出现满屏色块**；声音不断。观看页显示"传输丢失 n 次 · 已拦下 n 帧受损画面 · 定格 n 次"，
+      日志有 `[guard]` 行。主播 **开播** 页这位观众的一行显示"途中丢包 x %"。
+- [ ] 经常定格时：观众把延迟改成 **中国**（3.5 s）或自定义加 500～1000 ms，看 `never recovered` 是否降到 0；还多就降码率（比如 40 → 25 Mbps）再看。
+- [ ] 把观众的播放方式改成 **mpv 直接播放** 对比：丢包时又出现色块（守卫只在 ffmpeg 管道里起作用）。
+
+## 13. 按需关键帧（0.3.3）
+
+主播在 **开播 → 更多选项** 打开 **按需关键帧**（只有编码器是 NVENC 时才有这一项；打开后"前瞻"变灰），观众装 0.3.3（旧版本观众照常能看，只是不会请求）。
+单机回环（2026-10-24，下文"单机回环"的做法，观众另设 `HDRCAST_SIMULATE_LOSS=4:30`、延迟 1500 ms）已经核对过：从模拟的丢包到强制的 IDR 离开编码器
+72～99 ms（1080p60 HDR），画面停住 166～183 ms 的流内时间；同样的丢包关掉开关时每次停 1.0～1.5 s。4K60 HDR 40 Mbps 时停 200～233 ms，采集与封装 60 fps 不丢帧。
+细节见 `docs/design.md` §2.8、§8.12。要和朋友一起看的：
+
+- [ ] 主播日志有 `capture: encoding here: NVENC on …` 和 `[run] sending … (encoded by HdrCast itself: keyframes on request)`；ffmpeg 的命令行是
+      `-f mpegts … -c:v copy`。没有这两行而有 `ffmpeg encodes instead` 时，引擎前面几行写着为什么（驱动太旧、不是 NVIDIA…），画面照常，只是没有按需关键帧。
+- [ ] 观众加入时主播日志有 `[keyframe] <名字>: its stream started: a keyframe now`：画面出来得比以前快（不用等下一个定时关键帧）。
+- [ ] 线路丢包时观众日志有 `[keyframe] asked the host for a keyframe: part of the stream is still missing on the way (… ms ago)`、
+      `[keyframe] the host is making a keyframe`，稍后 `[keyframe] the picture moves again: it held … ms of the stream`。记下中国线路上的这个毫秒数
+      （预计 300～500 ms，主要是发现丢包要等两轮重发），和关掉开关时的 `[guard]` 汇总比较。
+- [ ] 主播日志的 `[keyframe] a keyframe went out … ms after …`：4K60 一般 20～40 ms。`… more lines like the ones above were left out` 很多时，说明丢包很频繁，
+      这时更该降码率。
+- [ ] 画质：打开前后看同一段画面（开关只去掉了前瞻，本机合成内容的 PSNR 只差 0.01 dB）。
+
+## 14. 悬浮窗、播放窗口、分享中改设置（0.3.3）
+
+观众端（design.md §3.1、§3.3）：
+
+- [ ] 画面出来后右上角有个半透明小圆按钮（150 % 缩放时 60 px，离画面边 18 px），鼠标移上去变实。mpv 窗口没有因此失去焦点（远程控制时键盘照常给主播）。
+- [ ] 单击按钮：展开成面板，按钮在右上时向左下展开。数据（分辨率 / 帧率 / 码率 / Ping / 丢包 / 解码）会动。标题栏的"—"、`Esc`、播放窗口里的
+      `Ctrl+Alt+O`、观看页的 **悬浮窗** 按钮都能收起 / 展开。
+- [ ] **拖动**（只有这项还没在真机上用鼠标试过）：拖按钮到画面左下角，松手后它留在那里；展开时面板向右上展开。拖面板的标题栏也行，收起后按钮在面板的角上。
+      退出 HdrCast 再观看，按钮还在左下（配置目录的 `overlay.json`）。拖到画面外松手，按钮回到画面边上。拖完按钮后键盘回到播放器（全屏时任务栏不留在上面）。
+- [ ] 拖动 / 改大小 mpv 窗口、切全屏：按钮跟着走，在画面上的相对位置不变。
+- [ ] 切到别的程序：按钮和面板一起藏起来；点回播放器又出现。点 HdrCast 主窗口时还在。
+- [ ] 面板里 **静音** / **取消静音** 立即生效；改延迟后 **应用**：几秒后用新延迟继续播放，面板一直在，"当前"变成新值，静音保持。
+      **解码方式** 立即切换（日志 `[app] decoder: no, switched while playing`）。
+- [ ] 播放窗口里的滚轮、空格、`q`、`m`、`9` / `0`、`f`、双击都没有反应；`Ctrl+Alt+Enter` 切全屏，`Esc` 退出全屏；把文件拖进播放窗口不会替换直播；
+      拖画面不会移动窗口。点播放窗口的关闭按钮 = 停止观看（日志 `[app] the player window was closed`、`[app] stopped watching`），不会 3 s 后又弹出来。
+- [ ] 远程控制中：除了 `Ctrl+Alt+Enter` / `Ctrl+Alt+O`，`Esc` 和其他键都到了主播那边；点悬浮窗不会把点击发给主播。
+
+主播端（design.md §2.7）：
+
+- [ ] 开播后开播页的设置不再变灰，画面一节下有"分享中改设置会立刻生效"的说明。改分辨率 / 帧率：日志 `the stream's settings changed: starting capture
+      and encoder again (viewers stay connected)`，观众停一秒左右继续看，不用重新加入。连续拖码率滑块只重启一次。
+- [ ] 打开 **按需关键帧** 后改码率：日志 `bitrate now … Mbps: the running encoder took it, no restart`，观众不中断。
+- [ ] 码率调得比观众加入时更高（例如 25 → 40）：主播日志 `<名字>: the bitrate went up to 40 Mbps, more than their connection was set up for: it starts again`，
+      观众约 10 s 后继续播放；调低时没有这一行。
 
 ## 单机回环（不碰真实群组、路由器和朋友）
 
@@ -202,5 +260,7 @@ rem 两个互相隔离的配置目录（各放一份 group.json：同一个 gid 
 set HDRCAST_NO_ROUTER=1            & rem 不做 UPnP
 set HDRCAST_CONTROL_DRY_RUN=1      & rem 远程控制只写日志，不真的注入（同一台电脑上真注入会自己套住自己）
 set HDRCAST_DATA_ROOT=D:\tmp\host   & start HdrCast.exe
+rem 试按需关键帧时，观众那份先加上这一行：每 4 s 把 30 个 SRT 包连同它们的全部重发丢掉
+set HDRCAST_SIMULATE_LOSS=4:30
 set HDRCAST_DATA_ROOT=D:\tmp\viewer & start HdrCast.exe
 ```

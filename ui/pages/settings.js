@@ -123,7 +123,7 @@ export function SettingsPage() {
     <//>
 
     <${Section} title=${t('settings.playback')}>
-      <${Row} name=${t('settings.hwdec')} disabled=${watching}>
+      <${Row} name=${t('settings.hwdec')}>
         <${Select} value=${receiver.hwDec} onChange=${(v) => setR({ hwDec: v })}
           options=${s.init.hwDecModes.map((m) => ({ value: m.id, label: m.name }))} />
       <//>
@@ -147,7 +147,11 @@ export function SettingsPage() {
       <//>
       <${Row} name=${t('settings.frontend')} hint=${t('settings.frontendHint')} disabled=${watching}>
         <${Select} value=${receiver.frontend} onChange=${(v) => setR({ frontend: v })}
-          options=${[{ value: 0, label: t('settings.frontendMpv') }, { value: 1, label: t('settings.frontendPipe') }]} />
+          options=${[
+            { value: 0, label: t('settings.frontendAuto') },
+            { value: 1, label: t('settings.frontendPipe') },
+            { value: 2, label: t('settings.frontendMpv') },
+          ]} />
       <//>
     <//>
 

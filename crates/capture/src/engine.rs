@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use crate::args::{CaptureArgs, CaptureFormat};
 use crate::audio::AudioPipeline;
+use crate::encode::{EncodeControl, EncodeStage, VideoEncoder};
 use crate::clock::{now_ticks, SessionClock, TICKS_PER_MS, TICKS_PER_SECOND};
 use crate::color;
 use crate::frame::{FramePool, FrameSink, SharedFrame};
@@ -29,6 +30,9 @@ pub mod exit_codes {
     pub const ACCESS_LOST: i32 = 5;
     /// The pipe was created but ffmpeg never connected to it.
     pub const NO_PIPE_CLIENT: i32 = 6;
+    /// `--encode` was asked for, and that encoder cannot be had here or failed while encoding (design.md section
+    /// 2.8): the app encodes with ffmpeg instead.
+    pub const ENCODER_UNAVAILABLE: i32 = 7;
 }
 
 /// Room the video pipe is created with (design.md section 2.2): a little over two 4K P010 frames, so a short
@@ -38,7 +42,7 @@ pub const VIDEO_PIPE_BUFFER_BYTES: usize = 64 << 20;
 /// Frames that may wait for the pipe writer before the loop starts dropping.
 const SINK_QUEUE_FRAMES: usize = 4;
 /// The queue, the "latest frame" slot and the frame being converted: with the writer giving a buffer back
-/// before its queue slot, renting can never fail.
+/// before its queue slot, renting can never fail. With zero copy the encoder adds the surfaces it holds itself.
 const POOL_FRAMES: usize = SINK_QUEUE_FRAMES + 2;
 
 const ACCESS_LOST_RETRY_MS: u64 = 500;
@@ -144,10 +148,40 @@ impl CaptureEngine {
             ));
             return exit_codes::DEVICE_ERROR;
         }
+        // The encoder is opened before the layout is announced: when it cannot be had, the app learns it from the
+        // exit code before it starts an ffmpeg that would wait for a stream that never comes.
+        let encoder: Option<Box<dyn VideoEncoder>> = match &self.args.encode {
+            None => None,
+            Some(encode) => {
+                let fps = self.args.fps.max(1);
+                // Zero copy when the screen can hand its pictures to the encoder on the GPU (design.md section
+                // 2.8), frames in memory otherwise.
+                let opened = match video.surface_encoder(encode, fps, POOL_FRAMES) {
+                    Some(encoder) => Ok(encoder),
+                    None => self.backend.open_encoder(encode, layout, fps),
+                };
+                match opened {
+                    Ok(encoder) => {
+                        log::info(format!("capture: encoding here: {}", encoder.describe()));
+                        Some(encoder)
+                    }
+                    Err(message) => {
+                        log::error(format!("capture: cannot encode here: {message}"));
+                        return exit_codes::ENCODER_UNAVAILABLE;
+                    }
+                }
+            }
+        };
         // Before any pipe exists: whoever waits for the pipes knows the format by the time they are there.
         (self.layout_sink)(&layout);
 
-        let pool = FramePool::new(POOL_FRAMES, layout.frame_bytes());
+        // With zero copy the pictures stay on the GPU: one buffer without bytes per surface.
+        let surfaces = encoder.as_ref().map_or(0, |encoder| encoder.surfaces());
+        let pool = if surfaces > 0 {
+            FramePool::new(surfaces, 0)
+        } else {
+            FramePool::new(POOL_FRAMES, layout.frame_bytes())
+        };
         let video_path = platform::pipe_path(&self.args.video_pipe);
         let sink = match &self.args.dump_path {
             Some(path) => FrameSink::create_file(path, SINK_QUEUE_FRAMES)
@@ -165,6 +199,17 @@ impl CaptureEngine {
                 return exit_codes::DEVICE_ERROR;
             }
         };
+        if let (Some(encoder), Some(encode)) = (encoder, &self.args.encode) {
+            let control = EncodeControl::new();
+            read_commands(Arc::clone(&control));
+            sink.encode_with(EncodeStage::new(
+                encoder,
+                self.args.fps.max(1),
+                encode.gop_frames,
+                control,
+                Box::new(|event| log::stdout_line(&event.to_json_line())),
+            ));
+        }
 
         // The audio PIPE has to exist before the video pipe blocks for its client: ffmpeg opens both
         // inputs, so waiting for ffmpeg first would deadlock the two sides. Recording itself starts later,
@@ -215,7 +260,7 @@ impl CaptureEngine {
             }
         }
 
-        let exit_code = self.run_loop(video.as_mut(), &pool, &sink, audio.as_ref());
+        let exit_code = self.run_loop(video.as_mut(), &pool, surfaces > 0, &sink, audio.as_ref());
 
         // Tear down in this order: the audio threads first, then the sink (drains its queue, bounded).
         drop(audio);
@@ -224,10 +269,13 @@ impl CaptureEngine {
         exit_code
     }
 
+    /// `on_surfaces`: the pool's buffers stand for the encoder's surfaces, which the video source converts into
+    /// (zero copy).
     fn run_loop(
         &mut self,
         video: &mut dyn VideoSource,
         pool: &FramePool,
+        on_surfaces: bool,
         sink: &FrameSink,
         audio: Option<&AudioPipeline>,
     ) -> i32 {
@@ -249,7 +297,14 @@ impl CaptureEngine {
         let Some(mut first) = pool.try_rent() else {
             return exit_codes::DEVICE_ERROR;
         };
-        color::fill_black(&mut first, layout.format, layout.width, layout.height);
+        if on_surfaces {
+            if let Err(message) = video.black_surface(first.index()) {
+                log::error(format!("capture: conversion failed: {message}"));
+                return exit_codes::DEVICE_ERROR;
+            }
+        } else {
+            color::fill_black(&mut first, layout.format, layout.width, layout.height);
+        }
         let mut latest: SharedFrame = Arc::new(first);
 
         let mut last_stats_tick = now_ticks();
@@ -270,8 +325,13 @@ impl CaptureEngine {
             }
             if sink.broken() {
                 let reason = sink.error().map(|e| format!(": {e}")).unwrap_or_default();
-                log::error(format!("capture: the pipe consumer went away{reason}"));
-                exit_code = exit_codes::PIPE_BROKEN;
+                if sink.encoder_failed() {
+                    log::error(format!("capture: the encoder failed{reason}"));
+                    exit_code = exit_codes::ENCODER_UNAVAILABLE;
+                } else {
+                    log::error(format!("capture: the pipe consumer went away{reason}"));
+                    exit_code = exit_codes::PIPE_BROKEN;
+                }
                 break;
             }
             if self.args.dump_seconds > 0
@@ -287,7 +347,13 @@ impl CaptureEngine {
                 // every buffer is still queued: the consumer is behind
                 None => self.dropped += 1,
                 Some(mut target) => {
-                    match video.next_frame(&mut target, Duration::from_millis(wait_ms)) {
+                    let timeout = Duration::from_millis(wait_ms);
+                    let next = if on_surfaces {
+                        video.next_surface(target.index(), timeout)
+                    } else {
+                        video.next_frame(&mut target, timeout)
+                    };
+                    match next {
                         Ok(FrameStatus::New { gpu_ms }) => {
                             access_lost_since = None;
                             self.gpu_ms_accum += gpu_ms;
@@ -452,6 +518,23 @@ impl CaptureEngine {
         (self.stats_sink)(&stats);
         self.gpu_ms_accum = 0.0;
         self.gpu_ms_count = 0;
+    }
+}
+
+/// Reads the app's commands for the encoder from stdin, one per line, until stdin ends (design.md section 2.8).
+/// The thread is left to run: a read cannot be interrupted, and the process ends with the session.
+fn read_commands(control: Arc<EncodeControl>) {
+    let spawned = std::thread::Builder::new().name("encoder-commands".into()).spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::stdin().lock().lines() {
+            let Ok(line) = line else { break };
+            if let Err(e) = control.command(&line) {
+                log::warn(format!("capture: {e}"));
+            }
+        }
+    });
+    if let Err(e) = spawned {
+        log::warn(format!("capture: cannot read commands from stdin: {e}"));
     }
 }
 

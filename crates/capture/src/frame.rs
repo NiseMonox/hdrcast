@@ -9,11 +9,13 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use crate::encode::EncodeStage;
 use crate::engine::StopHandle;
 use crate::platform::{PipeCanceller, PipeServer};
 
 struct PoolShared {
-    free: Mutex<Vec<Vec<u8>>>,
+    /// The free buffers, each with its index in the pool.
+    free: Mutex<Vec<(usize, Vec<u8>)>>,
 }
 
 /// Fixed set of pre-allocated frame buffers (no per-frame allocation at 25 MB per 4K P010 frame).
@@ -24,13 +26,19 @@ pub struct FramePool {
 }
 
 impl FramePool {
+    /// With `frame_bytes` 0 the buffers hold no bytes: each one only stands for the encoder surface of its
+    /// [`index`](FrameBuffer::index) (zero copy, design.md section 2.8), and the pool keeps track of which
+    /// surfaces are in use.
+    ///
     /// # Panics
     /// When `count` is less than 2.
     pub fn new(count: usize, frame_bytes: usize) -> Self {
         assert!(count >= 2, "a frame pool needs at least two buffers");
         // Filled with a non-zero byte on purpose: zeroed memory would stay uncommitted until the first frame
         // is written into each buffer, and the page faults of a 25 MB buffer would land in the capture loop.
-        let free = (0..count).map(|_| vec![0x10u8; frame_bytes]).collect();
+        let free = (0..count)
+            .map(|index| (index, vec![0x10u8; frame_bytes]))
+            .collect();
         Self {
             shared: Arc::new(PoolShared {
                 free: Mutex::new(free),
@@ -50,7 +58,7 @@ impl FramePool {
 
     /// A buffer to fill, or `None` when every buffer is in use.
     pub fn try_rent(&self) -> Option<FrameBuffer> {
-        let data = self
+        let (index, data) = self
             .shared
             .free
             .lock()
@@ -58,6 +66,7 @@ impl FramePool {
             .pop()?;
         Some(FrameBuffer {
             data,
+            index,
             pool: Arc::clone(&self.shared),
         })
     }
@@ -67,11 +76,20 @@ impl FramePool {
 /// between the queue and the "latest frame" slot as a [`SharedFrame`].
 pub struct FrameBuffer {
     data: Vec<u8>,
+    index: usize,
     pool: Arc<PoolShared>,
 }
 
 /// A finished frame: the sink's queue and the engine's "latest frame" slot can hold the same buffer.
 pub type SharedFrame = Arc<FrameBuffer>;
+
+impl FrameBuffer {
+    /// Which of the pool's buffers this is (0 up to the pool's count), the same every time it is rented. In a
+    /// pool without bytes it names the encoder surface the picture is in.
+    pub fn index(&self) -> usize {
+        self.index
+    }
+}
 
 impl Deref for FrameBuffer {
     type Target = [u8];
@@ -93,7 +111,7 @@ impl Drop for FrameBuffer {
             .free
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(data);
+            .push((self.index, data));
     }
 }
 
@@ -122,6 +140,8 @@ struct SinkShared {
     queued: AtomicUsize,
     written: AtomicU64,
     broken: AtomicBool,
+    /// It broke because the encoder failed, not the consumer.
+    encoder_failed: AtomicBool,
     closing: AtomicBool,
     error: Mutex<Option<String>>,
 }
@@ -131,11 +151,18 @@ impl SinkShared {
         *self.error.lock().unwrap_or_else(PoisonError::into_inner) = Some(error.to_string());
         self.broken.store(true, Ordering::SeqCst);
     }
+
+    fn fail_encoder(&self, message: String) {
+        *self.error.lock().unwrap_or_else(PoisonError::into_inner) = Some(message);
+        self.encoder_failed.store(true, Ordering::SeqCst);
+        self.broken.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Writes raw frames to the video pipe (server side, design.md section 2.2) or to a dump file on its own
 /// thread. The capture loop enqueues shared frames; when the consumer (ffmpeg) falls behind the queue fills
-/// up and the loop drops frames instead of stalling the GPU / pacer.
+/// up and the loop drops frames instead of stalling the GPU / pacer. With an [`EncodeStage`] the same thread
+/// encodes each frame and writes the transport stream instead (design.md section 2.8).
 pub struct FrameSink {
     shared: Arc<SinkShared>,
     capacity: usize,
@@ -143,6 +170,7 @@ pub struct FrameSink {
     canceller: Option<PipeCanceller>,
     /// The stream until the writer thread takes it over in [`start`](Self::start).
     target: Option<SinkTarget>,
+    stage: Option<EncodeStage>,
     queue: Option<Sender<SharedFrame>>,
     pending_queue: Option<Receiver<SharedFrame>>,
     thread: Option<JoinHandle<()>>,
@@ -172,6 +200,7 @@ impl FrameSink {
                 queued: AtomicUsize::new(0),
                 written: AtomicU64::new(0),
                 broken: AtomicBool::new(false),
+                encoder_failed: AtomicBool::new(false),
                 closing: AtomicBool::new(false),
                 error: Mutex::new(None),
             }),
@@ -179,6 +208,7 @@ impl FrameSink {
             is_pipe: matches!(target, SinkTarget::Pipe(_)),
             canceller,
             target: Some(target),
+            stage: None,
             queue: Some(queue),
             pending_queue: Some(pending_queue),
             thread: None,
@@ -190,9 +220,21 @@ impl FrameSink {
         self.is_pipe
     }
 
-    /// True once a write failed: the consumer went away.
+    /// True once a write failed: the consumer went away (or the encoder failed, see
+    /// [`encoder_failed`](Self::encoder_failed)).
     pub fn broken(&self) -> bool {
         self.shared.broken.load(Ordering::SeqCst)
+    }
+
+    /// The sink broke because its encoder failed; [`error`](Self::error) says how.
+    pub fn encoder_failed(&self) -> bool {
+        self.shared.encoder_failed.load(Ordering::SeqCst)
+    }
+
+    /// Encodes every frame with `stage` and writes the transport stream instead of the raw frame. Call it before
+    /// [`start`](Self::start).
+    pub fn encode_with(&mut self, stage: EncodeStage) {
+        self.stage = Some(stage);
     }
 
     pub fn error(&self) -> Option<String> {
@@ -244,13 +286,24 @@ impl FrameSink {
             return;
         };
         let shared = Arc::clone(&self.shared);
+        let mut stage = self.stage.take();
         let (done_tx, done_rx) = mpsc::channel();
         let thread = std::thread::Builder::new()
             .name("video-pipe-writer".into())
             .spawn(move || {
                 for frame in queue {
                     if !shared.broken.load(Ordering::SeqCst) {
-                        match target.write_all(&frame) {
+                        let written = match stage.as_mut() {
+                            None => target.write_all(&frame),
+                            Some(stage) => match stage.push(&frame) {
+                                Ok(()) => target.write_all(stage.output()).inspect(|_| stage.written()),
+                                Err(message) => {
+                                    shared.fail_encoder(message);
+                                    Ok(())
+                                }
+                            },
+                        };
+                        match written {
                             Ok(()) => {
                                 shared.written.fetch_add(1, Ordering::SeqCst);
                             }
@@ -262,6 +315,18 @@ impl FrameSink {
                     drop(frame);
                     shared.queued.fetch_sub(1, Ordering::SeqCst);
                 }
+                if let Some(stage) = stage.as_mut().filter(|_| !shared.broken.load(Ordering::SeqCst)) {
+                    // the pictures the encoder still holds (B-frames waiting for their reference)
+                    match stage.finish() {
+                        Ok(()) => {
+                            if let Err(e) = target.write_all(stage.output()) {
+                                shared.fail(&e);
+                            }
+                        }
+                        Err(message) => shared.fail_encoder(message),
+                    }
+                }
+                drop(stage);
                 if !shared.broken.load(Ordering::SeqCst) {
                     let _ = target.flush();
                 }
