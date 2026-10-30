@@ -1,7 +1,8 @@
 //! Finds an external executable (mpv / ffmpeg / ffprobe): next to our exe, in tools/, then on PATH.
 //!
 //! macOS adds the places a bundled or Homebrew copy lives: an app started from Finder gets a PATH of
-//! /usr/bin:/bin:/usr/sbin:/sbin, so Homebrew's directories have to be probed by name.
+//! /usr/bin:/bin:/usr/sbin:/sbin, so Homebrew's directories have to be probed by name. ffmpeg and ffprobe are
+//! looked for in Homebrew's `ffmpeg-full` before PATH: the plain `ffmpeg` formula has no libsrt.
 
 use std::path::{Path, PathBuf};
 
@@ -89,6 +90,13 @@ pub fn candidates(platform: Platform, exe_name: &str, app_dir: &Path, path_env: 
                 list.push(contents.join("Resources").join(TOOLS_FOLDER_NAME).join(exe_name));
             }
         }
+    }
+    // Homebrew's ffmpeg formula has no libsrt (nor zscale); ffmpeg-full has both. It is keg-only, so not linked into
+    // bin/: probed by name, and ahead of PATH, where a terminal finds the plain ffmpeg first.
+    let ffmpeg_tool = Path::new(exe_name).file_stem().is_some_and(|stem| stem == FFMPEG || stem == FFPROBE);
+    if platform == Platform::MacOs && ffmpeg_tool {
+        list.push(Path::new("/opt/homebrew/opt/ffmpeg-full/bin").join(exe_name)); // Apple silicon Homebrew
+        list.push(Path::new("/usr/local/opt/ffmpeg-full/bin").join(exe_name)); // Intel Homebrew
     }
     if let Some(path_env) = path_env {
         for raw in path_env.split(platform.path_separator()) {

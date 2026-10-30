@@ -27,7 +27,7 @@
 - **Windows 10 或 11**（64 位），或 **macOS 13** 及以上。在 Mac 上分享 HDR 需要 macOS 15 和 Apple 芯片。
 - **最好有 IPv6**。点对点在 IPv6 上最好用（IPv6 没有 NAT，两台电脑能直接互通）。在 <https://test-ipv6.com> 检查：看到 "10/10"，至少是 "IPv6 address detected" 就行。没有 IPv6？通常可以在路由器里打开，或者请运营商开通。没有 IPv6 时 HdrCast 走 IPv4，只要主播那边是开放的就能连（见下一条）。
 - **Windows 防火墙：点一次**。应用里 **防火墙** 那一行出现 **放行…** 时点一下，并在 Windows 的提示里确认。有些路由器（国内常见）每个目的地换一个端口，这样的包只有在 Windows 防火墙放行 HdrCast 时才进得来。这条规则认的是程序所在的路径：升级时把新版本解压覆盖到同一个 `HdrCast` 文件夹（见 [安装](#安装)），规则就一直有效；放到别的文件夹的副本要再点一次（应用会问）。应用在线或播放时会自己在路由器上打开端口（UPnP），停下后再关掉。
-- **ffmpeg**（开播用）和 **mpv**（观看用），都要带 SRT 支持。Windows：发行包的 `tools\` 里已经带了。macOS：`brew install ffmpeg mpv`。见 [工具](#工具)。
+- **ffmpeg**（开播用）和 **mpv**（观看用），都要带 SRT 支持。Windows：发行包的 `tools\` 里已经带了。macOS：`brew install ffmpeg-full mpv`（Homebrew 普通的 `ffmpeg` 不带 SRT）。见 [工具](#工具)。
 - 能硬解 10 bit HEVC 的显卡（NVIDIA GTX 10 系及以上、AMD RX 400 及以上、Intel 7 代及以上、任何 Apple 芯片的 Mac）。
 - 下行带宽约为码率的 1.3 倍（40 Mbps 的流要 50 Mbps 左右）。开播的人每位观众要占一路上行（见 [开播](#开播)）。
 
@@ -37,7 +37,7 @@
 
 - **Windows**：把 `HdrCast-<版本>.zip` 解压到任意位置，运行解压出来的 `HdrCast` 文件夹里的 `HdrCast.exe`。ffmpeg、ffprobe 和 mpv 已经在它的 `tools\` 里。（朋友一般从建组的人那里拿到这个 zip；自己打包见 [构建](#构建)。）
 - **Windows 上升级**：先在通知区域的 HdrCast 图标上选 **退出 HdrCast**，再把新的 zip 解压到放 `HdrCast` 的那个文件夹（资源管理器的"全部解压缩"里把目标改成那个文件夹，比如 `D:\`），替换旧文件。`HdrCast` 文件夹名不带版本号，所以防火墙规则和 **登录时自动启动 HdrCast** 都继续有效。
-- **macOS**：把 `HdrCast.app` 拖进"应用程序"，再装工具：`brew install ffmpeg mpv`。第一次开播时系统会请求"屏幕与系统音频录制"权限。
+- **macOS**：把 `HdrCast.app` 拖进"应用程序"，再装工具：`brew install ffmpeg-full mpv`。第一次开播时系统会请求"屏幕与系统音频录制"权限。
 
 ### 建组或加入
 
@@ -118,7 +118,7 @@
 | The signaling server cannot be reached | 你的网络断了，或者信令服务器挂了。已经在看的人不受影响。 |
 | 画面卡一下、过几秒又恢复 | 加大延迟（中国可以试自定义 4000～5000 ms），或者请主播降低码率。 |
 | HDR 显示器上颜色发灰、发平 | 系统的 HDR 没打开（Windows：`Win + Alt + B`）。 |
-| mpv 说打不开 `srt://` | 你的 mpv 没带 libsrt：用 zhongfly / shinchiro 的构建（get-tools.cmd 下载的就是）或 Homebrew 的。 |
+| mpv 说打不开 `srt://` | 你的 mpv 没带 libsrt：Windows 上用 zhongfly / shinchiro 的构建（get-tools.cmd 下载的就是）。Homebrew 的 mpv 也不带：Mac 上装好 `ffmpeg-full`，**设置 → 播放方式** 保持 **自动**（或 **ffmpeg → HdrCast → mpv**）。 |
 
 更多见 [docs/faq.zh-CN.md](docs/faq.zh-CN.md)。找朋友帮忙时，把 **日志 → 复制** 的内容发给他：里面的密码和邀请码都已经打码。
 
@@ -156,11 +156,13 @@
 
 | 工具 | 谁需要 | Windows | macOS |
 |---|---|---|---|
-| ffmpeg | 开播的人 | 发行包 `tools\` 自带（BtbN gpl 构建，带 libsrt 和 NVENC / AMF / QSV） | `brew install ffmpeg`（带 libsrt 和 VideoToolbox） |
-| mpv | 看的人 | 发行包 `tools\` 自带（zhongfly 构建，带 libsrt） | `brew install mpv` |
+| ffmpeg | 开播的人（Mac 上看的人也要） | 发行包 `tools\` 自带（BtbN gpl 构建，带 libsrt 和 NVENC / AMF / QSV） | `brew install ffmpeg-full`（带 libsrt 和 VideoToolbox；普通的 `ffmpeg` 不带 libsrt） |
+| mpv | 看的人 | 发行包 `tools\` 自带（zhongfly 构建，带 libsrt） | `brew install mpv`（不带 libsrt：经 ffmpeg 管道播放，见下） |
 | WebView2 | 界面 | Windows 11 自带；Windows 10 一般已随 Edge 装好 | 不需要（系统自带 WebKit） |
 
 Windows 上 `scripts\get-tools.cmd` 一键下载 / 更新 ffmpeg 和 mpv（`sender` / `viewer` / `both`，加 `force` 重新下载）；`scripts\check-tools.cmd` 检查编码器和 `srt://` 支持。
+
+Mac 上 HdrCast 会自己找到 Homebrew 的 `ffmpeg-full`（它是 keg-only，不在 PATH 里），并优先于普通的 `ffmpeg`。Homebrew 的 mpv 不带 libsrt，但只要 **设置 → 播放方式** 是 **自动**（默认），就由 ffmpeg-full 接收流，再交给 mpv，不受影响。
 
 设置和日志在 `%APPDATA%\HdrCast\`（macOS：`~/Library/Application Support/HdrCast/`）。`group.json` 与 0.2 共用，升级后不用重新加入。0.3.1 起多了 `device.json`（这台电脑的设备私钥：不要发出去，换电脑时不要拷贝它）和 `access.json`（谁可以连接）。
 

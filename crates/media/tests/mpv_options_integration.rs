@@ -154,6 +154,11 @@ fn every_generated_mpv_option_exists() {
             "this mpv has no Direct3D 11, so {not_here:?} went unchecked (an mpv on Windows checks them)"
         ));
     }
+    if !not_here.is_empty() {
+        note(&format!(
+            "this mpv has no Direct3D 11, so {not_here:?} went unchecked (an mpv on Windows checks them)"
+        ));
+    }
 }
 
 /// `--list-options` also prints the choices of an option: every value we can generate for such an option must

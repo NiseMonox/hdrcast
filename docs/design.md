@@ -1139,7 +1139,7 @@ answer: "hdrcast/v1/answer-device" gid  sid  t  ok(true|false)  reason  cands  �
 | NVENC / AMF / QSV / x265 | `hevc_videotoolbox`（HDR：`-profile:v main10`、`p010le`；`-realtime 1 -allow_sw 0`）或 x265 |
 | mpv `--gpu-api=d3d11 --hwdec=d3d11va` | `--vo=gpu-next --hwdec=videotoolbox`（其余选项相同；HDR 直通是否还需要别的选项要在 XDR 屏上看） |
 | mpv IPC 命名管道 | 临时目录下的 Unix 套接字 |
-| 工具在 `tools\` | Homebrew：`/opt/homebrew/bin`、`/usr/local/bin`（`brew install ffmpeg mpv`），或应用包里的 `Resources/tools` |
+| 工具在 `tools\` | Homebrew：`/opt/homebrew/bin`、`/usr/local/bin`（`brew install ffmpeg-full mpv`；ffmpeg / ffprobe 先找 keg-only 的 `/opt/homebrew/opt/ffmpeg-full/bin`，在 PATH 之前，因为普通的 `ffmpeg` 不带 libsrt；Homebrew 的 mpv 也不带，靠默认的播放方式"自动"经过 ffmpeg），或应用包里的 `Resources/tools` |
 | `%APPDATA%\HdrCast` | `~/Library/Application Support/HdrCast` |
 | Windows 防火墙规则 + **放行…** | 没有对应物（界面不显示这一栏）；UPnP 照做 |
 | 稳定 IPv6 地址：`GetAdaptersAddresses` 的 SuffixOrigin / DAD 状态 | `getifaddrs` + `SIOCGIFAFLAG_IN6`（跳过 temporary / deprecated） |

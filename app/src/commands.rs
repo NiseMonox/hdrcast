@@ -324,8 +324,9 @@ pub fn ffmpeg_missing(platform: tool_locator::Platform) -> String {
             By hand: take the gyan.dev \"full\" or BtbN win64-gpl build and put ffmpeg.exe next to HdrCast.exe \
             (or in tools\\), or choose it in Settings."
             .to_string(),
-        _ => "ffmpeg was not found.\n\nInstall it with Homebrew (brew install ffmpeg), or choose it in Settings. \
-              It needs libsrt and, for sharing, the VideoToolbox HEVC encoder (Homebrew's build has both)."
+        _ => "ffmpeg was not found.\n\nInstall it with Homebrew (brew install ffmpeg-full), or choose it in Settings. \
+              It needs libsrt and, for sharing, the VideoToolbox HEVC encoder: Homebrew's ffmpeg-full has both, \
+              its plain ffmpeg has no libsrt."
             .to_string(),
     }
 }
@@ -339,7 +340,8 @@ pub fn mpv_missing(platform: tool_locator::Platform) -> String {
             (or in tools\\), or choose it in Settings."
             .to_string(),
         _ => "mpv was not found.\n\nInstall it with Homebrew (brew install mpv), or choose it in Settings. \
-              It needs libsrt (Homebrew's build has it)."
+              Homebrew's mpv has no libsrt, so on a Mac it plays through ffmpeg (Player input \"Automatic\", the \
+              default), which needs an ffmpeg with libsrt (brew install ffmpeg-full)."
             .to_string(),
     }
 }
