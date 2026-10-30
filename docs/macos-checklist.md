@@ -402,3 +402,19 @@ open dist/HdrCast.app
       "系统设置 → 通用 → 登录项"里能看到它；在那里关掉后 HdrCast 的开关**仍显示开**（读不到这个状态，是已知局限）。
 - [ ] HdrCast 运行时在访达里再打开 HdrCast.app：不会出现第二个进程（`pgrep -fl HdrCast` 只有一个应用进程），原来的窗口出来。
       登录项启动的那一份同样如此（它是 launchd 直接启动的，LaunchServices 是否把它认作同一个应用要实测；不认时 `instance.lock` 会让第二个进程把窗口叫出来后退出）。
+
+## 17. 控制模式（0.3.7；Mac 当观众，主播是有 NVIDIA 显卡的 Windows）
+
+Mac 多半是拿来操作别的电脑的那一台。控制模式里 Mac 自己的部分只做过类型检查：声音走 AudioQueue（`crates/capture/src/mac/playback.rs`），
+mpv 用 `crates/media/src/receiver/mpv_command.rs` 里的 `low_latency_args`（`--untimed`、`--video-latency-hacks=yes`、`--hwdec-threads=1`，从标准输入读裸 HEVC）。
+
+- [ ] 主播 **开播 → 控制模式 → 提供控制模式** 开着（默认开）。Mac 上 **观看 → 连接 → 模式 → 控制**，主播那一行带"控制模式"标记 → 点 **控制**。
+      日志依次有 `[app] connecting to … in control mode …`、`[app] control mode: HdrCast hands mpv each picture …`；mpv 窗口出画面，
+      面板没有延迟预设，"延迟"格写着 `主播 … ms · ping … ms`，还有帧率、码率和"丢失的画面"。
+- [ ] 声音：有、不断续，面板里声音的欠载数不一直涨。没有声音时日志有 `[ll] no sound: …`（AudioQueue 打不开）：把那一行发回来。
+- [ ] 延迟：主播屏幕上开一个毫秒秒表，用手机同时拍主播的屏幕和 Mac 上的 mpv 窗口，读数之差就是从屏幕到屏幕的延迟。
+      Windows 观众在同一台电脑上是 14.5 ms（1080p 120 fps）；Mac 多一两个刷新周期正常。多出 50 ms 以上 → mpv 在 VideoToolbox 上还在攒帧：
+      把 **设置 → 硬件解码** 改成 `videotoolbox-copy` 再拍一次，两次的照片和 mpv 日志（**日志** 页筛"播放器"）都发回来。
+- [ ] 移动鼠标、打字：和第 15 步一样能控制，指针跟手。
+- [ ] 主播端拔一下网线（或关掉 Wi-Fi）两三秒再接上：画面停住，面板写着"传输中丢了一帧：画面停在上一帧，等关键帧"；接上后一两秒内画面接着动，
+      不用重新连接（连接 15 s 收不到东西才算断）。

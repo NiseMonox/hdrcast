@@ -7,16 +7,19 @@
 //! * [`VideoEncoder`] is what a platform's encoder does (NVENC on Windows);
 //! * [`KeyframeClock`] decides which frames become keyframes: the first, every `--gop` frames after the previous
 //!   one, and any frame one was asked for;
-//! * [`ts::TsWriter`] wraps the pictures into a transport stream;
+//! * [`ts::TsWriter`] wraps the pictures into a transport stream, or in control mode (`--low-latency`, design.md
+//!   section 11) [`frames`] gives each picture a record of its own that HdrCast reads;
 //! * [`EncodeControl`] carries the app's commands (lines on stdin) to the thread that encodes, and
 //!   [`EncoderEvent`]s go back as JSON lines on stdout;
 //! * [`EncodeStage`] puts them together on the sink's writer thread.
 
+pub mod frames;
 pub mod ts;
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
+use crate::clock::{now_ticks, TICKS_PER_SECOND};
 use crate::frame::SharedFrame;
 use crate::log;
 
@@ -61,30 +64,38 @@ pub trait VideoEncoder: Send {
 
 /// Which frames become keyframes: the first, then every `gop` frames after the previous keyframe, and any frame
 /// one was asked for. One asked for restarts the count, so the next unasked one comes a whole interval later
-/// instead of right after it.
+/// instead of right after it. A `gop` of 0 (control mode) makes only the first and the ones asked for.
 #[derive(Debug, Clone)]
 pub struct KeyframeClock {
-    gop: u64,
+    gop: Option<u64>,
     last: Option<u64>,
 }
 
 impl KeyframeClock {
     pub fn new(gop_frames: u32) -> Self {
-        Self { gop: u64::from(gop_frames.max(1)), last: None }
+        Self { gop: (gop_frames > 0).then_some(u64::from(gop_frames)), last: None }
     }
 
     /// Whether frame `index` is to be a keyframe; `asked`: somebody asked for one since the previous frame.
     pub fn is_keyframe(&mut self, index: u64, asked: bool) -> bool {
-        let due = self.last.is_none_or(|last| index.saturating_sub(last) >= self.gop);
+        let due = match (self.last, self.gop) {
+            (None, _) => true,
+            (Some(last), Some(gop)) => index.saturating_sub(last) >= gop,
+            (Some(_), None) => false,
+        };
         if due || asked {
             self.last = Some(index);
         }
         due || asked
     }
 
-    /// Frames from `index` to the next keyframe nobody needs to ask for.
+    /// Frames from `index` to the next keyframe nobody needs to ask for; `u64::MAX` when none will come.
     pub fn frames_to_next(&self, index: u64) -> u64 {
-        self.last.map_or(0, |last| (last + self.gop).saturating_sub(index))
+        match (self.last, self.gop) {
+            (None, _) => 0,
+            (Some(last), Some(gop)) => (last + gop).saturating_sub(index),
+            (Some(_), None) => u64::MAX,
+        }
     }
 }
 
@@ -200,6 +211,8 @@ impl EncoderEvent {
 pub struct EncodeStage {
     encoder: Box<dyn VideoEncoder>,
     ts: ts::TsWriter,
+    /// Control mode: each picture gets a record of its own ([`frames`]) instead of going into the transport stream.
+    framed: bool,
     clock: KeyframeClock,
     control: Arc<EncodeControl>,
     next_index: u64,
@@ -207,6 +220,10 @@ pub struct EncodeStage {
     output: Vec<u8>,
     /// The keyframe request this stage is serving: when it came in.
     asked_at: Option<Instant>,
+    /// The frame of the last push: when it was captured, whether it repeats the one before, how long it took.
+    captured: i64,
+    repeat: bool,
+    encode_us: u32,
     events: Box<dyn FnMut(&EncoderEvent) + Send>,
 }
 
@@ -222,14 +239,24 @@ impl EncodeStage {
         Self {
             encoder,
             ts: ts::TsWriter::new(fps),
+            framed: false,
             clock: KeyframeClock::new(gop_frames),
             control,
             next_index: 0,
             pictures: Vec::new(),
             output: Vec::with_capacity(1 << 20),
             asked_at: None,
+            captured: 0,
+            repeat: false,
+            encode_us: 0,
             events,
         }
+    }
+
+    /// Control mode (design.md section 11.2): the output is one [`frames::FrameRecord`] per picture.
+    pub fn framed(mut self) -> Self {
+        self.framed = true;
+        self
     }
 
     /// Encodes the next frame. What it produced is in [`output`](Self::output) (possibly nothing).
@@ -252,8 +279,13 @@ impl EncodeStage {
             self.asked_at.get_or_insert(at);
         }
         let keyframe = self.clock.is_keyframe(self.next_index, asked.is_some());
+        // the same buffer again, captured at the same moment: the engine had nothing new to send
+        self.repeat = frame.captured_ticks() != 0 && frame.captured_ticks() == self.captured;
+        self.captured = frame.captured_ticks();
         self.pictures.clear();
+        let began = Instant::now();
         self.encoder.encode(frame, self.next_index, keyframe, &mut self.pictures)?;
+        self.encode_us = micros(began.elapsed().as_secs_f64());
         self.next_index += 1;
         self.wrap();
         Ok(())
@@ -269,6 +301,17 @@ impl EncodeStage {
 
     fn wrap(&mut self) {
         self.output.clear();
+        if self.framed {
+            // no B-frames in control mode: the picture that came out is the frame just pushed
+            let age = if self.captured != 0 { micros((now_ticks() - self.captured) as f64 / TICKS_PER_SECOND as f64) } else { 0 };
+            for picture in &self.pictures {
+                let asked = picture.keyframe && self.asked_at.is_some();
+                let flags = frames::flags(picture.keyframe, self.repeat, asked);
+                frames::write_header(picture.pts.max(0) as u64, flags, age, self.encode_us, picture.data.len(), &mut self.output);
+                self.output.extend_from_slice(&picture.data);
+            }
+            return;
+        }
         for picture in &self.pictures {
             self.ts.write(picture, &mut self.output);
         }
@@ -293,10 +336,69 @@ impl EncodeStage {
     }
 }
 
+/// Seconds as whole µs, saturating.
+fn micros(seconds: f64) -> u32 {
+    (seconds * 1e6).round().clamp(0.0, f64::from(u32::MAX)) as u32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::frame::FramePool;
+
+    #[test]
+    fn with_no_interval_only_the_first_keyframe_and_those_asked_for_come() {
+        let mut clock = KeyframeClock::new(0);
+        let keyframes: Vec<u64> = (0..1000).filter(|&i| clock.is_keyframe(i, i == 400 || i == 401)).collect();
+        assert_eq!(keyframes, vec![0, 400, 401]);
+        assert_eq!(clock.frames_to_next(500), u64::MAX);
+    }
+
+    #[test]
+    fn framed_output_is_one_record_per_picture_with_its_age_and_whether_it_repeats() {
+        let control = EncodeControl::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let mut stage = EncodeStage::new(
+            Box::new(Fake { held: None, hold_odd: false, bitrates: Arc::new(Mutex::new(Vec::new())) }),
+            60,
+            0,
+            control.clone(),
+            Box::new(move |e| sink.lock().unwrap().push(e.clone())),
+        )
+        .framed();
+        let pool = FramePool::new(3, 4);
+        let mut stream = Vec::new();
+        let mut shared = None;
+        for i in 0..6u8 {
+            if i == 4 {
+                control.command("keyframe").unwrap();
+            }
+            // frames 2 and 3 repeat frame 1's buffer (nothing new on the screen)
+            if i != 2 && i != 3 {
+                let mut frame = pool.try_rent().unwrap();
+                frame.fill(i);
+                frame.set_captured_ticks(now_ticks() - 3 * crate::clock::TICKS_PER_MS);
+                shared = Some(Arc::new(frame));
+            }
+            stage.push(shared.as_ref().unwrap()).unwrap();
+            stream.extend_from_slice(stage.output());
+            stage.written();
+        }
+        let mut reader = &stream[..];
+        let mut records = Vec::new();
+        while let Some(record) = frames::FrameRecord::read(&mut reader).unwrap() {
+            records.push(record);
+        }
+        let summary: Vec<(u64, bool, bool, bool, u8)> =
+            records.iter().map(|r| (r.index, r.keyframe, r.repeat, r.asked, r.data[0])).collect();
+        assert_eq!(
+            summary,
+            vec![(0, true, false, false, 0), (1, false, false, false, 1), (2, false, true, false, 1), (3, false, true, false, 1), (4, true, false, true, 4), (5, false, false, false, 5)]
+        );
+        assert!(records.iter().all(|r| r.age_us >= 3000), "{records:?}");
+        assert!(events.lock().unwrap().iter().any(|e| matches!(e, EncoderEvent::Keyframe { frame: 4, asked: true, .. })));
+    }
 
     #[test]
     fn keyframes_come_every_gop_frames_and_one_asked_for_restarts_the_count() {

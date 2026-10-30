@@ -6,36 +6,47 @@
 //! rules (`access.rs`), for the user's answer when the rules say to ask, and for the stream to flow before it is
 //! answered, so that the viewer's player finds the stream at once. Remote control is registered per session,
 //! with the key agreed with the viewer's device and the rule of that device. With "keyframe on request" the
-//! capture engine encodes, and viewers who lose part of the stream get a fresh keyframe (§2.8, §8.12).
+//! capture engine encodes, and viewers who lose part of the stream get a fresh keyframe (§2.8, §8.12). A
+//! broadcast that everyone who watched has left ends by itself when the settings say so (§8.10).
+//!
+//! A viewer in control mode (§11) gets the low-latency stream instead: a capture engine of its own encodes for it
+//! (`low_latency_host.rs`), started when the first such viewer is let in and stopped a little after the last one
+//! left. It runs next to the buffered stream when both kinds of viewers are there.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hdrcast_capture::{CaptureArgs, CaptureFormat};
+use hdrcast_capture::{CaptureArgs, CaptureFormat, EncodeArgs, EngineEncoder};
 use hdrcast_core::common::firewall::row as firewall_row;
 use hdrcast_core::group::device;
 use hdrcast_core::group::keys::GroupKeys;
 use hdrcast_core::messages::JoinAnswer;
 use hdrcast_media::keyframe;
+use hdrcast_media::low_latency;
 use hdrcast_media::sender::encoder_profiles;
 use hdrcast_media::sender::ffmpeg_command::{self, AudioCodec, FfmpegPlan};
 use hdrcast_media::sender::settings::HdrMode;
-use hdrcast_p2p::{JoinTicket, P2pHost, P2pHostOptions, SideUse, SwitchableStream, ViewerState};
+use hdrcast_p2p::{JoinTicket, P2pHost, P2pHostOptions, SideUse, SwitchableStream, ViewerInfo, ViewerState};
 use serde_json::{json, Value};
 
 use crate::access::{AccessSettings, Connect, Control};
 use crate::commands;
 use crate::control_host::ControlHub;
 use crate::keyframe_host::KeyframeHub;
+use crate::low_latency_host::{LowLatencyHost, LowLatencyPlan};
 use crate::net_report::{self, End, NetReport};
 use crate::sender_runner::{self, RunnerState, SendPlan, SenderRunner};
 use crate::state::{self, AppState, Inner};
 
 /// The encoder keeps running this long after the last viewer left, for a viewer who comes straight back.
 const IDLE_STOP: Duration = Duration::from_secs(20);
+/// A broadcast that is to end when its viewers leave ends this long after the last one left. A viewer who comes
+/// back later is let in on request (without asking when it watched lately), and a path that drops only counts as
+/// leaving after 15 s of silence, by when the viewer has joined again.
+const UNWATCHED_END: Duration = Duration::from_secs(2);
 /// How long a request waits for this computer's user (the viewer waits a minute).
 const KNOCK_LIMIT: Duration = Duration::from_secs(50);
 /// Somebody let in (or watching) is let in again without asking for this long: reconnects after a hiccup.
@@ -50,6 +61,9 @@ const STREAM_WAIT: Duration = Duration::from_secs(25);
 /// A change of the stream's settings while it runs restarts capture and encoder this long after the last edit:
 /// dragging the bitrate slider or trying out frame rates restarts once, not at every step.
 const RESTART_SETTLE: Duration = Duration::from_millis(800);
+/// Control mode's engine keeps running this long after the last viewer in control mode left (one that comes
+/// straight back, or joins again after a hiccup, finds it running).
+const LOW_LATENCY_IDLE_STOP: Duration = Duration::from_secs(10);
 
 /// Who a viewer is, as far as the rules go.
 #[derive(Debug, Clone)]
@@ -89,8 +103,29 @@ struct Admitted {
 struct Activity {
     /// Viewers let in that wait for the stream to flow.
     admitting: usize,
-    /// Since when nobody has been watching (while the encoder runs on request).
+    /// Since when nobody has been watching: while the encoder runs on request, or while live once everyone who
+    /// watched has left (when the broadcast is to end then).
     idle_since: Option<Instant>,
+    /// Somebody has watched since going live: before that, a broadcast nobody watches is waiting for its viewers.
+    watched: bool,
+}
+
+impl Activity {
+    /// Housekeeping's look at the stream at `now` (`idle`: it runs and nobody watches, connects or waits;
+    /// `watching`: somebody's picture flows). True once nobody has been watching for long enough where that ends
+    /// something: [`IDLE_STOP`] for the encoder that runs on request, [`UNWATCHED_END`] for a broadcast (`live`)
+    /// that somebody watched, when the settings say it ends when its viewers leave (`ends_unwatched`).
+    fn idle_long_enough(&mut self, now: Instant, idle: bool, watching: bool, live: bool, ends_unwatched: bool) -> bool {
+        if live && watching {
+            self.watched = true;
+        }
+        if !idle || self.admitting > 0 || (live && !(ends_unwatched && self.watched)) {
+            self.idle_since = None;
+            return false;
+        }
+        let since = *self.idle_since.get_or_insert(now);
+        now.saturating_duration_since(since) >= if live { UNWATCHED_END } else { IDLE_STOP }
+    }
 }
 
 struct Session {
@@ -119,11 +154,17 @@ struct Session {
     net_reports: Mutex<HashMap<String, NetReport>>,
     /// The settings changed while streaming in a way only a restart applies: when to do it.
     restart_due: Mutex<Option<Instant>>,
+    /// Control mode's own capture engine and sender (§11).
+    low_latency: LowLatencyHost,
+    /// Since when its engine has been running with nobody in control mode.
+    low_latency_idle_since: Mutex<Option<Instant>>,
 }
 
 #[derive(Default)]
 pub struct Share {
     session: Mutex<Option<Arc<Session>>>,
+    /// Broadcasts that ended because everyone who watched had left, for the page to say so once.
+    ended_unwatched: AtomicU32,
 }
 
 fn current(app: &AppState) -> Option<Arc<Session>> {
@@ -197,6 +238,47 @@ fn build_plan(app: &AppState, inner: &Inner) -> Result<SendPlan, Vec<String>> {
     Ok(SendPlan { capture_exe: state::current_exe(), capture_argv, ffmpeg_exe: ffmpeg, ffmpeg: plan, pipe_names, engine_encode })
 }
 
+/// Control mode's engine (§11.2): the shared picture (display, size, HDR, cursor, sound) at control mode's own
+/// frame rate and bitrate, encoded by NVENC inside the engine the way Vibepollo encodes (`--low-latency`).
+fn build_low_latency_plan(inner: &Inner) -> Result<LowLatencyPlan, Vec<String>> {
+    let sender = &inner.sender;
+    let output = state::selected_output(sender, &inner.outputs).ok_or_else(|| vec!["No display selected.".to_string()])?;
+    let (width, height) = sender.resolve_size(output.width, output.height);
+    let format = sender.resolve_format(output.hdr);
+    let capture_format = if format == CaptureFormat::P010 { CaptureFormat::Auto } else { format };
+    let pid = std::process::id();
+    let (video_pipe, audio_pipe) = (format!("hdrcast-ll-video-{pid}"), format!("hdrcast-ll-audio-{pid}"));
+    let mut capture = sender.to_capture_args(output, width, height, capture_format, &video_pipe, &audio_pipe, pid);
+    capture.fps = sender.control_fps.clamp(10, 240) as u32;
+    let kbps = sender.control_bitrate_mbps.clamp(1, 500) as u32 * 1000;
+    capture.encode = Some(EncodeArgs::low_latency(EngineEncoder::Nvenc, kbps, capture.fps));
+    let mut capture_argv = vec!["capture".to_string()];
+    capture_argv.extend(capture.to_argv());
+    let summary = format!(
+        "control mode: HEVC (NVENC, ultra-low latency) {} Mbps, up to {} fps, {}x{} {}",
+        kbps / 1000,
+        capture.fps,
+        width,
+        height,
+        if format == CaptureFormat::P010 { "HDR10" } else { "SDR" }
+    );
+    Ok(LowLatencyPlan {
+        audio_pipe: sender.audio.then_some(audio_pipe),
+        capture,
+        capture_exe: state::current_exe(),
+        capture_argv,
+        video_pipe,
+        summary,
+    })
+}
+
+/// Control mode can be offered: switched on, and an NVIDIA GPU to encode on (the engine drives NVENC itself; one
+/// that found out it cannot made `low_latency` unavailable).
+fn offers_control_mode(inner: &Inner, low_latency: Option<&LowLatencyHost>) -> bool {
+    let nvidia = inner.outputs.iter().any(|o| o.adapter.to_ascii_uppercase().contains("NVIDIA"));
+    inner.sender.offers_control_mode(nvidia) && !low_latency.is_some_and(LowLatencyHost::unavailable)
+}
+
 /// The interval of the keyframes nobody asks for.
 fn gop_of(app: &AppState) -> Duration {
     Duration::from_secs_f64(app.inner.lock().unwrap().sender.gop_seconds.max(0.1))
@@ -224,6 +306,7 @@ fn start_hosting(app: &Arc<AppState>) -> Result<Arc<Session>, Vec<String>> {
         let (firewall_app, rules_app, admit_app, admit_session, demand_session) =
             (weak_app.clone(), weak_app.clone(), weak_app.clone(), me.clone(), me.clone());
         let keyframes_app = weak_app.clone();
+        let (control_app, control_session) = (weak_app.clone(), me.clone());
         let host = Arc::new(P2pHost::new(
             P2pHostOptions {
                 group,
@@ -246,6 +329,11 @@ fn start_hosting(app: &Arc<AppState>) -> Result<Arc<Session>, Vec<String>> {
                 })),
                 on_demand: Some(Arc::new(move || demand_session.upgrade().is_some_and(|s| !s.live.load(Ordering::Acquire)))),
                 offer_keyframes: Some(Arc::new(move || keyframes_app.upgrade().is_some_and(|app| app.inner.lock().unwrap().sender.encodes_in_engine()))),
+                offer_low_latency: Some(Arc::new(move || {
+                    let (Some(app), Some(session)) = (control_app.upgrade(), control_session.upgrade()) else { return false };
+                    let inner = app.inner.lock().unwrap();
+                    offers_control_mode(&inner, Some(&session.low_latency))
+                })),
                 ..P2pHostOptions::default()
             },
             Box::new(ts.clone()),
@@ -266,6 +354,12 @@ fn start_hosting(app: &Arc<AppState>) -> Result<Arc<Session>, Vec<String>> {
             Arc::new(move |sid| group_keys.keyframe_key(sid)),
             app.logger(),
         );
+        let sender = me.clone();
+        let low_latency = LowLatencyHost::new(
+            app.job.clone(),
+            app.logger(),
+            Arc::new(move |sid, payloads| sender.upgrade().map_or(0, |s| s.host.send_low_latency(sid, payloads.iter().copied()))),
+        );
         Session {
             host,
             ts,
@@ -285,12 +379,17 @@ fn start_hosting(app: &Arc<AppState>) -> Result<Arc<Session>, Vec<String>> {
             control_asks: Mutex::new(HashSet::new()),
             net_reports: Mutex::new(HashMap::new()),
             restart_due: Mutex::new(None),
+            low_latency,
+            low_latency_idle_since: Mutex::new(None),
         }
     });
-    // the side channel carries remote control and keyframe requests: they tell themselves apart by their first byte
-    let (hub, keyframes) = (session.hub.clone(), session.keyframes.clone());
+    // the side channel carries remote control, keyframe requests and control mode's requests: they tell themselves
+    // apart by their first byte
+    let (hub, keyframes, fast) = (session.hub.clone(), session.keyframes.clone(), session.low_latency.clone());
     session.host.set_side_handler(Arc::new(move |sid, payload| {
-        if keyframe::is_keyframe_datagram(payload) {
+        if low_latency::is_low_latency_datagram(payload) {
+            fast.on_datagram(sid, payload);
+        } else if keyframe::is_keyframe_datagram(payload) {
             keyframes.on_datagram(sid, payload);
         } else {
             hub.on_datagram(sid, payload);
@@ -314,6 +413,7 @@ fn start_hosting(app: &Arc<AppState>) -> Result<Arc<Session>, Vec<String>> {
 impl Session {
     fn shut_down(&self) {
         self.runner.stop();
+        self.low_latency.stop();
         self.hub.stop();
         self.keyframes.stop();
         self.host.stop();
@@ -376,9 +476,53 @@ pub fn settings_changed(app: &AppState) {
         session.host.set_ffmpeg_path(ffmpeg.into_os_string());
     }
     session.keyframes.set_gop(gop_of(app));
-    // "kf" in the live record follows the switch (it applies to the next stream that starts)
+    // "kf" in the live record follows the switch (it applies to the next stream that starts); "ll" too
     session.host.announce_now();
     apply_while_streaming(app, &session);
+    apply_to_control_mode(app, &session);
+}
+
+/// The settings changed: control mode's engine, when it runs, follows them (§11). A new bitrate goes to it without a
+/// break; anything else of its picture starts it again (its viewers ask for a keyframe and go on). Switched off,
+/// whoever is in control mode is disconnected (they may connect again to watch).
+fn apply_to_control_mode(app: &AppState, session: &Arc<Session>) {
+    let (offered, wanted) = {
+        let inner = app.inner.lock().unwrap();
+        (offers_control_mode(&inner, Some(&session.low_latency)), build_low_latency_plan(&inner))
+    };
+    if !offered {
+        for viewer in session.host.viewers().into_iter().filter(|v| v.low_latency) {
+            session.host.kick(&viewer.sid, "the host switched control mode off");
+        }
+        return;
+    }
+    if !matches!(session.low_latency.state(), RunnerState::Starting | RunnerState::Streaming) {
+        return;
+    }
+    let (Some(running), Ok(wanted)) = (session.low_latency.plan(), wanted) else { return };
+    if running == wanted {
+        return;
+    }
+    // the wanted plan at the running bitrate: equal when only the bitrate moved
+    let mut at_running_rate = wanted.capture.clone();
+    if let (Some(encode), Some(now)) = (at_running_rate.encode.as_mut(), running.capture.encode.as_ref()) {
+        (encode.bitrate_kbps, encode.vbv_kbits) = (now.bitrate_kbps, now.vbv_kbits);
+    }
+    if at_running_rate == running.capture {
+        if let Some(encode) = &wanted.capture.encode {
+            if session.low_latency.set_bitrate(encode.bitrate_kbps, encode.vbv_kbits) {
+                app.log(&format!("[app] control mode now at {} Mbps: the running encoder took it", encode.bitrate_kbps / 1000));
+                session.low_latency.adopt_plan(wanted);
+                return;
+            }
+        }
+    }
+    let (low_latency, session) = (session.low_latency.clone(), session.clone());
+    app.log("[app] control mode's settings changed: starting its capture and encoder again");
+    thread::spawn(move || {
+        let _one_at_a_time = session.starting.lock().unwrap();
+        low_latency.start(wanted);
+    });
 }
 
 /// What a change of the settings means for the stream that runs.
@@ -540,14 +684,20 @@ fn admit_in_background(app: &Arc<AppState>, session: &Arc<Session>, ticket: Join
     let (app, worker) = (app.clone(), session.clone());
     let spawned = thread::Builder::new().name("share-admit".into()).spawn(move || {
         let session = worker;
-        let outcome = ensure_streaming(&app, &session).and_then(|()| session.host.admit(&ticket.sid));
+        // control mode has a stream of its own (§11); everybody else gets the buffered one
+        let ready = if ticket.low_latency { ensure_low_latency(&app, &session) } else { ensure_streaming(&app, &session) };
+        let outcome = ready.and_then(|()| session.host.admit(&ticket.sid));
         match outcome {
             Ok(device_key) => {
                 let admitted = Admitted { who: who.clone(), device_bound: device_key.is_some() };
                 let control = control_rule(&app.inner.lock().unwrap().access, &admitted);
                 let key = device_key.unwrap_or_else(|| session.keys.control_key(&ticket.sid));
                 session.hub.register(&ticket.sid, &who.name, &key, control.policy());
-                session.keyframes.register(&ticket.sid, &who.name);
+                if ticket.low_latency {
+                    session.low_latency.register(&ticket.sid, &who.name, &key);
+                } else {
+                    session.keyframes.register(&ticket.sid, &who.name);
+                }
                 session.admitted.lock().unwrap().insert(ticket.sid.clone(), admitted);
                 session.recent_ok.lock().unwrap().insert(who.id.clone(), Instant::now());
             }
@@ -593,6 +743,36 @@ fn ensure_streaming(app: &Arc<AppState>, session: &Session) -> Result<(), String
     }
 }
 
+/// Makes sure control mode's engine runs and its pictures come (§11). The error says why it could not.
+fn ensure_low_latency(app: &Arc<AppState>, session: &Session) -> Result<(), String> {
+    let _one_at_a_time = session.starting.lock().unwrap();
+    if !matches!(session.low_latency.state(), RunnerState::Starting | RunnerState::Streaming) {
+        let plan = {
+            let inner = app.inner.lock().unwrap();
+            if !offers_control_mode(&inner, Some(&session.low_latency)) {
+                return Err("control mode is not offered on this computer".to_string());
+            }
+            build_low_latency_plan(&inner)
+        };
+        let plan = plan.map_err(|problems| problems.join(" "))?;
+        app.log(&format!("[app] {}", plan.summary));
+        session.low_latency.start(plan);
+    }
+    let begun = Instant::now();
+    loop {
+        match session.low_latency.state() {
+            RunnerState::Streaming if session.low_latency.pictures() > 0 => return Ok(()),
+            RunnerState::Failed => return Err(format!("control mode could not start: {}", session.low_latency.status()["detail"].as_str().unwrap_or(""))),
+            RunnerState::Idle => return Err("control mode was stopped".to_string()),
+            _ => {}
+        }
+        if begun.elapsed() > STREAM_WAIT {
+            return Err(format!("control mode's stream did not start within {} s", STREAM_WAIT.as_secs()));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Starts capture and encoder from the current settings.
 fn start_runner(app: &AppState, session: &Session) -> Result<(), Vec<String>> {
     let (plan, display, bitrate, max) = {
@@ -622,6 +802,12 @@ pub fn go_live(app: &Arc<AppState>) -> Result<(), Vec<String>> {
         let _one_at_a_time = session.starting.lock().unwrap();
         if !matches!(session.runner.state(), RunnerState::Starting | RunnerState::Streaming) {
             start_runner(app, &session)?;
+        }
+        // a new broadcast: it can end for want of viewers only once somebody has watched it
+        {
+            let mut activity = session.activity.lock().unwrap();
+            activity.watched = false;
+            activity.idle_since = None;
         }
         session.live.store(true, Ordering::Release);
     }
@@ -654,9 +840,39 @@ pub fn stop(app: &AppState) {
     {
         let _one_at_a_time = session.starting.lock().unwrap();
         session.runner.stop();
+        session.low_latency.stop();
     }
     session.host.announce_now();
     app.log("[app] stopped sharing; still available to the group");
+}
+
+/// Ends a broadcast that everyone who watched has left, as the user's Stop would, but only while nobody came back
+/// (so nobody is disconnected). This computer stays available when the rules say so. Takes a few seconds.
+fn end_unwatched(app: &AppState, session: &Arc<Session>) {
+    let _one_at_a_time = session.starting.lock().unwrap();
+    // looked at again under the lock: somebody may have come back, or the user stopped (and maybe went live again)
+    let unwatched = {
+        let activity = session.activity.lock().unwrap();
+        activity.watched && activity.admitting == 0
+    };
+    // viewers in control mode do not watch the broadcast: they have a stream of their own
+    let still = unwatched
+        && session.is_live()
+        && session.host.viewers().iter().all(|v| v.low_latency)
+        && current(app).is_some_and(|now| Arc::ptr_eq(&now, session));
+    if !still {
+        return;
+    }
+    session.live.store(false, Ordering::Release);
+    app.share.ended_unwatched.fetch_add(1, Ordering::AcqRel);
+    if !app.inner.lock().unwrap().access.available {
+        app.log("[app] everyone who watched has left: the broadcast ended");
+        shut_down(app);
+        return;
+    }
+    session.runner.stop();
+    session.host.announce_now();
+    app.log("[app] everyone who watched has left: the broadcast ended; still available to the group");
 }
 
 /// Disconnects one viewer (and keeps it out for a minute).
@@ -702,6 +918,43 @@ pub fn control_set(app: &AppState, sid: &str, allow: bool) -> Result<(), String>
     current(app).ok_or("Not sharing.")?.hub.decide(sid, allow)
 }
 
+/// Control mode's engine runs while somebody is in control mode, and [`LOW_LATENCY_IDLE_STOP`] longer; one that gave
+/// up for good (no NVENC here) disconnects whoever is in control mode, and the live record stops offering it.
+fn control_mode_housekeeping(app: &Arc<AppState>, session: &Arc<Session>, viewers: &[ViewerInfo]) {
+    let in_control: Vec<String> = viewers.iter().filter(|v| v.low_latency).map(|v| v.sid.clone()).collect();
+    session.low_latency.keep_only(&in_control);
+    let state = session.low_latency.state();
+    if state == RunnerState::Failed && !in_control.is_empty() {
+        for sid in &in_control {
+            session.host.kick(sid, "the host could not keep control mode's stream going");
+        }
+        session.host.announce_now();
+        return;
+    }
+    let running = matches!(state, RunnerState::Starting | RunnerState::Streaming);
+    let admitting = session.activity.lock().unwrap().admitting > 0;
+    let mut idle = session.low_latency_idle_since.lock().unwrap();
+    if !running || !in_control.is_empty() || admitting {
+        *idle = None;
+        return;
+    }
+    let since = *idle.get_or_insert_with(Instant::now);
+    if since.elapsed() < LOW_LATENCY_IDLE_STOP {
+        return;
+    }
+    *idle = None;
+    let (app, session) = (app.clone(), session.clone());
+    thread::spawn(move || {
+        let _one_at_a_time = session.starting.lock().unwrap();
+        // looked at again under the lock: somebody may have been let in meanwhile
+        let still = session.activity.lock().unwrap().admitting == 0 && session.host.viewers().iter().all(|v| !v.low_latency);
+        if still {
+            app.log("[app] nobody is in control mode: stopping its stream until somebody connects");
+            session.low_latency.stop();
+        }
+    });
+}
+
 /// Runs with every status tick: requests that waited too long, an encoder that gave up, an encoder serving
 /// nobody, and what the remote control and the "recently let in" memory should forget.
 pub fn housekeeping(app: &Arc<AppState>) {
@@ -710,6 +963,9 @@ pub fn housekeeping(app: &Arc<AppState>) {
     let sids: Vec<String> = viewers.iter().map(|v| v.sid.clone()).collect();
     session.hub.keep_only(&sids);
     session.keyframes.keep_only(&sids);
+    control_mode_housekeeping(app, &session, &viewers);
+    // from here on, the buffered stream: viewers in control mode have a stream of their own
+    let viewers: Vec<_> = viewers.into_iter().filter(|v| !v.low_latency).collect();
     let restart = {
         let mut due = session.restart_due.lock().unwrap();
         if due.is_some_and(|at| Instant::now() >= at) {
@@ -798,25 +1054,23 @@ pub fn housekeeping(app: &Arc<AppState>) {
         return;
     }
 
-    // On request: once nobody has been watching for a while, the encoder stops.
-    let idle = !session.is_live()
-        && matches!(state, RunnerState::Starting | RunnerState::Streaming)
+    // Once nobody has been watching for a while, the encoder stops when it runs on request, and a broadcast ends
+    // when everyone who watched it has left and the settings say so.
+    let live = session.is_live();
+    let ends_unwatched = app.inner.lock().unwrap().sender.end_when_viewers_leave;
+    let idle = matches!(state, RunnerState::Starting | RunnerState::Streaming)
         && viewers.is_empty()
         && session.knocks.lock().unwrap().is_empty();
-    let stop_now = {
-        let mut activity = session.activity.lock().unwrap();
-        if !idle || activity.admitting > 0 {
-            activity.idle_since = None;
-            false
-        } else {
-            let since = *activity.idle_since.get_or_insert_with(Instant::now);
-            since.elapsed() >= IDLE_STOP
-        }
-    };
+    let watching = viewers.iter().any(|v| v.state == ViewerState::Watching);
+    let stop_now = session.activity.lock().unwrap().idle_long_enough(Instant::now(), idle, watching, live, ends_unwatched);
     if stop_now {
         session.activity.lock().unwrap().idle_since = None;
         let (app, session) = (app.clone(), session.clone());
         thread::spawn(move || {
+            if live {
+                end_unwatched(&app, &session);
+                return;
+            }
             let _one_at_a_time = session.starting.lock().unwrap();
             // looked at again under the lock: somebody may have been let in meanwhile
             let still_idle = !session.is_live() && session.activity.lock().unwrap().admitting == 0 && session.host.viewers().is_empty();
@@ -832,12 +1086,20 @@ pub fn housekeeping(app: &Arc<AppState>) {
 
 pub fn status(app: &AppState) -> Value {
     let device = app.device.code();
+    let ended_unwatched = app.share.ended_unwatched.load(Ordering::Acquire);
     let Some(session) = current(app) else {
         return json!({
             "mode": "off", "state": "idle", "detail": "", "attempt": 0, "uptimeSec": 0,
             "capture": null, "encode": null, "video": null, "p2p": null, "knocks": [], "problem": null, "device": device,
+            "endsInSec": null, "endedUnwatched": ended_unwatched,
         });
     };
+    // live with nobody left of those who watched: housekeeping ends the broadcast when this runs out
+    let ends_in = session
+        .is_live()
+        .then(|| session.activity.lock().unwrap().idle_since)
+        .flatten()
+        .map(|since| UNWATCHED_END.saturating_sub(since.elapsed()).as_secs_f64().ceil() as u64);
     let run = session.runner.snapshot();
     let host = &session.host;
     let admitted = session.admitted.lock().unwrap();
@@ -859,6 +1121,9 @@ pub fn status(app: &AppState) -> Value {
                 "overheadPercent": v.overhead_percent,
                 "net": v.srt.as_ref().map(|s| net_report::status(s, End::Host)),
                 "control": session.hub.state_of(&v.sid),
+                // control mode (§11): its own stream, and what the viewer reports of it
+                "mode": if v.low_latency { "control" } else { "watch" },
+                "ll": session.low_latency.viewer_status(&v.sid),
             })
         })
         .collect();
@@ -913,6 +1178,12 @@ pub fn status(app: &AppState) -> Value {
         "knocks": knocks,
         "problem": session.problem.lock().unwrap().clone(),
         "device": device,
+        "endsInSec": ends_in,
+        "endedUnwatched": ended_unwatched,
+        "controlMode": {
+            "offered": offers_control_mode(&app.inner.lock().unwrap(), Some(&session.low_latency)),
+            "engine": session.low_latency.status(),
+        },
     })
 }
 
@@ -951,5 +1222,49 @@ mod tests {
         let mut lower = by_ffmpeg.clone();
         lower.ffmpeg.encoder.bitrate_kbps = 25_000;
         assert!(matches!(plan_change(&by_ffmpeg, &lower), PlanChange::Restart));
+    }
+
+    #[test]
+    fn a_broadcast_ends_once_everyone_who_watched_has_left_and_not_before() {
+        let start = Instant::now();
+        let at = |s: u64| start + Duration::from_secs(s);
+        // live, with the switch on: nobody, somebody watching, somebody connecting (not idle, nobody's picture yet)
+        let alone = |a: &mut Activity, s: u64| a.idle_long_enough(at(s), true, false, true, true);
+        let watched = |a: &mut Activity, s: u64| a.idle_long_enough(at(s), false, true, true, true);
+        let connecting = |a: &mut Activity, s: u64| a.idle_long_enough(at(s), false, false, true, true);
+
+        // nobody has come yet: the broadcast waits for its viewers however long that takes
+        let mut live = Activity::default();
+        assert!(!alone(&mut live, 0));
+        assert!(!alone(&mut live, 3600));
+        // somebody who never got a picture does not count either
+        assert!(!connecting(&mut live, 3601));
+        assert!(!alone(&mut live, 3602));
+        assert!(!alone(&mut live, 3700));
+        // somebody watched and left: 2 s later it ends, unless somebody comes back first
+        assert!(!watched(&mut live, 3701));
+        assert!(!alone(&mut live, 3702));
+        assert!(!alone(&mut live, 3703));
+        assert!(!connecting(&mut live, 3703)); // back (joining again with a new delay, say): the wait starts over
+        assert!(!alone(&mut live, 3704));
+        assert!(!alone(&mut live, 3705));
+        assert!(alone(&mut live, 3706));
+
+        // a viewer being let in holds it, as on request
+        let mut admitting = Activity { admitting: 1, watched: true, ..Activity::default() };
+        assert!(!alone(&mut admitting, 0));
+        assert!(!alone(&mut admitting, 60));
+
+        // switched off: the broadcast goes on without viewers, as before
+        let mut kept = Activity { watched: true, ..Activity::default() };
+        assert!(!kept.idle_long_enough(at(0), true, false, true, false));
+        assert!(!kept.idle_long_enough(at(600), true, false, true, false));
+
+        // on request the encoder stops 20 s after the last viewer, whatever the switch says
+        let mut on_request = Activity::default();
+        assert!(!on_request.idle_long_enough(at(0), true, false, false, false));
+        assert!(!on_request.idle_long_enough(at(2), true, false, false, true));
+        assert!(!on_request.idle_long_enough(at(19), true, false, false, false));
+        assert!(on_request.idle_long_enough(at(20), true, false, false, false));
     }
 }

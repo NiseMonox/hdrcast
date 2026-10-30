@@ -81,25 +81,34 @@ export function WatchPage() {
                     <span>${liveFor(h.sinceMs, h.onDemand)}</span>
                     ${(!h.onDemand || h.viewers > 0) && html`<span>· ${t('watch.viewers', { n: h.viewers, max: h.maxViewers })}</span>`}
                     ${h.control && html`<span class="badge"><${Icon} name="cursor" style="width:11px;height:11px" />${t('control.offered')}</span>`}
+                    ${h.lowLatency && html`<span class="badge">${t('watch.lowLatencyBadge')}</span>`}
                   </div>
                 </div>
                 <div class="pactions">
                   ${mine
                     ? html`<span class="badge green">${t('watch.watchingNow')}</span>`
-                    : html`<button class=${'btn' + (h.onDemand ? '' : ' primary')} disabled=${watching || full} onClick=${() => startWatch(h.hostId)}>
-                        <${Icon} name=${h.onDemand ? 'link' : 'play'} />${full ? t('watch.full') : h.onDemand ? t('watch.connect') : t('watch.watch')}</button>`}
+                    : receiver.controlMode && h.lowLatency
+                      ? html`<button class="btn primary" disabled=${watching || full} onClick=${() => startWatch(h.hostId)}>
+                          <${Icon} name="cursor" />${full ? t('watch.full') : t('watch.controlBtn')}</button>`
+                      : html`<button class=${'btn' + (h.onDemand ? '' : ' primary')} disabled=${watching || full} onClick=${() => startWatch(h.hostId)}>
+                          <${Icon} name=${h.onDemand ? 'link' : 'play'} />${full ? t('watch.full') : h.onDemand ? t('watch.connect') : t('watch.watch')}</button>`}
                 </div>
               </div>`;
             })}
     </div>
     ${live.hosts.some((h) => h.onDemand) && html`<div class="section-note">${t('watch.onDemandNote')}</div>`}
 
-    <${Section} title=${t('watch.connection')} note=${watching ? t('watch.latencyNoteWatching') : t('watch.latencyNote')}>
-      <${Row} name=${t('watch.latency')} hint=${t('watch.latencyHint')} disabled=${watching}>
+    <${Section} title=${t('watch.connection')}
+      note=${receiver.controlMode ? t('watch.controlNote') : watching ? t('watch.latencyNoteWatching') : t('watch.latencyNote')}>
+      <${Row} name=${t('watch.mode')} hint=${receiver.controlMode ? t('watch.modeControlHint') : t('watch.modeWatchHint')} disabled=${watching}>
+        <${Segmented} value=${!!receiver.controlMode} onChange=${(v) => set({ controlMode: v })}
+          options=${[{ value: false, label: t('watch.modeWatch') }, { value: true, label: t('watch.modeControl') }]} />
+      <//>
+      ${!receiver.controlMode && html`<${Row} name=${t('watch.latency')} hint=${t('watch.latencyHint')} disabled=${watching}>
         <${Segmented} value=${presetValue} onChange=${(v) => { setCustom(v < 0); if (v > 0) set({ latencyMs: v }); }}
           options=${presets.map((p) => ({ value: p.latencyMs, label: t('preset.' + p.name, null, p.name) })).concat([{ value: -1, label: t('watch.custom') }])} />
-      <//>
-      ${presetValue === -1 && html`<${Row} name=${t('watch.latencyCustom')} disabled=${watching}>
+      <//>`}
+      ${!receiver.controlMode && presetValue === -1 && html`<${Row} name=${t('watch.latencyCustom')} disabled=${watching}>
         <${NumberField} value=${receiver.latencyMs} min=${20} max=${30000} onChange=${(v) => set({ latencyMs: v })} />
         <span class="unit">ms</span>
       <//>`}
@@ -170,6 +179,29 @@ function GuardLine({ guard }) {
     ${t('watch.guardSummary', { losses: guard.losses, held: guard.heldBack, freezes: guard.freezes })}</div>`;
 }
 
+/** Control mode (docs/design.md §11): what the host and the path add to the picture, and what was lost on the way. */
+function ControlModeTiles({ watch }) {
+  const ll = watch.ll;
+  const player = watch.player;
+  const session = watch.session;
+  const delay = ll && ll.rttMs != null ? ll.hostMs + ll.rttMs / 2 : null;
+  return html`<div class="tiles">
+      <div class="tile"><div class="k">${t('watch.tDelay')}</div>
+        <div class="v">${delay != null ? delay.toFixed(0) : '—'}<small>ms</small></div>
+        <div class="s">${ll ? t('watch.llDelaySub', { host: ll.hostMs.toFixed(1), rtt: ll.rttMs != null ? ll.rttMs.toFixed(1) : '—' }) : ' '}</div></div>
+      <div class="tile"><div class="k">${t('watch.tFps')}</div>
+        <div class="v">${ll ? ll.fps.toFixed(0) : '—'}<small>fps</small></div>
+        <div class="s">${player?.hwdec || ' '}</div></div>
+      <div class="tile"><div class="k">${t('watch.tBitrate')}</div>
+        <div class="v">${ll ? ll.mbps.toFixed(1) : '—'}<small>Mbps</small></div>
+        <div class="s">${shortPath(session?.path, null)}</div></div>
+      <div class="tile"><div class="k">${t('watch.tLost')}</div>
+        <div class="v">${ll ? ll.lost : '—'}</div>
+        <div class="s">${ll ? t('watch.llRestored', { n: ll.restored }) : ' '}</div></div>
+    </div>
+    <div class="hero-sub" style="margin-top:-6px">${ll?.waiting && ll.shown > 0 ? t('watch.llWaiting') : t('watch.llMode')}</div>`;
+}
+
 function NowPlaying({ watch }) {
   const session = watch.session;
   const player = watch.player;
@@ -191,7 +223,8 @@ function NowPlaying({ watch }) {
         <${Icon} name="expand" />${t('watch.fullscreenBtn')}</button>`}
       <button class="btn solid" onClick=${stopWatch}>${refused ? t('common.close') : html`<${Icon} name="stop" />${t('watch.stop')}`}</button>
     </div>
-    ${!refused && html`<div class="tiles">
+    ${!refused && watch.lowLatency && html`<${ControlModeTiles} watch=${watch} />`}
+    ${!refused && !watch.lowLatency && html`<div class="tiles">
       <div class="tile"><div class="k">${t('watch.tBuffer')}</div>
         <div class="v">${player?.cacheSeconds != null ? player.cacheSeconds.toFixed(1) : '—'}<small>${t('unit.s')}</small></div>
         <div class="s">${player?.text || ' '}</div></div>

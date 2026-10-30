@@ -140,18 +140,29 @@ function Watching({ w }) {
     <${Head} title=${html`<span class=${'dot' + (playing ? ' red pulse' : '')}></span>${w.hostName || t('watch.pillConnecting')}`}
       time=${playing ? formatDuration(player.uptimeSec) : pillOf(session)} />
     <div class="ov-source">${sourceLine(player, session)}</div>
-    <div class="ov-stats">
-      <${Stat} k=${t('watch.tBitrate')} v=${fixed(player?.bitrateMbps, 1)} unit="Mbps" />
-      <${Stat} k=${t('watch.tBuffer')} v=${fixed(player?.cacheSeconds, 1)} unit=${t('unit.s')} />
-      <${Stat} k=${t('overlay.ping')} v=${net ? Math.round(net.rttMs) : '—'} unit="ms" />
-      <${Stat} k=${t('overlay.loss')} v=${net ? net.lossPercent.toFixed(1) : '—'} unit="%" />
-      <${Stat} k=${t('watch.tDropped')} v=${player ? player.drops + player.decoderDrops : '—'} />
-      <${Stat} k=${t('overlay.decoding')} v=${decoding} />
-    </div>
-    ${player?.guard?.frozen
-      ? html`<div class="ov-guard">${t('watch.guardFrozen')}</div>`
-      : player?.guard?.losses > 0 && html`<div class="ov-guard">${t('watch.guardSummary', { losses: player.guard.losses, held: player.guard.heldBack, freezes: player.guard.freezes })}</div>`}
-    <${Delay} w=${w} />
+    ${w.lowLatency
+      ? html`<div class="ov-stats">
+          <${Stat} k=${t('watch.tBitrate')} v=${fixed(w.ll?.mbps, 1)} unit="Mbps" />
+          <${Stat} k=${t('overlay.host')} v=${fixed(w.ll?.hostMs, 1)} unit="ms" />
+          <${Stat} k=${t('overlay.ping')} v=${fixed(w.ll?.rttMs, 1)} unit="ms" />
+          <${Stat} k=${t('overlay.lost')} v=${w.ll ? w.ll.lost : '—'} />
+          <${Stat} k=${t('overlay.restored')} v=${w.ll ? w.ll.restored : '—'} />
+          <${Stat} k=${t('overlay.decoding')} v=${decoding} />
+        </div>
+        ${w.ll?.waiting && w.ll.shown > 0 && html`<div class="ov-guard">${t('watch.llWaiting')}</div>`}
+        <div class="ov-note">${t('overlay.controlMode')}</div>`
+      : html`<div class="ov-stats">
+          <${Stat} k=${t('watch.tBitrate')} v=${fixed(player?.bitrateMbps, 1)} unit="Mbps" />
+          <${Stat} k=${t('watch.tBuffer')} v=${fixed(player?.cacheSeconds, 1)} unit=${t('unit.s')} />
+          <${Stat} k=${t('overlay.ping')} v=${net ? Math.round(net.rttMs) : '—'} unit="ms" />
+          <${Stat} k=${t('overlay.loss')} v=${net ? net.lossPercent.toFixed(1) : '—'} unit="%" />
+          <${Stat} k=${t('watch.tDropped')} v=${player ? player.drops + player.decoderDrops : '—'} />
+          <${Stat} k=${t('overlay.decoding')} v=${decoding} />
+        </div>
+        ${player?.guard?.frozen
+          ? html`<div class="ov-guard">${t('watch.guardFrozen')}</div>`
+          : player?.guard?.losses > 0 && html`<div class="ov-guard">${t('watch.guardSummary', { losses: player.guard.losses, held: player.guard.heldBack, freezes: player.guard.freezes })}</div>`}
+        <${Delay} w=${w} />`}
     <${Decoder} />
     <div class="ov-foot">
       <button class="btn small" disabled=${!player || player.state === 'idle'} onClick=${() => invoke('watch_fullscreen').catch(() => {})}>

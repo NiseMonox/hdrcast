@@ -67,6 +67,7 @@ impl FramePool {
         Some(FrameBuffer {
             data,
             index,
+            captured: 0,
             pool: Arc::clone(&self.shared),
         })
     }
@@ -77,6 +78,8 @@ impl FramePool {
 pub struct FrameBuffer {
     data: Vec<u8>,
     index: usize,
+    /// When the picture in it was captured ([`crate::clock::now_ticks`]); 0 = not said.
+    captured: i64,
     pool: Arc<PoolShared>,
 }
 
@@ -88,6 +91,16 @@ impl FrameBuffer {
     /// pool without bytes it names the encoder surface the picture is in.
     pub fn index(&self) -> usize {
         self.index
+    }
+
+    /// When the picture in this buffer was captured ([`crate::clock::now_ticks`]), as the engine noted it; 0 when
+    /// nobody did. Control mode measures how long a picture took to leave the engine from it.
+    pub fn captured_ticks(&self) -> i64 {
+        self.captured
+    }
+
+    pub fn set_captured_ticks(&mut self, ticks: i64) {
+        self.captured = ticks;
     }
 }
 

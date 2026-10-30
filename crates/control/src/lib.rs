@@ -19,7 +19,11 @@
 //! count, 8 bytes each). Host -> viewer plaintext: version, grant state, last event sequence applied.
 //! Pointer positions are latest-wins; keys, buttons and wheel steps are resent until acknowledged, and the host
 //! applies them once, in order.
+//!
+//! On Windows the host's own process can only reach windows of programs that run at its own integrity level or
+//! lower; [`elevated`] is the small helper that reaches the others.
 
+pub mod elevated;
 pub mod host;
 pub mod inject;
 pub mod keys;
@@ -27,7 +31,7 @@ pub mod viewer;
 pub mod wire;
 
 pub use host::{Grant, HostControl};
-pub use inject::{Injector, ScreenRect, SystemInjector};
+pub use inject::{Injector, Notices, ScreenRect, SystemInjector};
 pub use keys::{Button, Key, Mods, NamedKey};
 pub use viewer::{ControlState, ViewerControl};
 pub use wire::{Event, EventKind};

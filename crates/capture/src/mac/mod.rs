@@ -17,6 +17,7 @@ mod audio;
 mod displays;
 mod output;
 mod permission;
+pub(crate) mod playback;
 mod stream;
 mod system;
 mod timer;

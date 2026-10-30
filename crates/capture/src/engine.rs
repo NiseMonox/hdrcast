@@ -13,7 +13,7 @@ use crate::clock::{now_ticks, SessionClock, TICKS_PER_MS, TICKS_PER_SECOND};
 use crate::color;
 use crate::frame::{FramePool, FrameSink, SharedFrame};
 use crate::log;
-use crate::pacer::FramePacer;
+use crate::pacer::{EagerPacer, FramePacer};
 use crate::platform::{self, Backend, FrameLayout, FrameStatus, VideoError, VideoSource};
 use crate::stats::CaptureStats;
 use crate::timer::HighResTimer;
@@ -44,6 +44,11 @@ const SINK_QUEUE_FRAMES: usize = 4;
 /// The queue, the "latest frame" slot and the frame being converted: with the writer giving a buffer back
 /// before its queue slot, renting can never fail. With zero copy the encoder adds the surfaces it holds itself.
 const POOL_FRAMES: usize = SINK_QUEUE_FRAMES + 2;
+/// Control mode: one picture at most waits for the encoder. A newer capture takes its turn rather than queueing
+/// behind it, so what reaches the encoder is never older than the picture it is busy with.
+const LOW_LATENCY_QUEUE_FRAMES: usize = 1;
+/// Control mode with nothing new on the screen: the last picture goes again this often (design.md section 11.2).
+const IDLE_REPEAT_MS: i64 = 100;
 
 const ACCESS_LOST_RETRY_MS: u64 = 500;
 const ACCESS_LOST_GIVE_UP_MS: i64 = 30000;
@@ -148,6 +153,14 @@ impl CaptureEngine {
             ));
             return exit_codes::DEVICE_ERROR;
         }
+        let low_latency = self.args.encode.as_ref().is_some_and(|e| e.low_latency);
+        let (queue_frames, pool_frames) =
+            if low_latency { (LOW_LATENCY_QUEUE_FRAMES, LOW_LATENCY_QUEUE_FRAMES + 2) } else { (SINK_QUEUE_FRAMES, POOL_FRAMES) };
+        if low_latency {
+            if let Some(what) = video.raise_gpu_priority() {
+                log::info(format!("capture: control mode: {what}"));
+            }
+        }
         // The encoder is opened before the layout is announced: when it cannot be had, the app learns it from the
         // exit code before it starts an ffmpeg that would wait for a stream that never comes.
         let encoder: Option<Box<dyn VideoEncoder>> = match &self.args.encode {
@@ -156,7 +169,7 @@ impl CaptureEngine {
                 let fps = self.args.fps.max(1);
                 // Zero copy when the screen can hand its pictures to the encoder on the GPU (design.md section
                 // 2.8), frames in memory otherwise.
-                let opened = match video.surface_encoder(encode, fps, POOL_FRAMES) {
+                let opened = match video.surface_encoder(encode, fps, pool_frames) {
                     Some(encoder) => Ok(encoder),
                     None => self.backend.open_encoder(encode, layout, fps),
                 };
@@ -180,16 +193,16 @@ impl CaptureEngine {
         let pool = if surfaces > 0 {
             FramePool::new(surfaces, 0)
         } else {
-            FramePool::new(POOL_FRAMES, layout.frame_bytes())
+            FramePool::new(pool_frames, layout.frame_bytes())
         };
         let video_path = platform::pipe_path(&self.args.video_pipe);
         let sink = match &self.args.dump_path {
-            Some(path) => FrameSink::create_file(path, SINK_QUEUE_FRAMES)
+            Some(path) => FrameSink::create_file(path, queue_frames)
                 .map_err(|e| format!("cannot create the dump file {path}: {e}")),
             None => self
                 .backend
                 .create_pipe(&self.args.video_pipe, VIDEO_PIPE_BUFFER_BYTES)
-                .map(|pipe| FrameSink::for_pipe(pipe, SINK_QUEUE_FRAMES))
+                .map(|pipe| FrameSink::for_pipe(pipe, queue_frames))
                 .map_err(|e| format!("cannot create the video pipe {video_path}: {e}")),
         };
         let mut sink = match sink {
@@ -202,13 +215,14 @@ impl CaptureEngine {
         if let (Some(encoder), Some(encode)) = (encoder, &self.args.encode) {
             let control = EncodeControl::new();
             read_commands(Arc::clone(&control));
-            sink.encode_with(EncodeStage::new(
+            let stage = EncodeStage::new(
                 encoder,
                 self.args.fps.max(1),
                 encode.gop_frames,
                 control,
                 Box::new(|event| log::stdout_line(&event.to_json_line())),
-            ));
+            );
+            sink.encode_with(if encode.low_latency { stage.framed() } else { stage });
         }
 
         // The audio PIPE has to exist before the video pipe blocks for its client: ffmpeg opens both
@@ -260,7 +274,7 @@ impl CaptureEngine {
             }
         }
 
-        let exit_code = self.run_loop(video.as_mut(), &pool, surfaces > 0, &sink, audio.as_ref());
+        let exit_code = self.run_loop(video.as_mut(), &pool, surfaces > 0, low_latency, &sink, audio.as_ref());
 
         // Tear down in this order: the audio threads first, then the sink (drains its queue, bounded).
         drop(audio);
@@ -270,18 +284,21 @@ impl CaptureEngine {
     }
 
     /// `on_surfaces`: the pool's buffers stand for the encoder's surfaces, which the video source converts into
-    /// (zero copy).
+    /// (zero copy). `low_latency`: control mode, each picture goes the moment it is captured ([`EagerPacer`]) instead
+    /// of on the constant beat.
     fn run_loop(
         &mut self,
         video: &mut dyn VideoSource,
         pool: &FramePool,
         on_surfaces: bool,
+        low_latency: bool,
         sink: &FrameSink,
         audio: Option<&AudioPipeline>,
     ) -> i32 {
         let layout = video.layout();
         let fps = self.args.fps.max(1);
         let mut pacer = FramePacer::new(fps, TICKS_PER_SECOND);
+        let mut eager = EagerPacer::new(fps, TICKS_PER_SECOND, IDLE_REPEAT_MS * TICKS_PER_MS);
         let parent = self.watch_parent();
         let mut timer = HighResTimer::new();
 
@@ -340,9 +357,24 @@ impl CaptureEngine {
                 break;
             }
 
-            // Pull whatever the desktop has, without blocking past the next frame deadline.
-            let ticks_left = pacer.ticks_until_next(now_ticks());
-            let wait_ms = (ticks_left / TICKS_PER_MS).clamp(0, 8) as u64;
+            // Control mode: nothing is captured while no picture may go (less than a frame interval since the last
+            // one). Desktop duplication keeps the newest image meanwhile, so the one taken when the interval is over
+            // is as fresh as any: converting every image of a 360 Hz desktop for 120 pictures a second only kept the
+            // GPU, and the device the encoder shares with the converter, busy.
+            if low_latency && !fresh_frame && !backlogged {
+                let wait = eager.ticks_until_due(now_ticks(), true);
+                if wait > 0 {
+                    timer.wait_until(now_ticks() + wait);
+                }
+            }
+            // Pull whatever the desktop has, without blocking past the next frame deadline. In control mode that is
+            // when a waiting picture may go, or the idle repeat; a new desktop image ends the wait at once.
+            let wait_ms = if low_latency {
+                let ticks_left = if backlogged { TICKS_PER_MS } else { eager.ticks_until_due(now_ticks(), fresh_frame) };
+                ((ticks_left + TICKS_PER_MS - 1) / TICKS_PER_MS).clamp(0, 8) as u64
+            } else {
+                (pacer.ticks_until_next(now_ticks()) / TICKS_PER_MS).clamp(0, 8) as u64
+            };
             match pool.try_rent() {
                 // every buffer is still queued: the consumer is behind
                 None => self.dropped += 1,
@@ -358,6 +390,7 @@ impl CaptureEngine {
                             access_lost_since = None;
                             self.gpu_ms_accum += gpu_ms;
                             self.gpu_ms_count += 1;
+                            target.set_captured_ticks(now_ticks());
                             latest = Arc::new(target);
                             self.captured += 1;
                             fresh_frame = true;
@@ -412,7 +445,21 @@ impl CaptureEngine {
 
             // Emit every frame whose deadline has passed (repeating the last image when idle).
             let now = now_ticks();
-            let mut due = pacer.frames_due(now);
+            let mut due = if low_latency { 0 } else { pacer.frames_due(now) };
+            if low_latency && eager.due(now, fresh_frame) {
+                if sink.try_enqueue(&latest) {
+                    eager.sent(now);
+                    if !fresh_frame {
+                        self.duplicated += 1;
+                    }
+                    fresh_frame = false;
+                    backlogged = false;
+                } else if !backlogged {
+                    // the encoder is still busy with the previous picture: this one waits (a newer one replaces it)
+                    self.dropped += 1;
+                    backlogged = true;
+                }
+            }
             if due > 0 {
                 if due > i64::from(fps) {
                     // More than a second behind (suspend/resume, long stall): jump to now instead of catching up.
@@ -450,7 +497,9 @@ impl CaptureEngine {
                 self.emit_stats(sink, audio, Some(since_stats));
             }
 
-            if pacer.ticks_until_next(now_ticks()) > 0 {
+            if low_latency {
+                // the next pass waits in the capture itself (up to the moment something is due)
+            } else if pacer.ticks_until_next(now_ticks()) > 0 {
                 timer.wait_until(pacer.next_deadline_ticks());
             } else if backlogged {
                 // The frame that is due cannot go anywhere until the writer frees a slot: do not spin on it.

@@ -246,4 +246,8 @@ impl VideoSource for DxgiVideoSource {
     fn black_surface(&mut self, surface: usize) -> Result<(), String> {
         self.converter.clear_surface(surface)
     }
+
+    fn raise_gpu_priority(&mut self) -> Option<String> {
+        Some(super::gpu_priority::raise(self.duplicator.device()))
+    }
 }

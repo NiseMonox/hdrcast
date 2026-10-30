@@ -487,6 +487,12 @@ fn sender_settings_files_are_read_normalised_and_used_like_the_csharp_did() {
         assert!(version == Some(json!(0)) || version == Some(json!(SenderSettings::SETTINGS_VERSION)), "{file}: {version:?}");
         // 0.3.3's switch for encoding inside the capture engine (§2.8): no C# file has it, so it is off
         assert_eq!(ours.as_object_mut().unwrap().shift_remove("keyframeOnRequest"), Some(json!(false)), "{file}");
+        // and the switch that ends a broadcast once everyone has left (§8.10): on without the field
+        assert_eq!(ours.as_object_mut().unwrap().shift_remove("endWhenViewersLeave"), Some(json!(true)), "{file}");
+        // and 0.3.7's control mode (§11): offered, at its own bitrate and frame rate
+        for (key, value) in [("controlMode", json!(true)), ("controlBitrateMbps", json!(30)), ("controlFps", json!(60))] {
+            assert_eq!(ours.as_object_mut().unwrap().shift_remove(key), Some(value), "{file}");
+        }
         // where the C# gave its default (a missing or unreadable value), ours is today's default
         if float_of(&theirs["gopSeconds"]) == 2.0 && s.gop_seconds == SenderSettings::DEFAULT_GOP_SECONDS {
             theirs["gopSeconds"] = json!(s.gop_seconds);
@@ -630,7 +636,9 @@ fn receiver_settings_files_are_read_and_normalised_like_the_csharp_did() {
         );
 
         let s = raw.normalized();
-        let ours = serde_json::to_value(&s).unwrap();
+        let mut ours = serde_json::to_value(&s).unwrap();
+        // 0.3.7's choice of control mode (docs/design.md §11): no C# file has it, so it is watching as always
+        assert_eq!(ours.as_object_mut().unwrap().shift_remove("controlMode"), Some(Value::from(false)), "{file}");
         let mut theirs: Value = serde_json::from_str(str_of(&out["normalized"])).unwrap();
         if s.frontend == ReceiverFrontend::MpvDirect {
             // 2 is "mpv direct" since 0.3.2; the C# had no such number and fell back to its 0

@@ -167,6 +167,12 @@ pub trait VideoSource {
         let _ = surface;
         Err(NO_SURFACES.to_owned())
     }
+
+    /// Control mode: puts this process's GPU work ahead of other programs' where the platform allows it. Says what
+    /// came of it, for the log; `None` where there is nothing to raise.
+    fn raise_gpu_priority(&mut self) -> Option<String> {
+        None
+    }
 }
 
 const NO_SURFACES: &str = "this screen converts into memory, not into encoder surfaces";

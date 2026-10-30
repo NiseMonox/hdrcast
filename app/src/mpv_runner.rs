@@ -4,6 +4,7 @@
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
+use std::process::ChildStdin;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -65,6 +66,8 @@ pub type IpcTap = Arc<dyn Fn(&MpvIpcMessage) + Send + Sync>;
 pub type IpcReady = Arc<dyn Fn() + Send + Sync>;
 /// Sees what the guard does (freezes, recoveries), on the pump thread: keyframes on request use it.
 pub type GuardTap = Arc<dyn Fn(GuardEvent) + Send + Sync>;
+/// Gets the stdin of every mpv started, to write the stream into itself (control mode, docs/design.md §11.3).
+pub type StdinFeed = Arc<dyn Fn(ChildStdin) + Send + Sync>;
 
 struct Gate {
     generation: u64,
@@ -96,6 +99,7 @@ struct Shared {
     ready: Mutex<Option<IpcReady>>,
     guard_tap: Mutex<Option<GuardTap>>,
     player_message: Mutex<Option<PlayerMessage>>,
+    stdin_feed: Mutex<Option<StdinFeed>>,
 }
 
 #[derive(Clone)]
@@ -131,8 +135,14 @@ impl MpvRunner {
                 ready: Mutex::new(None),
                 guard_tap: Mutex::new(None),
                 player_message: Mutex::new(None),
+                stdin_feed: Mutex::new(None),
             }),
         }
+    }
+
+    /// Who writes the stream into mpv's stdin (control mode): each mpv started from now on hands its stdin over.
+    pub fn set_stdin_feed(&self, feed: Option<StdinFeed>) {
+        *self.shared.stdin_feed.lock().unwrap() = feed;
     }
 
     /// Who hears the player's own bindings (the panel's key, the close button); replaces the previous one.
@@ -295,8 +305,9 @@ impl Shared {
         let text = if attempt == 1 { "Starting mpv…".to_string() } else { format!("Reconnecting (attempt {attempt})…") };
         self.set_state(PlayerState::Starting, &text);
 
+        let feed = self.stdin_feed.lock().unwrap().clone();
         let mut mpv = LineProcess::new(&plan.mpv_exe, &plan.mpv_args);
-        mpv.job(Some(self.job.clone())).redirect_stdin(plan.uses_ffmpeg_pipe());
+        mpv.job(Some(self.job.clone())).redirect_stdin(plan.uses_ffmpeg_pipe() || feed.is_some());
         let me = self.clone();
         mpv.on_stdout_line(move |line| me.on_mpv_line(gen, line));
         let me = self.clone();
@@ -359,6 +370,8 @@ impl Shared {
         }
         if let Some(p) = &ffmpeg {
             self.start_pump(gen, p, &mpv);
+        } else if let (Some(feed), Some(stdin)) = (feed, mpv.take_stdin()) {
+            feed(stdin);
         }
 
         let me = self.clone();

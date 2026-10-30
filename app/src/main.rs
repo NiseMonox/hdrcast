@@ -6,12 +6,15 @@ mod clipboard;
 mod commands;
 mod control_host;
 mod control_viewer;
+mod input_helper;
 mod instance;
 mod ipc_stream;
 mod keyframe_host;
 mod keyframe_viewer;
 mod live;
 mod logs;
+mod low_latency_host;
+mod low_latency_viewer;
 mod mpv_ipc;
 mod mpv_runner;
 mod net_report;
@@ -172,6 +175,8 @@ fn run_app(startup_invite: Option<String>, background: bool, instance: instance:
             commands::settings_save,
             commands::autostart_get,
             commands::autostart_set,
+            commands::input_helper_get,
+            commands::input_helper_set,
             commands::tray_texts,
             commands::outputs_refresh,
             commands::audio_apps,

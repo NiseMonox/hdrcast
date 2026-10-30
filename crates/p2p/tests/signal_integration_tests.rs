@@ -317,6 +317,7 @@ fn the_server_carries_the_remote_control_flag_without_reading_it() {
         remote_control: true,
         device: None,
         keyframes: false,
+        low_latency: false,
     };
     c.post_join(&host.peer_id, &SignedEnvelope::seal(&keys, messages::KIND_JOIN, &host.group_id, &host.peer_id, &asking.to_payload()), &ct).unwrap();
     let (joins, _) = c.poll_joins(&host.peer_id, 0, 0, &ct).unwrap();
@@ -1071,6 +1072,7 @@ fn a_host_lets_signed_viewers_in_when_it_decides_and_they_share_a_private_contro
         remote_control: true,
         device: None,
         keyframes: false,
+        low_latency: false,
     };
     device::sign_join(&laptop, &Exchange::new(), &impostor.group_id, &host_group.peer_id, &mut forged);
     forged.session_id = keys::new_id();

@@ -118,6 +118,8 @@ pub fn status(app: &AppState) -> Value {
                 "ipv6": p2p_diagnostics::has_ipv6(&r.candidates),
                 "openIpv4": r.open_ipv4,
                 "control": h.remote_control(),
+                // control mode, the low-latency stream for remote control (docs/design.md §11)
+                "lowLatency": r.low_latency,
                 // on request: shown as "online" (connect), not as a broadcast (watch)
                 "onDemand": r.on_demand,
                 "deviceCode": r.device_key.as_deref().map(device::code_of).unwrap_or_default(),

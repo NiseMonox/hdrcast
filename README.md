@@ -38,6 +38,11 @@ sharer's computer. No relay server, no public IPv4 address, no port forwarding t
   the stream for good, the viewer holds the last good picture until the next keyframe instead of showing colourful
   blocks, like Moonlight; the sound goes on. The sharer's encoder keeps its bitrate steadier, so less is lost in the
   first place, and both ends show and log how lossy the path is ([docs/faq.md](docs/faq.md)).
+- **Control mode for remote control (0.3.7).** On the Watch page choose **Control** instead of **Watch**, and a sharer
+  with an NVIDIA GPU sends a stream made for using their computer, the way Sunshine / Vibepollo stream to Moonlight:
+  NVENC with its ultra-low-latency tuning, each picture sent the moment it is captured, Reed-Solomon parity instead of
+  retransmission, and mpv showing each picture as soon as it is complete. Measured screen to screen on one PC: 14.5 ms at
+  1080p and 21 ms in 4K HDR, instead of seconds ([Control mode](#control-mode)).
 - **English, Chinese and Japanese** in the app (**Settings → Language**; Automatic follows the system).
 
 > **Status (0.3.1):** on Windows, capture, encoding, peer-to-peer, playback and the UI have been tested on real machines.
@@ -122,7 +127,10 @@ control, use the **Fast** preset (see below).
 **Online or live.** While HdrCast runs and **Share → Who Can Connect → Available to connect** is on (the default), the
 computer shows as **Online** in the group. When somebody clicks **Connect**, the rules below decide; the screen is only
 captured once somebody has been let in, and capture stops 20 s after the last one leaves. **Go Live** opens it to the whole
-group instead: everybody not set to **Never** may watch without asking.
+group instead: everybody not set to **Never** may watch without asking. Once everybody who watched has left, the broadcast
+ends by itself 2 s later and the computer is online again (offline, with Available to connect off): a viewer who connects
+again is served on request, without asking you if they watched in the last 3 minutes. To keep broadcasting to an empty
+room, switch off **Share → Viewers → End the broadcast when everyone leaves**.
 
 **Closing the window keeps you online.** While Available to connect is on, the window's close button only tucks HdrCast
 into the notification area (the tray; the menu bar on a Mac), and the computer stays online. Click the tray icon (or
@@ -166,13 +174,39 @@ the overlay, stay with your player).
 and wait for them to allow it. The sharer can **Take Back** control or **Disconnect** you at any time (after a disconnect
 you cannot connect again for a minute).
 
-- The picture is still behind by the SRT delay plus the player buffer: for remote control pick the **Fast** preset (300 ms)
-  and lower **Settings → Player buffer**. Good for using a computer and changing settings, not for games (there is no
-  relative mouse).
-- A sharing Mac needs HdrCast allowed under System Settings → Privacy & Security → Accessibility. On Windows, programs
-  running as administrator ignore the injected input unless HdrCast runs as administrator, too.
+- To use the other computer, connect in **Control mode** (below): the picture is tens of milliseconds behind instead of
+  the seconds of watching. Watching keeps the SRT delay and the player buffer, which is right for watching and feels slow
+  for using a computer. There is no relative mouse yet (games that capture the mouse do not work).
+- A sharing Mac needs HdrCast allowed under System Settings → Privacy & Security → Accessibility. On Windows, windows of
+  programs that run as administrator ignore the injected input; switch on **Settings → Control programs that run as
+  administrator** on the sharing PC (Windows asks for permission once, see the [FAQ](docs/faq.md)).
 - A sharer on 0.2.4 offers no remote control; a sharer on 0.3.0 has no device codes and no Online, and uses its own
   *Off / Ask Me / Allow* setting.
+
+## Control mode
+
+Watching is built like a broadcast: SRT keeps a window of 0.3–3.5 s to send lost packets again, and the player buffers
+another 1.5 s, so the picture stays sharp across borders but is seconds behind. **Control mode** (0.3.7) is the other way
+round, for using the other computer: nothing is buffered and nothing is sent twice.
+
+- **Viewer:** **Watch → Connection → Mode → Control**, then click **Control** next to the computer. Computers that offer it
+  carry a *control mode* tag; one that does not (older HdrCast, no NVIDIA GPU) is watched as usual. The delay presets do not
+  apply. The panel (and the overlay on the player) shows the delay the sharer and the network add, the frame rate, the
+  bitrate and the pictures lost on the way.
+- **Sharer:** **Share → Control Mode**: *Offer control mode* (on by default), its own bitrate (30 Mbps) and highest frame rate
+  (60). The picture is the one set above it (display, size, HDR, cursor, sound). It needs an NVIDIA GPU, and runs only while
+  somebody is in control mode. Who may connect and who may control is decided by the same rules as before.
+- **How:** a capture engine of its own encodes the way Vibepollo does (NVENC P1 with the ultra-low-latency tuning, a rate
+  buffer of one frame, no B-frames, keyframes only when asked) and sends each picture the moment the desktop changes. Each
+  picture is cut into datagrams with 20 % Reed-Solomon parity, sealed with ChaCha20-Poly1305 and sent over the same
+  peer-to-peer path. The viewer puts the pictures together and writes each one straight into mpv (no cache, one decoder
+  thread: mpv's default of four held three pictures back). A picture that cannot be put together freezes the picture for
+  a moment while the sharer sends a keyframe. The sound is plain PCM, played by HdrCast from a 30 ms buffer.
+- **Measured** (one PC, screen to screen, docs/design.md §11.5): 1080p at 120 fps 14.5 ms (median), with packets lost
+  15.1 ms; 4K HDR at 120 fps 21.3 ms. Over a real network add the one-way delay.
+- **Best on a LAN or a short, clean path.** On a lossy line (across the border into China, say) it freezes more often:
+  watch instead, or lower its bitrate. The Mac side of control mode (playing, sound) has not run on a Mac yet
+  ([docs/macos-checklist.md](docs/macos-checklist.md) step 17).
 
 ## If something is wrong
 

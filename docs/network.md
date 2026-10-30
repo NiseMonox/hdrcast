@@ -49,7 +49,11 @@ path ⇄ ViewerLink ⇄ mpv (127.0.0.1).
   then starts capture and the encoder before it answers (usually 1-2 s), so that the viewer's mpv has a picture to pick
   up straight away, and it stops both 20 s after the last viewer leaves. When the sharer's rule for the viewer is
   **Ask Me** and the sharer is not live, the answer waits until the sharer clicks **Allow** (at most 50 s). **Go Live**
-  announces the computer as live and keeps the encoder running.
+  announces the computer as live and keeps the encoder running until everybody who watched has left: 2 s later the
+  broadcast ends and the computer is online again (offline, with Available to connect off), unless **End the broadcast
+  when everyone leaves** is switched off. A viewer who joins again afterwards is served on request, without the sharer's
+  answer if they watched in the last 3 minutes; a path that goes quiet for less than 15 s does not count as leaving (see
+  Reconnecting).
 - **Reconnecting**: a path that carries no packets for 15 s counts as lost, and the viewer joins again by itself (on the
   same local port, so mpv picks the stream up again without a restart). When the sharer stops, it sends BYE, and the
   viewer's panel says "The stream ended - waiting for … to go live again" (or "… ended the session - asking again" when

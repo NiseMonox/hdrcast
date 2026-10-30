@@ -384,7 +384,9 @@ impl NvencEncoder {
         if max_w > 0 && max_h > 0 && (self.width > max_w as u32 || self.height > max_h as u32) {
             return Err(format!("{}x{} is larger than {} encodes ({max_w}x{max_h})", self.width, self.height, self.gpu));
         }
-        let b_frames = args.b_frames.min(self.caps(NV_ENC_CAPS_NUM_MAX_BFRAMES).max(0) as u32);
+        // control mode: a B-frame would hold the picture before it back until the next one is captured
+        let b_frames = if args.low_latency { 0 } else { args.b_frames.min(self.caps(NV_ENC_CAPS_NUM_MAX_BFRAMES).max(0) as u32) };
+        let tuning = if args.low_latency { NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY } else { NV_ENC_TUNING_INFO_HIGH_QUALITY };
         // 0 none, 1 each, 2 only middle, 3 both
         let middle_refs = b_frames > 1 && self.caps(NV_ENC_CAPS_SUPPORT_BFRAME_REF_MODE) & 2 != 0;
         self.dynamic_bitrate = self.caps(NV_ENC_CAPS_SUPPORT_DYN_BITRATE_CHANGE) != 0;
@@ -395,7 +397,7 @@ impl NvencEncoder {
         preset_config.presetCfg.version = NV_ENC_CONFIG_VER;
         let get_preset = self.api.list.nvEncGetEncodePresetConfigEx.ok_or("nvEncGetEncodePresetConfigEx is missing")?;
         // SAFETY: valid session; the preset config is a live, versioned structure.
-        let status = unsafe { get_preset(self.session, NV_ENC_CODEC_HEVC_GUID, preset, NV_ENC_TUNING_INFO_HIGH_QUALITY, &mut *preset_config) };
+        let status = unsafe { get_preset(self.session, NV_ENC_CODEC_HEVC_GUID, preset, tuning, &mut *preset_config) };
         self.check(status, "reading the NVENC preset")?;
 
         let config = &mut *self.config;
@@ -461,7 +463,7 @@ impl NvencEncoder {
         init.encodeConfig = &mut *self.config;
         init.maxEncodeWidth = self.width;
         init.maxEncodeHeight = self.height;
-        init.tuningInfo = NV_ENC_TUNING_INFO_HIGH_QUALITY;
+        init.tuningInfo = tuning;
         let init_ptr: *mut NV_ENC_INITIALIZE_PARAMS = &mut *self.init;
         call!(self, nvEncInitializeEncoder(init_ptr))?;
 
@@ -487,12 +489,13 @@ impl NvencEncoder {
         }
 
         self.summary = format!(
-            "NVENC on {}, HEVC {} {}x{}@{fps}, P{} high quality, {} kbit/s CBR, buffer {} kbit, {} B-frame{}{}, two-pass {}, AQ {}, no lookahead, keyframes every {} frames and on request{}",
+            "NVENC on {}, HEVC {} {}x{}@{fps}, P{} {}, {} kbit/s CBR, buffer {} kbit, {} B-frame{}{}, two-pass {}, AQ {}, no lookahead, {}{}",
             self.gpu,
             if hdr { "Main10 (PQ, BT.2020)" } else { "Main (BT.709)" },
             self.width,
             self.height,
             args.preset.clamp(1, 7),
+            if args.low_latency { "ultra-low latency" } else { "high quality" },
             args.bitrate_kbps,
             args.vbv_kbits,
             b_frames,
@@ -500,7 +503,7 @@ impl NvencEncoder {
             if middle_refs { " (middle as reference)" } else { "" },
             args.multipass.name(),
             if args.aq_strength > 0 { args.aq_strength.to_string() } else { "off".to_owned() },
-            args.gop_frames,
+            if args.gop_frames > 0 { format!("keyframes every {} frames and on request", args.gop_frames) } else { "keyframes on request".to_owned() },
             if self.dynamic_bitrate { ", bitrate changeable while running" } else { "" },
         );
         Ok(())

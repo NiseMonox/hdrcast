@@ -106,7 +106,9 @@ fn every_generated_mpv_option_exists() {
                 platform,
             )
             .unwrap();
-            for arg in &plan.mpv_args {
+            // and control mode's list (docs/design.md §11.3)
+            let low_latency = mpv_command::low_latency_args(&s, "hdrcast-ipc", platform);
+            for arg in plan.mpv_args.iter().chain(&low_latency) {
                 let Some((name, _)) = split_option(arg) else {
                     continue;
                 };
@@ -171,7 +173,8 @@ fn every_generated_choice_is_one_mpv_offers() {
                 platform,
             )
             .unwrap();
-            for arg in &plan.mpv_args {
+            let low_latency = mpv_command::low_latency_args(s, "hdrcast-ipc", platform);
+            for arg in plan.mpv_args.iter().chain(&low_latency) {
                 let Some((name, Some(value))) = split_option(arg) else {
                     continue;
                 };

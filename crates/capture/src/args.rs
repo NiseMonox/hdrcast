@@ -79,7 +79,8 @@ pub struct EncodeArgs {
     pub bitrate_kbps: u32,
     /// The rate buffer (VBV) in kbit.
     pub vbv_kbits: u32,
-    /// Frames from one keyframe to the next when nobody asks for one in between.
+    /// Frames from one keyframe to the next when nobody asks for one in between; 0 = only the first and those
+    /// asked for.
     pub gop_frames: u32,
     /// B-frames between two reference frames (0 = none).
     pub b_frames: u32,
@@ -88,6 +89,10 @@ pub struct EncodeArgs {
     pub multipass: Multipass,
     /// Spatial adaptive quantisation strength 1..15; 0 = off.
     pub aq_strength: u32,
+    /// Control mode (`--low-latency`, docs/design.md §11): NVENC's ultra-low-latency tuning and no B-frames, each
+    /// picture sent the moment it is captured (at most `--fps` a second) instead of on a fixed beat, and the video
+    /// pipe carries framed pictures for HdrCast itself ([`crate::encode::frames`]) instead of an MPEG-TS for ffmpeg.
+    pub low_latency: bool,
 }
 
 impl EncodeArgs {
@@ -106,6 +111,24 @@ impl EncodeArgs {
             preset: Self::DEFAULT_PRESET,
             multipass: Multipass::Quarter,
             aq_strength: Self::DEFAULT_AQ_STRENGTH,
+            low_latency: false,
+        }
+    }
+
+    /// Control mode at `bitrate_kbps` and `fps`, as Vibepollo sets NVENC up (docs/design.md §11.2): preset P1
+    /// with the ultra-low-latency tuning, CBR with a rate buffer of one frame, no B-frames, no AQ, a two-pass of a
+    /// quarter resolution, and keyframes only when somebody asks.
+    pub fn low_latency(encoder: EngineEncoder, bitrate_kbps: u32, fps: u32) -> Self {
+        Self {
+            encoder,
+            bitrate_kbps,
+            vbv_kbits: (bitrate_kbps / fps.max(1)).max(1),
+            gop_frames: 0,
+            b_frames: 0,
+            preset: 1,
+            multipass: Multipass::Quarter,
+            aq_strength: 0,
+            low_latency: true,
         }
     }
 }
@@ -233,7 +256,10 @@ impl CaptureArgs {
              \x20   --bframes <n>           B-frames between references (default 0)\n\
              \x20   --preset <1..7>         NVENC preset P1..P7 (default 5)\n\
              \x20   --multipass off|quarter|full  (default quarter)\n\
-             \x20   --aq <0..15>            spatial AQ strength, 0 = off (default 8)\n"
+             \x20   --aq <0..15>            spatial AQ strength, 0 = off (default 8)\n\
+             \x20   --low-latency           control mode: ultra-low-latency tuning, no B-frames, each picture\n\
+             \x20                           sent when captured (at most --fps), framed pictures instead of\n\
+             \x20                           MPEG-TS; --gop 0 = keyframes only on request\n"
         )
     }
 
@@ -249,6 +275,7 @@ impl CaptureArgs {
         let mut preset: Option<u32> = None;
         let mut multipass: Option<Multipass> = None;
         let mut aq: Option<u32> = None;
+        let mut low_latency = false;
         let mut it = args.iter().map(AsRef::as_ref);
         while let Some(opt) = it.next() {
             let mut next = || {
@@ -297,11 +324,12 @@ impl CaptureArgs {
                 "--encode" => encoder = Some(parse_encoder(next()?)?),
                 "--bitrate" => bitrate = Some(parse_int(opt, next()?, 100, 1_000_000)? as u32),
                 "--vbv" => vbv = Some(parse_int(opt, next()?, 1, 10_000_000)? as u32),
-                "--gop" => gop = Some(parse_int(opt, next()?, 1, 100_000)? as u32),
+                "--gop" => gop = Some(parse_int(opt, next()?, 0, 100_000)? as u32),
                 "--bframes" => b_frames = Some(parse_int(opt, next()?, 0, 4)? as u32),
                 "--preset" => preset = Some(parse_int(opt, next()?, 1, 7)? as u32),
                 "--multipass" => multipass = Some(parse_multipass(next()?)?),
                 "--aq" => aq = Some(parse_int(opt, next()?, 0, 15)? as u32),
+                "--low-latency" => low_latency = true,
                 _ => return err(format!("unknown option: {opt}")),
             }
         }
@@ -324,6 +352,7 @@ impl CaptureArgs {
                     preset: preset.unwrap_or(d.preset),
                     multipass: multipass.unwrap_or(d.multipass),
                     aq_strength: aq.unwrap_or(d.aq_strength),
+                    low_latency,
                 });
             }
             None if bitrate.is_some()
@@ -332,7 +361,8 @@ impl CaptureArgs {
                 || b_frames.is_some()
                 || preset.is_some()
                 || multipass.is_some()
-                || aq.is_some() =>
+                || aq.is_some()
+                || low_latency =>
             {
                 return err("the encoder options (--bitrate, --gop, ...) need --encode");
             }
@@ -396,7 +426,7 @@ impl CaptureArgs {
 impl EncodeArgs {
     /// `--encode` and the options after it, as [`CaptureArgs::to_argv`] appends them.
     pub fn to_argv(&self) -> Vec<String> {
-        [
+        let mut argv: Vec<String> = [
             ("--encode", self.encoder.name().to_owned()),
             ("--bitrate", self.bitrate_kbps.to_string()),
             ("--vbv", self.vbv_kbits.to_string()),
@@ -408,7 +438,11 @@ impl EncodeArgs {
         ]
         .into_iter()
         .flat_map(|(option, value)| [option.to_owned(), value])
-        .collect()
+        .collect();
+        if self.low_latency {
+            argv.push("--low-latency".to_owned());
+        }
+        argv
     }
 }
 

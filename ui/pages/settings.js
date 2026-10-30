@@ -54,6 +54,41 @@ async function setAutostart(on) {
   }
 }
 
+function adminInputHint(helper, waiting) {
+  if (waiting) return t('settings.adminInputWait');
+  if (helper.notNeeded) return t('settings.adminInputNotNeeded');
+  if (!helper.bundled && !helper.installed) return t('settings.adminInputMissing');
+  if (helper.outdated) return t('settings.adminInputOutdated');
+  return t(helper.installed ? 'settings.adminInputOn' : 'settings.adminInputHint');
+}
+
+/** Sets the input service up or takes it away: Windows' permission prompt comes up and the call waits for the answer. */
+async function setAdminInput(on, setWaiting) {
+  setWaiting(true);
+  try {
+    setState({ inputHelper: await invoke('input_helper_set', { on }) });
+  } catch (e) {
+    toast(String(e), { kind: 'warn' });
+    invoke('input_helper_get').then((inputHelper) => setState({ inputHelper })).catch(() => {});
+  }
+  setWaiting(false);
+}
+
+function AdminInputRow({ helper }) {
+  const [waiting, setWaiting] = useState(false);
+  let control;
+  if (helper.notNeeded) {
+    control = html`<span class="value">${t('settings.adminInputNotNeededBadge')}</span>`;
+  } else if (helper.outdated) {
+    control = html`<button class="btn tinted" disabled=${waiting} onClick=${() => setAdminInput(true, setWaiting)}>
+      <${Icon} name="shield" />${t('settings.adminInputUpdate')}</button>`;
+  } else {
+    control = html`<${Switch} on=${helper.installed} disabled=${waiting || (!helper.bundled && !helper.installed)}
+      onChange=${(on) => setAdminInput(on, setWaiting)} />`;
+  }
+  return html`<${Row} name=${t('settings.adminInput')} tile="cursor" hint=${adminInputHint(helper, waiting)}>${control}<//>`;
+}
+
 export function SettingsPage() {
   const s = useStore();
   const { ui, sender, receiver } = s.settings;
@@ -65,6 +100,7 @@ export function SettingsPage() {
   // the entry belongs to the system (Task Manager can turn it off): look again whenever the page opens
   useEffect(() => {
     invoke('autostart_get').then((autostart) => setState({ autostart })).catch(() => {});
+    invoke('input_helper_get').then((inputHelper) => setState({ inputHelper })).catch(() => {});
   }, []);
 
   return html`
@@ -82,6 +118,7 @@ export function SettingsPage() {
       ${s.autostart?.supported && html`<${Row} name=${t('settings.autostart')} tile="bolt" hint=${autostartHint(s.autostart, mac)}>
         <${Switch} on=${s.autostart.on} onChange=${setAutostart} />
       <//>`}
+      ${s.inputHelper?.supported && html`<${AdminInputRow} helper=${s.inputHelper} />`}
     <//>
 
     <${Section} title=${t('settings.group')} note=${t('settings.groupNote')}>

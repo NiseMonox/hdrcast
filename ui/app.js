@@ -331,7 +331,15 @@ function Toasts({ toasts }) {
 // Things in the status snapshot that want the user's attention once, wherever they are in the app.
 const announced = new Map();      // session id -> the toast asking about it
 const knocked = new Map();        // session id of a request to watch -> its toast
+let endedUnwatched = null;        // broadcasts that ended because everyone had left, as of the last look
 function watchStatus() {
+  // the broadcast ended by itself: everyone who watched had left (not said for what happened before the page loaded)
+  const ended = state.status?.share?.endedUnwatched;
+  if (ended != null) {
+    if (endedUnwatched != null && ended > endedUnwatched) toast(t('share.endedUnwatched'), { kind: 'info', ms: 8000 });
+    endedUnwatched = ended;
+  }
+
   // somebody asks to watch this computer
   const knocks = state.status?.share?.knocks || [];
   for (const k of knocks) {

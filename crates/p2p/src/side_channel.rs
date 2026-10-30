@@ -36,6 +36,19 @@ pub fn build(sid: &[u8; ID_BYTES], payload: &[u8]) -> Option<Vec<u8>> {
     Some(datagram)
 }
 
+/// [`build`] into `datagram` (replacing what was there), so a busy sender reuses one buffer. False, with
+/// `datagram` untouched, for a payload out of range.
+pub fn build_into(sid: &[u8; ID_BYTES], payload: &[u8], datagram: &mut Vec<u8>) -> bool {
+    if !is_valid_payload(payload) {
+        return false;
+    }
+    datagram.clear();
+    datagram.extend_from_slice(MAGIC);
+    datagram.extend_from_slice(sid);
+    datagram.extend_from_slice(payload);
+    true
+}
+
 /// The datagram starts with the side channel's magic. Such a datagram is never SRT, whatever else is wrong
 /// with it: it is either delivered to the side handler or dropped.
 pub fn has_magic(datagram: &[u8]) -> bool {
@@ -68,6 +81,11 @@ mod tests {
         assert_eq!(id, base64url::encode(&sid));
         assert_eq!(id.len(), 22);
         assert_eq!(payload, b"hi");
+        let mut reused = b"old".to_vec();
+        assert!(build_into(&sid, b"hi", &mut reused));
+        assert_eq!(reused, datagram);
+        assert!(!build_into(&sid, b"", &mut reused));
+        assert_eq!(reused, datagram, "untouched");
     }
 
     #[test]

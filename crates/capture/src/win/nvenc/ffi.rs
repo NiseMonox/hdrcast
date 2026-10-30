@@ -125,6 +125,8 @@ pub const NV_ENC_MULTI_PASS_DISABLED: u32 = 0x0;
 pub const NV_ENC_TWO_PASS_QUARTER_RESOLUTION: u32 = 0x1;
 pub const NV_ENC_TWO_PASS_FULL_RESOLUTION: u32 = 0x2;
 pub const NV_ENC_TUNING_INFO_HIGH_QUALITY: u32 = 1;
+/// Control mode (what Sunshine and Vibepollo use): no frame of the encoder's own delay.
+pub const NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY: u32 = 3;
 pub const NV_ENC_DEVICE_TYPE_DIRECTX: u32 = 0x0;
 pub const NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX: u32 = 0x0;
 /// NV_ENC_BUFFER_USAGE: a registered resource that holds pictures to encode.

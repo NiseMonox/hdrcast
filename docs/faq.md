@@ -179,6 +179,31 @@ swscale clips every value above 1.0 (above 80 nits), as tests with three version
 HdrCast converts scRGB → PQ / BT.2020 → P010 in a D3D11 compute shader of its own, on the GPU, and only has ffmpeg encode
 the P010, which is also what OBS does. Details in [design.md](design.md) §1.1 (in Chinese).
 
+## Remote control does nothing in some windows. Why?
+
+Windows only lets a program type into another program's windows when it has at least that program's rights (UAC's
+"User Interface Privilege Isolation"). HdrCast runs with a normal user's rights, so while a window of a program that was
+started **as administrator** is in front, Windows throws the viewer's mouse and keyboard away without a word. Parsec and
+Sunshine do not have the problem because their installers add a Windows service that runs with higher rights.
+
+HdrCast does the same. On the sharing PC, switch on **Settings → General → Control programs that run as
+administrator**. Windows asks for permission once. That puts one small program, `HdrCastInput.exe`, into
+`C:\Program Files\HdrCast\Input` and registers it as a Windows service, **HdrCastInput**, which runs as the system
+account. A service cannot reach your desktop, so while somebody controls your computer HdrCast starts the service (you
+are the only user who may) and the service starts the same program inside your session, where it types what HdrCast
+sends it. Nothing runs the rest of the time: the service is not started at boot, and both stop about 45 seconds after
+the last viewer. The same switch takes it away again.
+
+- Without it, **Activity** says so when it notices: *Windows refuses the viewer's mouse and keyboard right now…*.
+- It is the trade Parsec makes, too: any program running as you can ask the program to type, and so can reach windows
+  of programs run as administrator without Windows' prompt. The program has every privilege taken off, only types, and
+  only on your own desktop. If that is more than you want, leave it off, or run the program you want to control
+  without administrator rights.
+- Not covered: Windows' permission prompts (UAC) and the lock screen. They live on a separate desktop that neither
+  HdrCast's capture nor its input can reach, and reaching it would let any program of yours press "Yes" on its own prompt.
+- HdrCast is not code-signed, and an unsigned program that registers a service can look suspicious to Windows Security.
+  If it reports `HdrCastInput.exe`, please say so in an issue instead of allowing it on the device.
+
 ## How safe is it?
 
 - The 32-byte group key in the invite is the root of everything: the signaling auth key, the message signing key, the SRT
@@ -203,8 +228,13 @@ same; one is just a few seconds later.
 
 ## Can the delay be shorter?
 
-Yes, but HdrCast is built like a broadcast. Pick **Fast** (300 ms) under **Watch → Delay**, or a **Custom** delay of about
+For using the other computer, yes: connect in **Control mode** (0.3.7, **Watch → Connection → Mode → Control**). Nothing
+is buffered and nothing is sent twice, the way Moonlight works: measured screen to screen on one PC at 120 fps, the
+picture is 14.5 ms behind at 1080p and 21 ms in 4K HDR, plus the network's one-way delay. The sharer needs an NVIDIA GPU, and the line
+should be good: a lost picture freezes the screen until a keyframe comes, so a lossy line freezes often (see the README's
+Control mode section).
+
+For watching, HdrCast is built like a broadcast. Pick **Fast** (300 ms) under **Watch → Delay**, or a **Custom** delay of about
 4 × RTT (Japan about 200 ms, Australia about 700 ms), and lower **Settings → Player buffer** (mpv's `cache-pause-wait`) to
 0.5 s: the whole delay comes down to about 1.5 s, but the picture stalls whenever the line hiccups. Going below 3 × RTT
-is not recommended. Remote-desktop latency is not what this tool is for: **Fast** is there for remote control, to help
-out on a computer, not for games.
+is not recommended.

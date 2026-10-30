@@ -81,6 +81,17 @@ pub struct SenderSettings {
     pub max_viewers: i32,
     /// This line's upload in Mbps, for the "upload needed" warning (0 = unknown).
     pub upload_mbps: i32,
+    /// A broadcast ends by itself a little after everyone who watched it has left (docs/design.md §8.10).
+    pub end_when_viewers_leave: bool,
+
+    // ---- control mode (docs/design.md §11) ----
+    /// Offer control mode: a viewer may ask for the low-latency stream for remote control instead of the buffered
+    /// one. Only with NVENC (the capture engine encodes it itself).
+    pub control_mode: bool,
+    /// Control mode's own bitrate and highest frame rate (its picture is otherwise the one shared: display, size,
+    /// HDR, cursor, sound).
+    pub control_bitrate_mbps: i32,
+    pub control_fps: i32,
 
     // ---- tools ----
     #[serde(deserialize_with = "null_as_default")]
@@ -114,6 +125,14 @@ impl SenderSettings {
     /// Files without it (0) were written before 0.3.2 and hold that version's defaults: a 2 s keyframe interval
     /// and a 2 s buffer, which [`load`](Self::load) changes to today's once.
     pub const SETTINGS_VERSION: i32 = 1;
+    /// Control mode's bitrate when nobody chose one: Moonlight's 1080p60 default is 20 Mbps and its 4K60 one 80;
+    /// a desktop at 4K, mostly still, looks sharp at 30 with a frame of rate buffer.
+    pub const DEFAULT_CONTROL_BITRATE_MBPS: i32 = 30;
+
+    /// Whether control mode can be offered: switched on, and NVENC encodes (it runs inside the capture engine).
+    pub fn offers_control_mode(&self, nvenc_available: bool) -> bool {
+        self.control_mode && nvenc_available
+    }
 
     /// Fresh settings: the encoder is the first one `platform` offers.
     pub fn defaults_for(platform: Platform) -> Self {
@@ -144,6 +163,11 @@ impl SenderSettings {
 
             max_viewers: 4,
             upload_mbps: 0,
+            end_when_viewers_leave: true,
+
+            control_mode: true,
+            control_bitrate_mbps: Self::DEFAULT_CONTROL_BITRATE_MBPS,
+            control_fps: 60,
 
             ffmpeg_path: String::new(),
             settings_version: Self::SETTINGS_VERSION,
@@ -184,6 +208,10 @@ impl SenderSettings {
         }
         self.max_viewers = self.max_viewers.clamp(1, 16);
         self.upload_mbps = self.upload_mbps.clamp(0, 100_000);
+        self.control_bitrate_mbps = self.control_bitrate_mbps.clamp(1, 500);
+        if !(10..=240).contains(&self.control_fps) {
+            self.control_fps = 60;
+        }
         self
     }
 

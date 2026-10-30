@@ -119,6 +119,12 @@ fn a_sender_file_written_by_0_2_4_is_read_whole() {
         audio_exclude_app: "Discord.exe".to_string(),
         max_viewers: 6,
         upload_mbps: 1000,
+        // a file without it ends broadcasts that everyone left, as fresh settings do
+        end_when_viewers_leave: true,
+        // and offers control mode, at its own defaults
+        control_mode: true,
+        control_bitrate_mbps: SenderSettings::DEFAULT_CONTROL_BITRATE_MBPS,
+        control_fps: 60,
         ffmpeg_path: r"D:\HdrCast-0.2.4\tools\ffmpeg.exe".to_string(),
         settings_version: SenderSettings::SETTINGS_VERSION,
     };
@@ -175,6 +181,8 @@ fn a_receiver_file_written_by_0_2_4_is_read_whole() {
         auto_catch_up: false,
         target_peak_nits: 400,
         last_host: "q83vEjRWeJA_dzSLwjkZeg".to_string(),
+        // a file from before 0.3.7 watches, as it always did
+        control_mode: false,
     };
     assert_eq!(ReceiverSettings::load(&path), expected);
 }
@@ -182,13 +190,20 @@ fn a_receiver_file_written_by_0_2_4_is_read_whole() {
 #[test]
 fn the_field_names_and_their_order_are_the_data_member_names() {
     let sender = serde_json::to_value(SenderSettings::defaults_for(Platform::Windows)).unwrap();
-    // 0.2.4's members in its order, with 0.3.3's switch next to the other encoder options, then the number
-    // 0.3.2 added
+    // 0.2.4's members in its order, with 0.3.3's switch next to the other encoder options and the broadcast's
+    // end next to the viewer limits, then the number 0.3.2 added
     let csharp = serde_json::from_str::<Value>(SENDER_0_2_4).unwrap();
     let mut expected = keys(&csharp);
     let (keyframes, version) = ("keyframeOnRequest".to_string(), "settingsVersion".to_string());
+    let end = "endWhenViewersLeave".to_string();
+    let control = ["controlMode".to_string(), "controlBitrateMbps".to_string(), "controlFps".to_string()];
     let after = expected.iter().position(|k| *k == "lookahead").unwrap() + 1;
     expected.insert(after, &keyframes);
+    let after = expected.iter().position(|k| *k == "uploadMbps").unwrap() + 1;
+    expected.insert(after, &end);
+    for (i, key) in control.iter().enumerate() {
+        expected.insert(after + 1 + i, key);
+    }
     expected.push(&version);
     assert_eq!(keys(&sender), expected);
     assert_eq!(
@@ -217,15 +232,21 @@ fn the_field_names_and_their_order_are_the_data_member_names() {
             "audioExcludeApp",
             "maxViewers",
             "uploadMbps",
+            "endWhenViewersLeave",
+            "controlMode",
+            "controlBitrateMbps",
+            "controlFps",
             "ffmpegPath",
             "settingsVersion",
         ]
     );
     let receiver = serde_json::to_value(ReceiverSettings::default()).unwrap();
-    assert_eq!(
-        keys(&receiver),
-        keys(&serde_json::from_str::<Value>(RECEIVER_0_2_4).unwrap())
-    );
+    // 0.2.4's members in its order, then 0.3.7's choice of control mode
+    let csharp_receiver = serde_json::from_str::<Value>(RECEIVER_0_2_4).unwrap();
+    let mut expected = keys(&csharp_receiver);
+    let control_mode = "controlMode".to_string();
+    expected.push(&control_mode);
+    assert_eq!(keys(&receiver), expected);
     assert_eq!(
         keys(&receiver),
         [
@@ -243,6 +264,7 @@ fn the_field_names_and_their_order_are_the_data_member_names() {
             "autoCatchUp",
             "targetPeakNits",
             "lastHost",
+            "controlMode",
         ]
     );
 }
@@ -276,7 +298,8 @@ fn enums_are_written_as_their_numbers() {
             "cursor": true, "sdrWhite": 80.0, "encoder": 0, "quality": 1, "bitrateMbps": 40, "gopSeconds": 1.0,
             "bufferSeconds": 0.25, "bFrames": true, "lookahead": true, "keyframeOnRequest": false, "audio": true, "audioDevice": "default",
             "audioCodec": 1, "audioBitrateKbps": 192, "audioExcludeApp": "", "maxViewers": 4, "uploadMbps": 0,
-            "ffmpegPath": "", "settingsVersion": 1
+            "endWhenViewersLeave": true, "controlMode": true, "controlBitrateMbps": 30, "controlFps": 60, "ffmpegPath": "",
+            "settingsVersion": 1
         })
     );
 
@@ -300,7 +323,7 @@ fn enums_are_written_as_their_numbers() {
         json!({
             "latencyMs": 1500, "expectedBitrateMbps": 100, "displayMode": 0, "toneMapping": "bt.2390", "hwDec": 1,
             "bufferSeconds": 1.5, "fullscreen": false, "fullscreenScreen": 0, "frontend": 0, "mpvPath": "",
-            "ffmpegPath": "", "autoCatchUp": true, "targetPeakNits": 0, "lastHost": ""
+            "ffmpegPath": "", "autoCatchUp": true, "targetPeakNits": 0, "lastHost": "", "controlMode": false
         })
     );
 }
