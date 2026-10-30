@@ -1,6 +1,7 @@
 //! The host side: many viewers on the same two WAN sockets. A datagram from a confirmed viewer address goes
 //! to that viewer's own 127.0.0.1 socket, which talks to the viewer's remux child (SRT listener); what the
-//! child answers goes back to wherever that viewer's data last came from.
+//! child answers goes back to wherever that viewer's data last came from. A viewer in control mode has no remux
+//! child ([`HostLink::add_direct_session`]): its stream is the host's own side datagrams.
 
 use std::collections::HashMap;
 use std::io;
@@ -77,7 +78,8 @@ impl Sessions {
 
 struct Entry {
     session: PeerSession,
-    local: UdpChannel,
+    /// The socket that talks to the viewer's remux child; `None` for a viewer in control mode (no SRT at all).
+    local: Option<UdpChannel>,
     target: Mutex<SocketAddr>,
     tag: Option<String>,
     reported: Mutex<LinkState>,
@@ -170,7 +172,7 @@ impl HostLink {
         )?;
         let entry = Arc::new(Entry {
             session,
-            local,
+            local: Some(local),
             target: Mutex::new(loopback(child_port)),
             tag,
             reported: Mutex::new(LinkState::Punching),
@@ -178,19 +180,27 @@ impl HostLink {
             srt: SrtMonitor::new(),
         });
         let _ = slot.set(Arc::downgrade(&entry));
+        self.inner.insert(sid, entry);
+        Ok(())
+    }
 
-        let old = {
-            let mut sessions = lock(&self.inner.sessions);
-            let old = sessions.by_sid.get(sid).cloned();
-            if let Some(old) = &old {
-                sessions.forget(old);
-            }
-            sessions.by_sid.insert(sid.to_string(), entry);
-            old
-        };
-        if let Some(old) = old {
-            old.local.dispose();
-        }
+    /// Starts punching towards a viewer in control mode (docs/design.md §11): no remux child, no SRT; what goes to
+    /// it is [`send_side`](Self::send_side) / [`send_side_many`](Self::send_side_many). A session with the same id is
+    /// replaced.
+    pub fn add_direct_session<S: AsRef<str>>(&self, sid: &str, viewer_candidates: &[S], tag: Option<String>) -> io::Result<()> {
+        let session = PeerSession::new(self.inner.core.keys(), sid, PeerRole::Host, mono_clock::now_us())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad session id"))?;
+        session.add_remote_candidates(viewer_candidates);
+        let entry = Arc::new(Entry {
+            session,
+            local: None,
+            target: Mutex::new(loopback(0)),
+            tag,
+            reported: Mutex::new(LinkState::Punching),
+            bytes_to_viewer: AtomicU64::new(0),
+            srt: SrtMonitor::new(),
+        });
+        self.inner.insert(sid, entry);
         Ok(())
     }
 
@@ -210,7 +220,7 @@ impl HostLink {
             entry
         };
         self.inner.core.send_all(&entry.session.close_with_bye(reason, mono_clock::now_us()));
-        entry.local.dispose();
+        entry.dispose_local();
         self.inner.report(&entry, true);
     }
 
@@ -255,7 +265,32 @@ impl HostLink {
             return false;
         }
         entry.session.note_sent(mono_clock::now_us());
+        entry.bytes_to_viewer.fetch_add(datagram.len() as u64, Ordering::Relaxed);
         true
+    }
+
+    /// [`send_side`](Self::send_side) for many payloads at once (a picture's datagrams in control mode): the session
+    /// is looked up once. Returns how many went out; stops at the first that could not.
+    pub fn send_side_many<'a>(&self, sid: &str, payloads: impl IntoIterator<Item = &'a [u8]>) -> usize {
+        let Some(entry) = lock(&self.inner.sessions).by_sid.get(sid).cloned() else { return 0 };
+        if entry.session.state() != LinkState::Connected {
+            return 0;
+        }
+        let Some(to) = entry.session.selected() else { return 0 };
+        let mut datagram = Vec::with_capacity(side_channel::HEADER_LENGTH + side_channel::MAX_PAYLOAD);
+        let (mut sent, mut bytes) = (0, 0);
+        for payload in payloads {
+            if !side_channel::build_into(entry.session.sid_bytes(), payload, &mut datagram) || !self.inner.core.send_wan(&datagram, to) {
+                break;
+            }
+            sent += 1;
+            bytes += datagram.len() as u64;
+        }
+        if sent > 0 {
+            entry.session.note_sent(mono_clock::now_us());
+            entry.bytes_to_viewer.fetch_add(bytes, Ordering::Relaxed);
+        }
+        sent
     }
 
     /// Ends every session with a BYE ("the host stopped") and closes the sockets. Also done when dropped.
@@ -269,7 +304,7 @@ impl HostLink {
             };
             for entry in entries {
                 inner.core.send_all(&entry.session.close_with_bye("the host stopped", mono_clock::now_us()));
-                entry.local.dispose();
+                entry.dispose_local();
             }
         });
     }
@@ -281,7 +316,31 @@ impl Drop for HostLink {
     }
 }
 
+impl Entry {
+    fn dispose_local(&self) {
+        if let Some(local) = &self.local {
+            local.dispose();
+        }
+    }
+}
+
 impl Inner {
+    /// Puts `entry` in place of any session with the same id.
+    fn insert(&self, sid: &str, entry: Arc<Entry>) {
+        let old = {
+            let mut sessions = lock(&self.sessions);
+            let old = sessions.by_sid.get(sid).cloned();
+            if let Some(old) = &old {
+                sessions.forget(old);
+            }
+            sessions.by_sid.insert(sid.to_string(), entry);
+            old
+        };
+        if let Some(old) = old {
+            old.dispose_local();
+        }
+    }
+
     fn on_child_data(&self, entry: &Entry, datagram: &[u8], from: SocketAddr) {
         if from.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
             return;
@@ -361,9 +420,11 @@ impl LinkEvents for Inner {
         if !entry.session.on_data(from, mono_clock::now_us()) {
             return;
         }
+        // a viewer in control mode has no remux child: whatever else it sends is nobody's
+        let Some(local) = &entry.local else { return };
         entry.srt.from_receiver(datagram);
         let target = *lock(&entry.target);
-        entry.local.send(datagram, target);
+        local.send(datagram, target);
     }
 
     fn on_tick(&self, now_us: i64) {
@@ -377,7 +438,7 @@ impl LinkEvents for Inner {
                         sessions.forget(&entry);
                     }
                 }
-                entry.local.dispose();
+                entry.dispose_local();
             }
             self.report(&entry, false);
         }

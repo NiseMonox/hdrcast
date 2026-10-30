@@ -1,11 +1,16 @@
 //! Putting a viewer's input into the host's operating system.
 
+use std::sync::Arc;
+
 use crate::keys::{Button, Key};
 
 #[cfg(target_os = "macos")]
 mod mac;
 #[cfg(windows)]
 mod win;
+
+#[cfg(windows)]
+pub(crate) use win::WinInjector;
 
 /// The shared display in the operating system's global coordinates (Windows: physical pixels of the virtual
 /// desktop; macOS: points of the global display space).
@@ -16,6 +21,9 @@ pub struct ScreenRect {
     pub width: f64,
     pub height: f64,
 }
+
+/// Says something worth knowing to the host's log, in its words ("[control] ...").
+pub type Notices = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// What [`crate::host::HostControl`] needs from the operating system. Modifiers arrive as their own presses,
 /// before the key or button they belong to.
@@ -28,12 +36,15 @@ pub trait Injector: Send {
     /// `bit` is one of the [`crate::keys::Mods`] constants.
     fn modifier(&mut self, bit: u8, down: bool);
     fn key(&mut self, key: Key, down: bool);
+    /// The viewer this injector serves is (`true`) or is no longer (`false`) controlling this computer. The first
+    /// input follows soon after a `true`: a chance to get ready (Windows: start the input service).
+    fn activate(&mut self, _on: bool) {}
 }
 
 /// The real thing for this operating system.
 pub struct SystemInjector {
     #[cfg(windows)]
-    inner: win::WinInjector,
+    inner: crate::elevated::client::ElevatedInjector,
     #[cfg(target_os = "macos")]
     inner: mac::MacInjector,
     #[cfg(not(any(windows, target_os = "macos")))]
@@ -41,19 +52,41 @@ pub struct SystemInjector {
 }
 
 impl SystemInjector {
-    /// `display` is the display being shared: the pointer is confined to it.
+    /// `display` is the display being shared: the pointer is confined to it. This one injects by itself and tells
+    /// nobody anything; see [`SystemInjector::for_session`].
     pub fn new(display: ScreenRect) -> Self {
+        Self::for_session(display, Arc::new(|_| {}))
+    }
+
+    /// The injector of one viewer's session. On Windows it hands the input to the input service's program while the
+    /// viewer has control and the service is set up (see [`crate::elevated`]), so that windows of programs run as
+    /// administrator react too; `notices` hears how that goes.
+    pub fn for_session(display: ScreenRect, notices: Notices) -> Self {
         #[cfg(windows)]
-        return Self { inner: win::WinInjector::new(display) };
+        return Self { inner: crate::elevated::client::ElevatedInjector::new(display, notices) };
         #[cfg(target_os = "macos")]
-        return Self { inner: mac::MacInjector::new(display) };
+        {
+            let _ = notices;
+            return Self { inner: mac::MacInjector::new(display) };
+        }
         #[cfg(not(any(windows, target_os = "macos")))]
-        return Self { _rect: display };
+        {
+            let _ = notices;
+            Self { _rect: display }
+        }
+    }
+
+    /// Like [`SystemInjector::for_session`], but for an input program somebody started by hand (`HdrCastInput serve` in an
+    /// elevated shell) on `pipe`, installed or not: for trying it out.
+    #[cfg(windows)]
+    #[doc(hidden)]
+    pub fn for_helper_at(display: ScreenRect, notices: Notices, pipe: &str) -> Self {
+        Self { inner: crate::elevated::client::ElevatedInjector::with_pipe(display, notices, pipe) }
     }
 
     /// Whether this process may inject input at all. macOS wants the user to tick the app under Privacy &
     /// Security > Accessibility; `prompt` makes the system show that request. Always true on Windows (windows
-    /// of elevated programs still ignore us unless HdrCast is elevated too).
+    /// of programs run as administrator ignore us unless the service in [`crate::elevated`] is set up).
     pub fn permitted(prompt: bool) -> bool {
         #[cfg(target_os = "macos")]
         return mac::accessibility_trusted(prompt);
@@ -81,6 +114,9 @@ impl Injector for SystemInjector {
     }
     fn key(&mut self, key: Key, down: bool) {
         self.inner.key(key, down)
+    }
+    fn activate(&mut self, on: bool) {
+        self.inner.activate(on)
     }
 }
 

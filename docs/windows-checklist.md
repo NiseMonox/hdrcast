@@ -158,13 +158,38 @@ idx  device         name                      size        pos          hz     hd
 - [ ] 主播把"组里其他人"的观看设成"询问我"，另一台没加规则的电脑来连接 → 弹出请求 → **拒绝**：对方显示"did not let you in"、不再重试；
       两分钟内再连直接被拒、不再弹。没人回答时 50 s 后对方显示"Nobody at … answered your request"。
 - [ ] 有请求在等时主播点 **开始直播**：请求自动放行，观看列表里主播变成 LIVE。**停止** 后所有观众断开，主播回到"在线"。
+- [ ] 主播点 **开始直播**，观众看了一会儿后点 **停止**：约 2 s 后直播自动结束（"正在观看"里先闪过倒计时；日志
+      `everyone who watched has left: the broadcast ended`），主播页面提示一次、回到"可被连接"，观众的列表里主播变回"在线"。
+      观众随后再点 **连接**：主播那边不弹请求（3 分钟内看过），几秒后出画面，主播面板是"按需分享中"。观众在悬浮窗里改延迟：直播不结束。
+      开播后一直没人来：不会结束。关掉 **观众 → 观众都离开后结束直播**：没人看也一直播。
 - [ ] 关掉 **开放连接**：主播从观众的列表里消失（10 s 内），正在按需观看的人被断开。
 - [ ] `Ctrl + Alt + Enter` 只切换观众自己的全屏，不会发给主播。
 - [ ] 主播点 **收回**：观众面板变成"主播不允许"，输入不再转发；观众按住的键在主播端不会卡住。
 - [ ] 观众掉线（拔网线）：1.5 s 内主播端松开他按着的所有键和鼠标按钮。
 - [ ] 0.3.0 的观众连 0.3.1 的主播：按"组里其他人"的规则（默认询问我），请求里写"旧版 HdrCast，无法核实是哪台电脑"，没有"总是允许"。
-- 局限：以管理员身份运行的窗口不接受注入（除非 HdrCast 也以管理员身份运行）；Win 键、`Alt + Tab`、`Ctrl + Alt + Del` 被观众自己的系统拦下，发不过去。
-  锁屏 / UAC 安全桌面时桌面复制拿不到画面。主播的 HdrCast 要在运行（窗口可以关，见下）。
+- 局限：以管理员身份运行的窗口不接受注入，除非打开设置里的 **控制以管理员身份运行的程序**（下一组）；Win 键、`Alt + Tab`、`Ctrl + Alt + Del` 被观众自己的系统拦下，发不过去。
+  锁屏 / UAC 安全桌面时桌面复制拿不到画面，输入也进不去。主播的 HdrCast 要在运行（窗口可以关，见下）。
+
+输入服务（0.3.6，主播这台；设计见 design.md §9.1；**第一条用探针在本机量过，第二条只在浏览器预览里看过；服务本身（注册、普通权限启动、SYSTEM 进程在你的会话里注入）还没有在真机上装过，从第三条起都是第一次**）：
+
+- [ ] 以管理员身份运行一个带输入框的程序（比如"以管理员身份运行"的记事本）放到最前面。**先不打开开关**：观众（控制中）在上面点击、打字没有反应，
+      主播日志约 2 s 后写 `Windows refuses the viewer's mouse and keyboard right now: …switch on "Control programs that run as administrator" in Settings…`
+      （之后至少隔 2 分钟才再写）。普通窗口在前面时不写。
+- [ ] 设置 → 通用 → **控制以管理员身份运行的程序**：开关是关的，下面写着它做什么（一个 Windows 服务，系统权限，只在有人控制时），Windows 会问一次。
+- [ ] 打开开关：Windows 弹出权限确认（程序 `HdrCastInput.exe`）→ 允许 → 开关变成开，说明变成 "On. …"。核对：
+      `C:\Program Files\HdrCast\Input\` 里有 `HdrCastInput.exe` 和 `protocol`；`sc qc HdrCastInput` 里启动类型是 DEMAND_START、SERVICE_START_NAME 是 LocalSystem、BINARY_PATH_NAME 带引号并以 `service --user S-1-5-21-…` 结尾；
+      `sc sdshow HdrCastInput` 的最后一项是你自己的 SID，权限里有 `RP`（启动）、没有 `WP`（停止）和 `SD`（删除）；`sc query HdrCastInput` 是 STOPPED（它按需启动）。
+- [ ] **在普通（非管理员）命令行里**运行 `sc start HdrCastInput`（或者直接让观众控制）：不弹权限确认；任务管理器"详细信息"里出现两个 `HdrCastInput.exe`：
+      一个在会话 0（服务），一个在你的会话里、用户名 SYSTEM；约 45 s 后后者自己消失，服务回到 STOPPED。
+      （方案成不成立靠这一条：提示"拒绝访问"是服务的访问控制没给你启动权；服务一启动就停了，看 `%ProgramData%\HdrCast\input-helper.log`。）
+- [ ] 观众开始控制：主播日志 `input goes through the HdrCast input service`；上面那个管理员窗口现在能点、能打字，指针也到位。观众收回控制 / 离开：按住的键都松开，约 45 s 后进程和服务都停了。
+- [ ] 输入进程在运行时在任务管理器里结束它：下一次输入时日志 `the HdrCast input service went away: injecting without it`，约 5 s 内自动再拉起，再写 `input goes through the HdrCast input service`。
+- [ ] 观众正按着一个键时，在管理员命令行里运行 `sc stop HdrCastInput`：键被松开（不会卡住），日志 `service: stopped on request`，输入进程消失。
+- [ ] 注销再登录、锁屏再解锁：服务按需再起，不残留 SYSTEM 进程。
+- [ ] 解压新版覆盖 `D:\HdrCast`：不受影响（服务的程序在 Program Files 里，不占用 HdrCast 文件夹里的文件）。只有协议号变了，设置页才会显示"重新设置"。
+- [ ] 关掉开关：权限确认一次，`C:\Program Files\HdrCast` 和服务都消失（`sc query HdrCastInput` 说没有这个服务）。`%ProgramData%\HdrCast\input-helper.log` 留着（它是日志）。
+- [ ] Windows 安全中心（Defender）没有把 `HdrCastInput.exe` 标成威胁。标了的话：不要点"允许在设备上"，把它的名字和提示发回来，要判断是误报还是要改写法。
+- 局限：UAC 提示和锁屏不在内（有意的：见 design.md §9.1）。
 
 托盘与登录时启动（主播这台；Windows 11 新图标默认在任务栏的隐藏区里，可以在"任务栏设置 → 其他系统托盘图标"里让 HdrCast 常显）：
 
@@ -249,6 +274,26 @@ remux 子进程的 `inputbw=5465531`，观众走 `ffmpeg -f data` → 守卫 →
 - [ ] 打开 **按需关键帧** 后改码率：日志 `bitrate now … Mbps: the running encoder took it, no restart`，观众不中断。
 - [ ] 码率调得比观众加入时更高（例如 25 → 40）：主播日志 `<名字>: the bitrate went up to 40 Mbps, more than their connection was set up for: it starts again`，
       观众约 10 s 后继续播放；调低时没有这一行。
+
+## 15. 控制模式（0.3.7）
+
+- [ ] 主播（有 NVIDIA 显卡）：**开播 → 控制模式** 里 **提供控制模式** 默认开着，下面是码率和帧率；没有 NVIDIA 显卡的电脑上显示"不提供"。
+- [ ] 观众：**观看 → 连接 → 模式** 选 **控制**：延迟预设消失；在线列表里这台主播带"控制模式"，按钮是 **控制**。不提供的主播按钮照旧是 **观看 / 连接**，
+      连上后观众日志 `this host does not offer control mode: watching with the usual delay`。
+- [ ] 连上：主播日志 `[p2p] <名字> is joining in control mode`、`[ll] streaming: Streaming`、
+      `[ll-capture] … capture: control mode: GPU scheduling class high, GPU thread priority 7`（不是管理员时可能是 unchanged）、
+      `encoding here: NVENC … P1 ultra-low latency … keyframes on request`；观众日志 `control mode: HdrCast hands mpv each picture …`，mpv `Using hardware decoding`。
+- [ ] 观看页面板：**延迟**（主播从采集到发出 + 半个往返）几毫秒到十几毫秒、帧率接近设定值、码率、**丢失的画面**；悬浮窗同样，没有延迟预设。
+      开播页这位观众一行带"控制模式"、ping、Mbps。
+- [ ] 鼠标、键盘照控制规则工作（§9）；声音从观众的默认输出出来，静音按钮有效。
+- [ ] 最后一位控制模式观众走后 10 s：主播日志 `nobody is in control mode: stopping its stream until somebody connects`。
+- [ ] 开播页改控制模式的码率：`control mode now at … Mbps: the running encoder took it`；改帧率：`control mode's settings changed: starting its capture and encoder again`，
+      观众停顿一下后继续。关掉 **提供控制模式**：控制模式的观众被断开。
+- [ ] 丢包（单机回环，观众那份加 `set HDRCAST_SIMULATE_LOSS=3:40:2`：每 3 s 连丢 40 个控制模式的数据报，另外随机丢 2 %）：观众日志
+      `[test] lost 40 datagrams …`，画面只停一两帧；面板的 **丢失的画面** 和 **FEC 补回** 增加。
+- [ ] 延迟（可选，单机）：`cargo build --release -p hdrcast-capture --example latprobe`，然后
+      `latprobe clock --x <主播采集的屏左上角> --y … --cell 24 --seconds 60`、`latprobe place --rect …`（把观众的 mpv 放到一块 SDR 屏上，打印画面区域）、
+      `latprobe read --output <那块屏的序号> --region <mpv 里条码的位置> --seconds 20`（design §11.5；2026-10-30 本机 1080p120 中位 14.5 ms，4K HDR 21.3 ms）。
 
 ## 单机回环（不碰真实群组、路由器和朋友）
 

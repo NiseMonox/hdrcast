@@ -12,3 +12,7 @@ hdrcast-capture = { path = "../capture" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 thiserror = "2.0.21"
+# control mode (src/low_latency): its datagrams are sealed as remote control seals its own, and a picture's packets
+# carry Reed-Solomon parity (pure Rust, SIMD on x86-64 and AArch64; no C to build for the macOS check)
+chacha20poly1305 = "0.11.0"
+reed-solomon-simd = "3.1.0"

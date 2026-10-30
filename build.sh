@@ -2,7 +2,8 @@
 # HdrCast build script (run from the repo root: Git Bash on Windows, a terminal on macOS; needs Rust, see README):
 #   runs the tests (cargo test, plus the signaling server's Python tests), builds the app in release mode and
 #   packages it.
-#     Windows  dist/HdrCast/ with HdrCast.exe and ffmpeg / ffprobe / mpv in tools/, zipped to dist/HdrCast-<version>.zip;
+#     Windows  dist/HdrCast/ with HdrCast.exe, HdrCastInput.exe (the helper that types into windows of programs run as
+#              administrator, docs/design.md 9.1) and ffmpeg / ffprobe / mpv in tools/, zipped to dist/HdrCast-<version>.zip;
 #              the folder has no version, so an update unzipped over it keeps its firewall rule and sign-in entry
 #     macOS    dist/HdrCast.app and a .dmg, made by the Tauri CLI (cargo install tauri-cli --version "^2" --locked);
 #              ffmpeg and mpv come from Homebrew there and are not bundled
@@ -114,6 +115,16 @@ else
   echo "!! build FAILED (see $LOGDIR/build.log)"; FAILED+=("app")
 fi
 
+step "build HdrCastInput.exe (cargo build --release -p hdrcast-control --bin HdrCastInput)"
+INPUT_OK=0
+if cargo build --release -p hdrcast-control --bin HdrCastInput > "$LOGDIR/build-input.log" 2>&1; then
+  INPUT_OK=1
+  tail -n 1 "$LOGDIR/build-input.log"
+else
+  grep -E '^(error|warning: unused)' -A 6 "$LOGDIR/build-input.log" | tail -n 40
+  echo "!! build FAILED (see $LOGDIR/build-input.log)"; FAILED+=("input-helper")
+fi
+
 step "assemble $DIST"
 rm -rf "$DIST"
 mkdir -p "$DIST"
@@ -122,6 +133,13 @@ if [ "$APP_OK" = 1 ] && [ -f "$TARGET/release/HdrCast.exe" ]; then
   echo "  HdrCast.exe $(du -h "$DIST/HdrCast.exe" | cut -f1)"
 else
   echo "  (no HdrCast.exe: not built)"
+fi
+# next to HdrCast.exe: Settings sets it up from there (it copies itself to the program files folder)
+if [ "$INPUT_OK" = 1 ] && [ -f "$TARGET/release/HdrCastInput.exe" ]; then
+  cp "$TARGET/release/HdrCastInput.exe" "$DIST/"
+  echo "  HdrCastInput.exe $(du -h "$DIST/HdrCastInput.exe" | cut -f1)"
+else
+  echo "  (no HdrCastInput.exe: not built)"
 fi
 
 mkdir -p "$DIST/scripts" "$DIST/docs"

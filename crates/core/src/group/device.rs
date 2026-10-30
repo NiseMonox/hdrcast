@@ -310,6 +310,7 @@ mod tests {
             remote_control: true,
             device: None,
             keyframes: true,
+            low_latency: false,
         }
     }
 

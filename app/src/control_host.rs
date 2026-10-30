@@ -72,6 +72,8 @@ struct Entry {
     name: String,
     requested: bool,
     granted: bool,
+    /// The first pointer move or key of this viewer has been seen (and said so in the log).
+    input_seen: bool,
 }
 
 struct Inner {
@@ -131,9 +133,16 @@ impl ControlHub {
         let injector: Box<dyn Injector> = if std::env::var_os(DRY_RUN_ENV).is_some() {
             Box::new(LoggingInjector { log: self.log.clone(), name: name.to_string(), pointer_logged: None })
         } else {
-            Box::new(SystemInjector::new(inner.display))
+            // the log hears how the input service does (docs/design.md §9.1)
+            Box::new(SystemInjector::for_session(inner.display, self.log.clone()))
         };
-        let entry = Entry { control: HostControl::new(key, grant_of(policy), injector), name: name.to_string(), requested: false, granted: false };
+        let entry = Entry {
+            control: HostControl::new(key, grant_of(policy), injector),
+            name: name.to_string(),
+            requested: false,
+            granted: false,
+            input_seen: false,
+        };
         inner.sessions.insert(sid.to_string(), entry);
     }
 
@@ -169,6 +178,12 @@ impl ControlHub {
         }
         if !granted && entry.granted {
             notes.push(format!("[control] {} no longer controls this computer", entry.name));
+        }
+        // Real input is never logged (it could be a password), but that some arrived is worth one line: it tells a viewer
+        // that sends nothing from a host that cannot get what it sends into a window.
+        if !entry.input_seen && entry.control.input_events() > 0 {
+            entry.input_seen = true;
+            notes.push(format!("[control] {}'s mouse or keyboard input is arriving", entry.name));
         }
         entry.requested = requested;
         entry.granted = granted;

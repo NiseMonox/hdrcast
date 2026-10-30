@@ -71,6 +71,9 @@ pub struct P2pHostOptions {
     /// Whether this host takes keyframe requests on the side channel ("kf" in the live record, docs/design.md
     /// §8.12). Asked at every heartbeat. `None` = never.
     pub offer_keyframes: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// Whether this host offers control mode, the low-latency stream for remote control ("ll" in the live record,
+    /// docs/design.md §11). Asked at every heartbeat and for every join that asks for it. `None` = never.
+    pub offer_low_latency: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 /// What a side datagram is for. Each use has its own flag in the live record and the join, and nothing goes to
@@ -81,6 +84,8 @@ pub enum SideUse {
     RemoteControl,
     /// Keyframe requests and their answers ("kf").
     Keyframes,
+    /// Control mode's stream, its requests and answers ("ll").
+    LowLatency,
 }
 
 /// Something that happened to one viewer's stream, for whoever drives the encoder (docs/design.md §8.12).
@@ -111,6 +116,8 @@ pub struct JoinTicket {
     pub wants_control: bool,
     /// The join said "kf": the viewer asks for keyframes and understands the answers (docs/design.md §8.12).
     pub wants_keyframes: bool,
+    /// The join said "ll": control mode, the low-latency stream instead of SRT (docs/design.md §11).
+    pub low_latency: bool,
     pub latency_ms: i32,
     pub overhead_percent: i32,
 }
@@ -136,6 +143,7 @@ impl Default for P2pHostOptions {
             admit: None,
             on_demand: None,
             offer_keyframes: None,
+            offer_low_latency: None,
         }
     }
 }
@@ -161,6 +169,8 @@ pub struct ViewerInfo {
     pub wants_control: bool,
     /// The viewer's join said "kf": it asks for keyframes (docs/design.md §8.12).
     pub wants_keyframes: bool,
+    /// The viewer is in control mode: no SRT, the host's side datagrams are its stream (docs/design.md §11).
+    pub low_latency: bool,
     pub viewer_id: String,
     /// The viewer's device key, when its join was signed (docs/design.md §8.10).
     pub device_key: Option<String>,
@@ -445,17 +455,30 @@ impl P2pHost {
     /// [`send_side`](Self::send_side) for `purpose`: only to a viewer whose join announced that use.
     pub fn send_side_for(&self, sid: &str, purpose: SideUse, payload: &[u8]) -> bool {
         let Some(viewer) = lock(&self.inner.state).viewers.get(sid).cloned() else { return false };
-        let announced = {
-            let info = lock(&viewer.info);
-            match purpose {
-                SideUse::RemoteControl => info.wants_control,
-                SideUse::Keyframes => info.wants_keyframes,
-            }
-        };
-        if viewer.ended.load(Ordering::Acquire) || !announced {
+        if !self.announced(&viewer, purpose) {
             return false;
         }
         self.inner.link.get().is_some_and(|link| link.send_side(sid, payload))
+    }
+
+    /// Sends a run of control mode's datagrams (a picture's shards) to a viewer in control mode; how many went.
+    pub fn send_low_latency<'a>(&self, sid: &str, payloads: impl IntoIterator<Item = &'a [u8]>) -> usize {
+        let Some(viewer) = lock(&self.inner.state).viewers.get(sid).cloned() else { return 0 };
+        if !self.announced(&viewer, SideUse::LowLatency) {
+            return 0;
+        }
+        self.inner.link.get().map_or(0, |link| link.send_side_many(sid, payloads))
+    }
+
+    /// The viewer is still served and its join announced `purpose`.
+    fn announced(&self, viewer: &Viewer, purpose: SideUse) -> bool {
+        let info = lock(&viewer.info);
+        let announced = match purpose {
+            SideUse::RemoteControl => info.wants_control,
+            SideUse::Keyframes => info.wants_keyframes,
+            SideUse::LowLatency => info.low_latency,
+        };
+        announced && !viewer.ended.load(Ordering::Acquire)
     }
 
     /// Who is told what happens to each viewer's stream ([`StreamEvent`]), on a network or fan-out thread (keep
@@ -836,6 +859,9 @@ impl Inner {
                 JoinAnswer::REASON_DENIED
             } else if self.watching(&state) >= self.max_viewers() as usize {
                 JoinAnswer::REASON_FULL
+            } else if join.low_latency && !self.offers_low_latency() {
+                // control mode was switched off since the viewer read the live record: it tries again, without "ll"
+                JoinAnswer::REASON_BUSY
             } else {
                 ""
             }
@@ -932,6 +958,7 @@ impl Inner {
                 overhead_percent: join.overhead_percent,
                 wants_control: join.remote_control,
                 wants_keyframes: join.keyframes,
+                low_latency: join.low_latency,
                 viewer_id: join.viewer_id.clone(),
                 device_key: device.as_ref().map(|d| d.key.clone()),
                 srt: None,
@@ -942,16 +969,25 @@ impl Inner {
             streaming: AtomicBool::new(false),
             control_key,
         });
-        let port = match self.start_child(&viewer) {
-            Ok(port) => port,
-            Err(e) => {
-                (self.log)(&format!("[p2p] cannot start ffmpeg for {}: {e}", join.name));
-                self.answer(&join.session_id, false, JoinAnswer::REASON_BUSY, &viewer_exchange, None);
-                return Err(format!("cannot start ffmpeg for this viewer: {e}"));
+        // control mode has no remux child: the app sends its stream on the side channel (docs/design.md §11)
+        let port = if join.low_latency {
+            None
+        } else {
+            match self.start_child(&viewer) {
+                Ok(port) => Some(port),
+                Err(e) => {
+                    (self.log)(&format!("[p2p] cannot start ffmpeg for {}: {e}", join.name));
+                    self.answer(&join.session_id, false, JoinAnswer::REASON_BUSY, &viewer_exchange, None);
+                    return Err(format!("cannot start ffmpeg for this viewer: {e}"));
+                }
             }
         };
         lock(&self.state).viewers.insert(join.session_id.clone(), viewer.clone());
-        if let Err(e) = link.add_session(&join.session_id, &join.candidates, port, Some(join.session_id.clone())) {
+        let added = match port {
+            Some(port) => link.add_session(&join.session_id, &join.candidates, port, Some(join.session_id.clone())),
+            None => link.add_direct_session(&join.session_id, &join.candidates, Some(join.session_id.clone())),
+        };
+        if let Err(e) = added {
             // no local socket for this viewer: the C# apps would have crashed here; refuse the one viewer instead
             (self.log)(&format!("[p2p] cannot open a local socket for {}: {e}", join.name));
             self.end_viewer(&viewer, "the host could not serve this viewer");
@@ -959,7 +995,11 @@ impl Inner {
             self.changed.raise();
             return Err(format!("cannot open a local socket for this viewer: {e}"));
         }
-        (self.log)(&format!("[p2p] {} is joining (latency {} ms, candidates {})", join.name, join.latency_ms, join.candidates.join(", ")));
+        if join.low_latency {
+            (self.log)(&format!("[p2p] {} is joining in control mode (low latency, candidates {})", join.name, join.candidates.join(", ")));
+        } else {
+            (self.log)(&format!("[p2p] {} is joining (latency {} ms, candidates {})", join.name, join.latency_ms, join.candidates.join(", ")));
+        }
         self.answer(&join.session_id, true, "", &viewer_exchange, exchange.as_ref());
         self.changed.raise();
         Ok(control_key)
@@ -1201,6 +1241,7 @@ impl Inner {
             device_key: self.o.device.as_ref().map(|d| d.public_key().to_string()),
             on_demand: self.on_demand(),
             keyframes: self.o.offer_keyframes.as_ref().is_some_and(|offers| offers()),
+            low_latency: self.offers_low_latency(),
         };
         let keys = self.keys.get().expect("sealed only while running");
         SignedEnvelope::seal(keys, messages::KIND_LIVE, &g.group_id, &g.peer_id, &record.to_payload())
@@ -1229,6 +1270,10 @@ impl Inner {
 
     fn on_demand(&self) -> bool {
         self.o.on_demand.as_ref().is_some_and(|ask| ask())
+    }
+
+    fn offers_low_latency(&self) -> bool {
+        self.o.offer_low_latency.as_ref().is_some_and(|offers| offers())
     }
 
     fn set_status(&self, status: String) {
@@ -1308,6 +1353,7 @@ fn ticket_of(pending: &PendingJoin) -> JoinTicket {
         device_key: pending.device.as_ref().map(|d| d.key.clone()),
         wants_control: join.remote_control,
         wants_keyframes: join.keyframes,
+        low_latency: join.low_latency,
         latency_ms: join.latency_ms,
         overhead_percent: join.overhead_percent,
     }

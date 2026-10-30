@@ -183,6 +183,26 @@ export function SharePage() {
       <${Disclosure} label=${advanced ? t('common.less') : t('share.advanced')} open=${advanced} onToggle=${() => setAdvanced(!advanced)} />
     <//>
 
+    <${Section} title=${t('share.controlMode')}
+      note=${sender.controlMode && share.controlMode && !share.controlMode.offered ? t('share.controlNoNvidia') : t('share.controlModeNote')}
+      noteWarn=${sender.controlMode && share.controlMode && !share.controlMode.offered}>
+      <${Row} name=${t('share.controlOffer')} hint=${t('share.controlOfferHint')}>
+        <${Switch} on=${sender.controlMode} onChange=${(v) => set({ controlMode: v })} />
+      <//>
+      ${sender.controlMode && html`
+        <${Row} name=${t('share.controlBitrate')} hint=${t('share.controlBitrateHint')} wide>
+          <div class="slider-wrap">
+            <${Slider} value=${Math.min(100, sender.controlBitrateMbps)} min=${5} max=${100} step=${1} onChange=${(v) => set({ controlBitrateMbps: v })} />
+            <${NumberField} value=${sender.controlBitrateMbps} min=${1} max=${500} onChange=${(v) => set({ controlBitrateMbps: v })} width=${56} />
+            <span class="unit">Mbps</span>
+          </div>
+        <//>
+        <${Row} name=${t('share.controlFps')} hint=${t('share.controlFpsHint')}>
+          <${Segmented} value=${sender.controlFps} onChange=${(v) => set({ controlFps: v })}
+            options=${[30, 60, 90, 120, 144, 240].map((v) => ({ value: v, label: String(v) }))} />
+        <//>`}
+    <//>
+
     <${Section} title=${t('share.sound')}>
       <${Row} name=${t('share.audio')} hint=${t('share.audioHint')}>
         <${Switch} on=${sender.audio} onChange=${(v) => set({ audio: v })} />
@@ -216,6 +236,9 @@ export function SharePage() {
       <${Row} name=${t('share.upload')} hint=${t('share.uploadHint')}>
         <${NumberField} value=${sender.uploadMbps} min=${0} max=${100000} onChange=${(v) => set({ uploadMbps: v })} />
         <span class="unit">Mbps</span>
+      <//>
+      <${Row} name=${t('share.endWhenLeft')} hint=${t('share.endWhenLeftHint')}>
+        <${Switch} on=${sender.endWhenViewersLeave} onChange=${(v) => set({ endWhenViewersLeave: v })} />
       <//>
       ${fw?.applicable && !firewallCard && html`<${FirewallRow} firewall=${fw} />`}
     <//>
@@ -375,13 +398,17 @@ function Viewers({ share }) {
   const viewers = p2p?.viewers || [];
   const control = (sid, allow) => invoke('control_set', { sid, allow }).catch((e) => toast(String(e), { kind: 'warn' }));
   const kick = (sid) => invoke('share_kick', { sid }).catch((e) => toast(String(e), { kind: 'warn' }));
+  // live, and everyone who watched has left: the broadcast ends when this runs out (the switch under Viewers)
+  const ending = share.mode === 'live' && share.endsInSec != null;
   return html`
     <div class="section-title">
       <span>${t('share.watching', { n: viewers.length })}</span><span class="spacer"></span>
       ${viewers.length > 0 && p2p && html`<span class="value">${t('share.uploadNow', { mbps: Math.ceil(p2p.uploadMbps) })}</span>`}
     </div>
     <div class="card rows">
-      ${viewers.length === 0
+      ${viewers.length === 0 && ending
+        ? html`<${Empty} icon="people" title=${t('share.allLeft')} text=${t('share.endsIn', { s: share.endsInSec })} />`
+        : viewers.length === 0
         ? html`<${Empty} icon="people" title=${t('share.nobody')} text=${t(share.mode === 'live' ? 'share.nobodyText' : 'share.nobodyOnDemand')}>
             ${share.mode === 'live' && html`<button class="btn tinted" onClick=${copyInvite}><${Icon} name="copy" />${t('group.copyInvite')}</button>`}
           <//>`
@@ -390,7 +417,14 @@ function Viewers({ share }) {
             <div class="who">
               <div class="pname">${v.name}${v.deviceCode && html` <span class="code">${v.deviceCode}</span>`}</div>
               <div class="pmeta">
-                ${v.state === 'watching'
+                ${v.state === 'watching' && v.mode === 'control'
+                  ? html`<span class=${'badge ' + (v.ipv6 ? 'blue' : '')}>${v.ipv6 ? 'IPv6' : 'IPv4'}</span>
+                      <span class="badge">${t('share.inControlMode')}</span>
+                      ${(v.ll?.rttMs ?? v.rttMs) >= 0 && html`<span>${t('share.ping', { ms: Math.round(v.ll?.rttMs ?? v.rttMs) })}</span>`}
+                      ${v.ll && html`<span>· ${v.ll.mbps.toFixed(1)} Mbps</span>`}
+                      ${v.ll?.lost > 0 && html`<span>· ${t('share.llLost', { n: v.ll.lost })}</span>`}
+                      ${v.ll?.restored > 0 && html`<span>· ${t('share.llRestored', { n: v.ll.restored })}</span>`}`
+                  : v.state === 'watching'
                   ? html`<span class=${'badge ' + (v.ipv6 ? 'blue' : '')}>${v.ipv6 ? 'IPv6' : 'IPv4'}</span>
                       ${v.rttMs >= 0 && html`<span>${t('share.ping', { ms: Math.round(v.rttMs) })}</span>`}
                       <span>· ${t('share.srtLatency', { s: (v.latencyMs / 1000).toFixed(1).replace(/\.0$/, '') })}</span>

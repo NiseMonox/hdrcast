@@ -10,6 +10,7 @@ export const state = {
   settings: null,      // { ui, sender, receiver }
   access: null,        // who may connect and control: { rev, available, others, devices }
   autostart: null,     // starting at sign-in, as the system has it: { supported, on, other, disabled }
+  inputHelper: null,   // the input service, as the system has it: { supported, installed, outdated, running, notNeeded, bundled }
   status: null,        // the latest runtime snapshot (pushed a few times a second)
   group: null,
   tools: null,
@@ -66,6 +67,7 @@ export async function boot() {
     settings: { ui: init.ui, sender: init.sender, receiver: init.receiver },
     access: init.access,
     autostart: init.autostart,
+    inputHelper: init.inputHelper,
     group: init.group,
     tools: init.tools,
     firewall: init.firewall,

@@ -29,6 +29,13 @@
 - v0.3.4（2026-10）：**升级不用再放行防火墙**。发行包里的文件夹固定叫 `HdrCast`，只有 zip 的名字带版本号（§6）：Windows 防火墙的规则和
   登录时启动的 Run 项认的都是 exe 的完整路径，新版本解压覆盖旧文件夹，两样都不用重做；以前每个版本一个文件夹，每次升级都要再点 **放行…**（UAC）。
   其余与 0.3.3 相同。
+- v0.3.5（2026-10）：**观众都离开后自动结束直播**。开播后，看过这次直播的人都离开 2 s，直播就自动结束、停掉采集和编码器，这台电脑
+  回到在线（关着开放连接时下线）；之后再连进来的观众按需分享，3 分钟内看过的不用再问（§8.10）。开播页 **观众** 一节可以关掉。
+  `sender.json` 多了字段 `endWhenViewersLeave`（没有时为开），线上协议不变。
+- v0.3.7（2026-10）：**控制模式**，为远程控制的超低延迟（§11）。观众在观看页选 **观看** 还是 **控制**；选控制时，提供它的主播（有 NVIDIA 显卡）
+  另起一路照 Vibepollo 的方式编码的流（NVENC 超低延迟调优、一帧的 VBV、采到就编、不定时出关键帧），不经 SRT、不缓冲，每帧切片加 Reed-Solomon 校验、
+  加密后走打洞出来的同一条路径，丢了不重发、只要关键帧；观众把收齐的每一帧直接写进 mpv（不缓冲、单线程硬解）。本机端到端 1080p 中位 14.5 ms、
+  4K HDR 21.3 ms。线上协议的新字段 `ll` 是可选的，旧版本不受影响。
 
 ## 1. 架构
 
@@ -94,6 +101,8 @@ AV1 要换成别的，比如插一个"重复上一帧"的 show_existing_frame）
 | `HdrCast audio-devices` | 列出音频输出端点（Windows） |
 | `HdrCast capture <参数>` | 采集引擎（无窗口，stdout 先写一行帧格式、再每秒写 JSON 统计，stderr 写日志）。应用把自己当子进程这样启动 |
 | `HdrCast firewall-allow` | 加 Windows 防火墙入站规则后退出；由界面的 **放行…** 以管理员身份启动（§8.7） |
+
+另有一个很小的独立程序 `HdrCastInput.exe`（`service --user <SID>` / `serve` / `install --user <SID>` / `uninstall`，没有窗口）：它既是 Windows 服务也是服务在用户会话里启动的输入进程，让远程控制能进管理员身份运行的窗口，见 §9.1。
 
 同一份配置（同一个 `%APPDATA%\HdrCast`，或同一个 `HDRCAST_DATA_ROOT`）同时只运行一个应用：已经在运行时再启动（前三种），新进程把参数交给正在运行的那个后自己退出（§2.7）。
 
@@ -268,11 +277,11 @@ Windows 11 用 Mica、macOS 用侧边栏毛玻璃作窗口背景（没有时退�
 1. **开播**：顶部是状态卡片（"可被连接" / "未开放连接"，以及这台电脑的设备码，§8.10）。有人请求观看时出现"请求观看"列表
    （设备码或"旧版本"、剩余秒数，**拒绝** / **总是允许** / **允许**；同时弹出提示，窗口不在前台时任务栏闪烁，收在托盘里或最小化时窗口自己出来，见下）。
    有人在看或开播时状态卡片换成面板：码率 / 编码 fps / 采集 fps / 丢帧；开播时标题"直播中"、按钮 **停止**，按需时标题"按需分享中"、按钮 **全部断开**；
-   下面是正在观看的人（设备码、IPv6 / IPv4、ping、延迟、远程控制状态与 允许 / 拒绝 / 收回、**断开**）。
+   下面是正在观看的人（设备码、IPv6 / IPv4、ping、延迟、远程控制状态与 允许 / 拒绝 / 收回、**断开**；开播中看过的人都离开后，这里是直播结束的倒计时，§8.10）。
    设置部分：显示器卡片（带 HDR 徽标、分辨率、刷新率、峰值亮度）；画面（码率滑块、帧率、分辨率、HDR 自动 / 始终 SDR、编码器 + **检测**，
    更多选项里是编码预设、关键帧间隔、B 帧、Lookahead、指针）；声音（开关、设备、AAC / Opus、排除程序）；
    **谁可以连接**（"开放连接"开关；"组里其他人"的 观看 / 控制 规则；每台电脑一行规则，可移除；**添加电脑…** 从在线或最近请求过的电脑里选：
-   "我的电脑" = 直接允许 + 自动获得控制，"信任的朋友" = 直接允许 + 控制要询问）；观众（同时观看人数、上行带宽与估算、防火墙 **放行…**）。
+   "我的电脑" = 直接允许 + 自动获得控制，"信任的朋友" = 直接允许 + 控制要询问）；观众（同时观看人数、上行带宽与估算、**观众都离开后结束直播**、防火墙 **放行…**）。
    底部固定一条：将要发送的格式 + **开始直播**。
 2. **观看**：组里在线的电脑（每 10 s 向信令服务器要一次；不要更快，服务器按 IP 限流每秒 10 次）：开播中的标 LIVE、按钮 **观看**，
    按需的标"在线"、按钮 **连接**，都带设备码；延迟预设（快速 300 ms / 日本 / 澳大利亚 / 中国 / 自定义）；输出（自动 / HDR / SDR）。
@@ -576,10 +585,10 @@ Cargo workspace（Rust 1.85+，edition 2021）。全部用普通线程和阻塞 
 |---|---|
 | `crates/core`（hdrcast-core） | 地址解析、SRT URL / 缓冲计算、参数引用、日志脱敏、工具查找、路径、`LineProcess` / `ProcessJob`、Windows 防火墙；群组（密钥、邀请码、签名消息、`group.json`） |
 | `crates/p2p`（hdrcast-p2p） | UDP 通道、打洞状态机、HostLink / ViewerLink、回显、UPnP、信令客户端、分发、P2pHost / ViewerSession、旁路通道 |
-| `crates/capture`（hdrcast-capture） | 采集引擎：平台无关的主循环（节拍、重复帧、统计、音频对齐、管道写线程）+ 后端（`win/`：DXGI / D3D11 / WASAPI；`mac/`：ScreenCaptureKit；其余：桩） |
-| `crates/media`（hdrcast-media） | 编码器档位、ffmpeg 命令、`-progress` 解析、编码器探测、`sender.json`；mpv 命令、IPC 消息、日志分类、`receiver.json` |
+| `crates/capture`（hdrcast-capture） | 采集引擎：平台无关的主循环（节拍、重复帧、统计、音频对齐、管道写线程）+ 后端（`win/`：DXGI / D3D11 / WASAPI；`mac/`：ScreenCaptureKit；其余：桩）；控制模式观众放声音（`playback`） |
+| `crates/media`（hdrcast-media） | 编码器档位、ffmpeg 命令、`-progress` 解析、编码器探测、`sender.json`；mpv 命令、IPC 消息、日志分类、`receiver.json`；控制模式的分片 / 纠错 / 加密 / 声音包（`low_latency`，§11） |
 | `crates/control`（hdrcast-control） | 远程控制：报文、按键名、输入注入（§9） |
-| `app`（hdrcast，产物 `HdrCast`） | Tauri 2 应用：窗口、命令、采集 + ffmpeg 的编排（`sender_runner`）、mpv 的编排（`mpv_runner`、`mpv_ipc`）、远程控制两端的粘合 |
+| `app`（hdrcast，产物 `HdrCast`） | Tauri 2 应用：窗口、命令、采集 + ffmpeg 的编排（`sender_runner`）、mpv 的编排（`mpv_runner`、`mpv_ipc`）、远程控制两端的粘合、控制模式的两端（`low_latency_host`、`low_latency_viewer`） |
 
 - `build.sh`：`cargo test --workspace` + 信令服务器的 Python 测试 → Windows：`cargo build --release -p hdrcast`，装配 `dist/HdrCast/`
   （`HdrCast.exe`、`tools/`、`scripts/`、`docs/`、`signal/`、README）并打成 `dist/HdrCast-<版本>.zip`；macOS：`cargo tauri build` 出 `HdrCast.app` 和 dmg。
@@ -587,7 +596,8 @@ Cargo workspace（Rust 1.85+，edition 2021）。全部用普通线程和阻塞 
 - 配置存 `%APPDATA%\HdrCast\`（macOS：`~/Library/Application Support/HdrCast/`）；日志存其下的 `logs/hdrcast-yyyyMMdd.log`。
 - 界面不经打包器：`node scripts/ui-preview.mjs` 可以在浏览器里单独打开它（`ui/mock.js` 扮演后端）。
 - 调试用的环境变量：`HDRCAST_DATA_ROOT`（另一份配置）、`HDRCAST_NO_ROUTER=1`（不做 UPnP）、`HDRCAST_CONTROL_DRY_RUN=1`（远程控制只写日志）、
-  `HDRCAST_SIMULATE_LOSS=<秒>[:<包数>]`（观众的链路每隔这么多秒把接下来的这么多个 SRT 数据包连同它们的全部重发丢掉，默认 20 个；单机试按需关键帧用）、
+  `HDRCAST_SIMULATE_LOSS=<秒>[:<包数>[:<百分比>]]`（观众的链路每隔这么多秒把接下来的这么多个 SRT 数据包连同它们的全部重发丢掉，默认 20 个；单机试按需关键帧用。
+  控制模式（§11）的画面和声音数据报同样每隔这么多秒连丢这么多个，第三个数是另外随机丢掉的百分比）、
   `HDRCAST_NO_ZERO_COPY=1`（主播端引擎编码时不用零拷贝，帧经内存交给 NVENC，§2.8）、调试构建里的 `HDRCAST_DEVTOOLS_PORT`（把界面暴露给 DevTools 协议，脚本驱动真实窗口用）。
 
 ## 7. 验证
@@ -669,6 +679,7 @@ JSON = {"v":1,"s":"http://101.43.23.94:18650","g":"<gid>","k":"<b64u(32 字节�
   还不知道时不写，旧主播也不写。观众据此说明 IPv4 失败是哪一边的问题。
 - 0.3.1 起的可选字段：`live` 的 `"dk"`、`"od"`，`join` 与 `answer` 的 `"dk"`、`"ek"`、`"ds"`，`answer` 的 `reason` 新值 `denied` / `timeout`，见 §8.10。
 - 0.3.3 起的可选字段：`live` 与 `join` 的 `"kf":true`（按需关键帧），见 §8.12。
+- 0.3.7 起的可选字段：`live` 与 `join` 的 `"ll":true`（控制模式），见 §11.1。
 - 收方先验 `m`（常量时间比较），再解 `p`；payload 里的 `host` / `sid` 必须等于信封所在的 key。
 - `t` 与本机时间相差超过 10 分钟的 `join` 丢弃；主播缓存已处理的 `sid` 10 分钟防重放。
 - `cands` 每项是 `Endpoint` 能解析的 `host:port`（IPv6 带方括号），最多 8 项。
@@ -805,7 +816,9 @@ P2P 层**只搬运、不解释**：不看载荷，也不替它加密或认证。
   接收一侧不看标志（没声明的对端本来就不会发）。
 - 0.3.3 起旁路通道还有第二种用途，按需关键帧（§8.12），标志是 `kf`，与 `rc` 各管各的：只向声明了**这种用途**的对端发这种数据报
   （`P2pHost::send_side_for(sid, SideUse, …)`、`ViewerSession::send_side_for(SideUse, …)`）。两种载荷靠第一个字节区分：远程控制是方向字节 1 / 2，
-  按需关键帧是 `K` / `k`。
+  按需关键帧是 `K` / `k`。0.3.7 起第三种用途是控制模式（§11.3），标志 `ll`，第一个字节 `V`（画面分片）、`A`（声音）、`R`（请求和报告）、`r`（回答），
+  只在 `join` 带 `ll` 的会话里收发（`SideUse::LowLatency`）。这样的会话没有 remux 子进程（`HostLink::add_direct_session`），
+  一帧的数据报一次交给链路（`HostLink::send_side_many`）。
 - 旧版本不受影响：C# 0.2.4 读消息时按字段名取值，未知字段忽略；信令服务器只存取 `p` / `m` 两个串，不解析载荷。
   已实测（`crates/p2p/tests/csharp_interop_tests.rs`，把发行版里的 `HdrCastReceiver.exe` / `HdrCastSender.exe` 加载进 PowerShell 5.1 直接驱动它们的
   `ViewerSession` / `P2pHost`）：带 `rc` 的 `live` 记录，0.2.4 观众照常加入并出画面；带 `rc` 的 `join`，0.2.4 主播照常接受并出画面；两个方向都没有任何旁路数据报发出。
@@ -866,7 +879,18 @@ answer: "hdrcast/v1/answer-device" gid  sid  t  ok(true|false)  reason  cands  �
   P2pHost 自己兜底：90 s 没人决定的 join 回答 `timeout`。
 - 观众端：所看主播的 `live` 带 `dk` 时最多等 60 s（2 s 没回答就显示"等待对方回答"）；回答来得晚（> 5 s）时用同一个 sid 重新打洞
   （第一轮 15 s 可能已经用完）。旧主播照旧等 20 s。
-- 最后一个观众离开 20 s 后停止采集和编码（开播期间不停）；"全部断开" / "停止"会断开所有观众，各自一分钟内不能重连。
+- 最后一个观众离开 20 s 后停止采集和编码。"全部断开" / "停止"会断开所有观众，各自一分钟内不能重连。
+- 开播期间，看过这次直播的人都离开 2 s 后直播自动结束（`sender.json` 的 `endWhenViewersLeave`，开播页 **观众** 一节的
+  **观众都离开后结束直播**，默认开；关掉则和以前一样，没人看也一直播）。结束和点 **停止** 一样：去掉 `live`、停掉采集和编码器、
+  回到在线（关着开放连接时下线），只是不断开任何人。只算路径真正连通过的观众（`ViewerState::Watching`）：开播后还没人看过、
+  或者来的人始终没连通时不会结束。只等 2 s（`UNWATCHED_END`），不像按需那样等 20 s：结束后再来的观众照上面的规则进来，
+  3 分钟内放行过（或看过）的不用再问，只是编码器要重新启动（本机实测：重新加入 1.1 s 后主播看到人，4.2 s 出画面）。
+  路径不到 15 s 没包不算断，短的网络抖动不会让列表变空；在悬浮窗里改延迟是先离开再加入，本机实测列表没有空过，
+  信令慢、超过 2 s 才加入时直播先结束，观众照样按需回来。代价：关着开放连接时结束就是下线，晚回来的观众连不回来。
+  有人连进来（包括正在放行、正在打洞的）就重新计时。housekeeping 每 400 ms 看一次，到时在 `starting`
+  锁里再确认一遍没人回来、还是同一次直播（用户可能已经停止又重新开始）才结束（`share.rs` 的 `end_unwatched`）。
+  "正在观看"里显示倒计时（状态里的 `endsInSec`）；结束后页面提示一次（`endedUnwatched` 计数加一），日志
+  `everyone who watched has left: the broadcast ended`。
 - 码率、人数上限、ffmpeg 路径可以在运行中改（`P2pHost::set_stream` / `set_ffmpeg_path`，设置一变就生效），`announce_now` 让下一次心跳马上发出。
 
 ### 8.11 SRT 链路统计（0.3.2 起）
@@ -947,8 +971,8 @@ answer: "hdrcast/v1/answer-device" gid  sid  t  ok(true|false)  reason  cands  �
 
 ## 9. 远程控制（0.3.0 起）
 
-观众可以请求使用主播的鼠标和键盘。输入走 §8.9 的旁路通道，所以只有双方都是 0.3+ 才有；画面延迟还是 SRT 延迟 + 播放器缓冲，
-这是"帮忙点一下"的功能，不是远程桌面（建议配合 300 ms 的"快速"预设）。
+观众可以请求使用主播的鼠标和键盘。输入走 §8.9 的旁路通道，所以只有双方都是 0.3+ 才有。观看模式下画面延迟还是 SRT 延迟 + 播放器缓冲，
+这是"帮忙点一下"的功能；0.3.7 起观众可以选 **控制模式**（§11）：不缓冲的低延迟流，像远程桌面那样用。
 
 **谁说了算**（0.3.1 起按电脑）。主播的 `access.json`：
 
@@ -994,9 +1018,59 @@ answer: "hdrcast/v1/answer-device" gid  sid  t  ok(true|false)  reason  cands  �
   布局里打不出的字符（中文等）用 `KEYEVENTF_UNICODE` 当文本输入。虚拟键都带上扫描码（有的游戏只认它）。指针用 `SendInput` 的虚拟桌面绝对坐标，
   限制在正在分享的那块显示器的矩形里。macOS 用 Quartz 事件（§10）。
 - **不留按住的键**：收回、观众离开、会话结束时全部松开；1.5 s 没收到这位观众的任何报文也全部松开；序号出现缺口（观众的队列溢出过）时先全部松开再继续。
-- 局限：Windows 上以管理员身份运行的窗口不接受注入；Win 键、`Alt+Tab`、`Ctrl+Alt+Del` 在观众自己的系统里就被拦下了；没有相对鼠标（不适合 FPS）。
+- 局限：Windows 上以管理员身份运行的窗口不接受主播应用自己的注入，要打开设置里的"控制以管理员身份运行的程序"（§9.1）；
+  UAC 提示和锁屏连服务也进不去（有意的，见 §9.1）；Win 键、`Alt+Tab`、`Ctrl+Alt+Del` 在观众自己的系统里就被拦下了；没有相对鼠标（不适合 FPS）。
 - 主播和观众在同一台电脑上试的时候，真注入会让播放窗口里的指针反过来驱动自己：设 `HDRCAST_CONTROL_DRY_RUN=1`，主播端只把收到的动作写进日志
   （不写是哪个字符键，日志是要发给别人看的）。
+
+### 9.1 输入服务：控制以管理员身份运行的窗口（0.3.6 起，Windows）
+
+**问题**。Windows 的 UIPI（用户界面特权隔离，UAC 的一部分）只让完整性级别不低于目标窗口的进程向它发输入。HdrCast 以登录用户的"中"级别运行；
+前台窗口属于以管理员身份启动的程序（"高"，比如以管理员运行的 Claude 桌面版）时，`SendInput` 照样返回成功，输入被系统悄悄丢掉
+（量过：指针不动，`SetCursorPos` 失败，`ERROR_ACCESS_DENIED`），于是"远程控制没反应"。Parsec、Sunshine（和它的分支）没有这个问题，
+因为它们的安装程序注册了 Windows 服务，让输入进程以 SYSTEM 身份跑在用户的会话里，级别比谁都高。
+
+**做法**（`crates/control/src/elevated/`、`src/bin/hdrcast_input.rs`）：同样的结构，三部分，都在一个 `HdrCastInput.exe` 里。
+（服务本身待在 session 0，碰不到用户的桌面，所以"服务 + 它在用户会话里启动的输入进程"这两个进程是躲不掉的；Sunshine 是 `sunshinesvc.exe` + `sunshine.exe`，Parsec 是 `pservice` + `parsecd`。）
+
+- **服务**（`HdrCastInput service --user <SID>`，`service.rs`）。LocalSystem，**按需启动**（`SERVICE_DEMAND_START`，不是开机自启）；它只做一件事：在用户的会话里用自己的令牌启动输入进程，输入进程走了它就停。
+  - 找会话：`WTSEnumerateSessionsW` 找状态为 Active 的会话，`WTSQueryUserToken` 取各会话用户的 SID，和注册服务时写进命令行的 `--user` 比；找不到（用户没登录）就停并写日志。远程桌面登录的用户也行。
+  - 令牌：复制自己的 SYSTEM 令牌（`DuplicateTokenEx`，主令牌），`SetTokenInformation(TokenSessionId)` 改到那个会话（Sunshine 也这样做；要 SeTcb，LocalSystem 有，进来先把 SeTcb / SeAssignPrimaryToken / SeIncreaseQuota 打开，它们平时是关着的），
+    再 `CreateRestrictedToken(DISABLE_MAX_PRIVILEGE)` 去掉全部特权：输入进程要的是**级别**（UIPI 比的是完整性级别），不是特权；万一它有漏洞，拿到的尽量少。
+  - 启动：`CreateProcessAsUserW`，`lpDesktop = winsta0\default`，不要窗口，命令行 `"<exe>" serve --user <SID> --stop-event <名>`。
+  - 停：Windows 要求停止（卸载、关机）时，服务置位一个命名事件（`Global\HdrCastInputStop-…`，访问控制只给 SYSTEM），输入进程听到后先断开所有客户端、松开他们按住的键再退出；4 s 内没走才 `TerminateProcess`。
+    输入进程自己退出（最后一个观众走了 45 s）时服务随之停止。
+- **输入进程**（`HdrCastInput serve`，`server.rs`）。以 SYSTEM（无特权）跑在用户会话里，监听 `\\.\pipe\hdrcast-input-<协议号>-<用户 SID>`，单向（应用→输入进程）。`FILE_FLAG_FIRST_PIPE_INSTANCE`：已经有一个在听就退出。
+  访问控制（SDDL）：SYSTEM 和对象所有者全权；用户只有"写数据 + 读属性"（`0x100082`，所以用户的普通程序开不了管道的第二个实例）；完整性标签"中、禁止低写"（低完整性的沙箱进不来）。
+  总留着一个空闲实例，免得第二个客户端撞上"全忙"。每个连接一个线程、一个 `Replay`：必须先收到 `Hello`；记着按住的键、鼠标键和修饰键，连接断了（应用崩溃也一样）就全部松开；
+  协议外的字节、同时按住超过 256 个键都直接断开。进程是每显示器 DPI 感知的，指针坐标是物理像素。手动运行 `HdrCastInput serve`（调试用）服务的是运行它的用户。
+  **不跟着切到安全桌面**（UAC 提示、锁屏），见下。
+- **客户端**（`client.rs`，在 HdrCast 里）。观众拿到控制权时（`HostControl` 第一次 `granted`，调用 `Injector::activate(true)`；收回、观众离开时是 `false`），`ElevatedInjector` 在后台线程里：
+  管道不在就 `StartService`（服务的访问控制让注册它的那个用户启动，普通权限也行，不弹 UAC；服务正在停时每 300 ms 再试），最多等 5 s，连上管道，先发 `Hello`（共享显示器的矩形），之后每个动作一帧。
+  连上之前的头几百毫秒、没装服务、应用自己已经是管理员时，照旧自己 `SendInput`（键盘状态是系统的，不是哪个程序的，中途换路不会卡键）；
+  输入进程中途没了（写管道失败）就切回自己注入并每 5 s 再试一次，日志里说一声（同一个问题只说一次，直到它又好了）。
+- **设置**（设置 → 通用 → **控制以管理员身份运行的程序**，Windows 的权限确认一次）。应用像 `firewall-allow` 那样（`ShellExecuteEx` 的 `runas`，等退出码）以管理员身份启动自己旁边的
+  `HdrCastInput.exe install --user <SID>`。它把自己复制到 `%ProgramFiles%\HdrCast\Input\`（路径用 `SHGetKnownFolderPath` 取，不信环境变量；**以 SYSTEM 运行的文件必须是普通程序改不了的**），写下协议号，
+  向服务管理器注册服务 `HdrCastInput`（`CreateServiceW`：LocalSystem、按需启动、命令行里程序带引号），并设服务的访问控制：SYSTEM 和管理员照默认，装它的这个用户只能**查询和启动**，不能停止、修改、删除。
+  关掉开关就是同样的 `uninstall`（停服务、删服务、删这两个文件和空文件夹；用应用旁边那份来跑，装好的那份删不掉自己）。服务管理器是直接调 API 问的，不看任何工具的输出，所以和系统语言无关。
+- **协议**（`elevated::Frame`）：1 字节标签 + 定长字段，小端：`Hello`（显示器 x、y、宽、高，各 f64）、`Pointer`（x、y，u16）、`Button`（键、按下）、`Wheel`（轴、i16）、
+  `Modifier`（位、按下）、`Key`（`Key::code()`，u32；按下）。协议号写在管道名里：应用和输入进程不一致时互相看不见；设置页拿装好时写下的协议号和这一版比，
+  不一致就显示"重新设置"。
+- **信任**。输入进程听从"这个用户自己的进程"写进管道的输入，不再多问：等于允许这个用户的普通程序越过 UAC 去操作管理员窗口（微软不把 UAC 当安全边界；Parsec 的服务也是同一个交换）。
+  它能做的只有输入；只在有人被授予控制时才会被启动（服务按需启动），45 s 后自己退出；它是 SYSTEM，所以：程序放在 Program Files、令牌去掉全部特权、不碰安全桌面。设置页默认关着。
+- **不碰安全桌面是有意的**。要操作 UAC 提示和锁屏，输入进程得每次发输入前先切到当前的输入桌面（Sunshine 就是这么做的）；那样用户的任何程序都能经管道替 UAC 提示按"是"。
+  而且 HdrCast 的采集在应用进程里，采不到那张桌面，观众也看不见提示，所以收益是零。真要做，得连采集一起改成跟着桌面切换。
+- **没装服务时**。`ElevatedInjector` 每 2 s 用 `SetCursorPos`（设到指针当前位置，不会动）看一次系统是不是在拒绝（前台是管理员窗口、屏幕锁着、权限提示在前面时它会失败；
+  `SendInput` 不会，它永远报成功），在拒绝就在日志里说一次（至少隔 120 s），并指向设置页的开关。试过不能靠读前台窗口的令牌来判断：普通权限读不了管理员进程的令牌。
+- **杀毒软件**。一个没签名的程序注册 SYSTEM 服务、复制令牌、在别的会话里起进程，启发式扫描可能不喜欢（曾经有一次，测试里把一个 exe 写进"登录时启动"，Defender 就按行为把那个 exe 的哈希标成了可疑，连发行版 exe 也读不出来了）。
+  Sunshine、Parsec 都签了名；HdrCast 没有，所以第一次点开关时留意 Defender 的提示。
+- **验证过的**（2026-10-29，本机，没有注册任何服务）：
+  - 输入进程那一层：手动在管理员 shell 里起它（高级别），普通权限的探针（`crates/control/examples/inject_probe.rs`，无窗口，`explorer.exe inject_probe.exe` 启动才是普通级别）对着前台的管理员窗口：
+    自己注入，指针不动、按键 0 个到达；经输入进程，指针精确到位，`hdrcast` 七个字符打进了管理员窗口的文本框。
+  - 协议、`Replay`、管道服务端和客户端（多客户端、坏字节、重复启动、输入进程不在、连接途中收回控制、停止时松开客户端按住的键）有单元测试，管理员和普通权限下都跑过。
+  - 服务里能单独拿出来试的部分：令牌复制 + 去特权后只剩 SeChangeNotifyPrivilege，用户和级别不变；用这样的令牌 `CreateProcessAsUserW` 启动 `cmd.exe /c exit 7` 拿到退出码 7；会话枚举找得到活动会话；
+    把需要的特权打开；真的 `HdrCastInput serve --stop-event` 在事件被置位后以 0 退出；手动运行 `service` 会说"要由 Windows 当服务运行"（`tests/input_program.rs`、`cargo test -p hdrcast-control -- --ignored`）。
+  - **没验证过**：注册服务、普通权限 `StartService`（服务访问控制）、服务管理器的状态流程、`WTSQueryUserToken` 按 SID 找会话、把 SYSTEM 令牌移到用户会话后真的在那里起进程并注入、停止时的优雅退出、UAC 流程——都要真的装一个服务，见 windows-checklist §9。
 
 ## 10. macOS（0.3.0 起，尚未在真机上运行）
 
@@ -1022,3 +1096,135 @@ answer: "hdrcast/v1/answer-device" gid  sid  t  ok(true|false)  reason  cands  �
 
 权限：开播要"屏幕与系统音频录制"（第一次开播时系统弹框，允许后要重开应用）；当主播被远程控制要"辅助功能"。
 
+## 11. 控制模式：为远程控制的超低延迟（0.3.7 起）
+
+观看（§2、§3）是缓冲直播：SRT 的延迟窗口（0.3～3.5 s）给丢包重发留时间，mpv 再缓冲 1.5 s，画面又稳又清楚，跨境也行，但比现场晚好几秒。
+远程控制要的是反过来：鼠标一动画面就跟上，丢一点画质可以，晚不行。所以控制模式走 Moonlight 和 Sunshine / Vibepollo 的路线：**不缓冲、不重发**，
+每一帧采到就编码，编码完就发，收齐就显示；丢了的帧用前向纠错补，补不回来就停在上一帧、马上要关键帧。
+
+### 11.1 两种模式怎么选
+
+- 观众在 **观看** 页选 **模式**：**观看**（以前的方式）/ **控制**（`receiver.json` 的 `controlMode`，默认观看）。选了控制时延迟预设不显示（用不上），
+  提供控制模式的电脑在在线列表里带"控制模式"标记，按钮是 **控制**；不提供的（旧版本、没有 NVIDIA 显卡、主播关掉了）照常观看，日志里说一句。
+- 主播在 **开播** 页的 **控制模式** 一节：**提供控制模式**（默认开）、码率（默认 30 Mbps）、最高帧率（默认 60）。画面的其余部分（显示器、分辨率、HDR、
+  指针、声音）跟开播的设置一样（`sender.json` 的 `controlMode`、`controlBitrateMbps`、`controlFps`）。只有这台电脑有 NVIDIA 显卡（看显示器所在适配器的名字）
+  而且引擎没有报告编不了（退出码 7）时才提供；编不了时这一次运行里不再提供，页面上说明。
+- 线上协议仍是 v1：`live` 的 `"ll":true` = 这个主播提供控制模式；`join` 的 `"ll":true` = 这个观众要控制模式（只发给 live 带 `ll` 的主播）。都只在为 true 时写，
+  写在最后（`live`：`…[,"kf":true][,"ll":true]`；`join`：`…[,"kf":true][,"ll":true]`），不带它们的消息与 0.3.6 逐字节相同。
+  主播收到带 `ll` 的 join 而此刻不提供（刚关掉）时回答 `busy`，观众过一会儿再读 live 记录，没有 `ll` 就按观看加入。
+- 权限照旧（§8.10、§9）：观看规则决定能不能连，控制规则决定鼠标键盘。控制模式只是另一路流；被设成"不允许控制"的电脑选了控制模式也能连上，
+  看到的是低延迟的画面，控制一行照常说明不能控制。
+- 两种观众可以同时在：控制模式有自己的采集引擎和编码器（下面），和观看用的那一路并排跑，互不影响。
+
+### 11.2 主播：按 Vibepollo 的方式编码
+
+控制模式的采集引擎是另一个 `HdrCast capture` 进程，参数 `--encode nvenc --low-latency`（`EncodeArgs::low_latency`），编码设置照 Vibepollo 的默认值
+（`src/nvenc/nvenc_base.cpp`、`nvenc_config.h`）：
+
+| | 观看（§2.8 按需关键帧时） | 控制模式 | Vibepollo 默认 |
+|---|---|---|---|
+| 预设 / 调优 | P3～P7 / HIGH_QUALITY | **P1 / ULTRA_LOW_LATENCY** | P1 / ULTRA_LOW_LATENCY |
+| 码率控制 / VBV | CBR / 0.25 s | CBR / **一帧**（码率 ÷ 帧率） | CBR / 一帧 |
+| B 帧 / AQ | 按设置 / 8 | **0 / 关** | 0 / 关 |
+| 二次编码 | 按预设 | 四分之一分辨率 | 四分之一分辨率 |
+| 关键帧 | 每秒一个 + 被要求的 | **只有第一帧和被要求的**（`--gop 0`） | 只有被要求的 |
+
+- **发帧时机**（`EagerPacer`）。观看用固定节拍：节拍到了才把最新的画面交给编码器，新画面平均要等半个间隔、最多一个。控制模式没有节拍：桌面复制
+  一交出新画面（`AcquireNextFrame` 等的就是它）就编码，只是不早于上一帧之后 0.9 个帧间隔（`--fps` 是上限，刷新率正好等于它的显示器不会被拖一帧）。
+  画面不变时每 100 ms 把上一帧再编一次（几百字节的 P 帧）：观众借它分清"画面静止"和"丢了一帧"，也借它把要来的关键帧带出来。
+  等编码器的队列只有一帧：编码器忙时新画面替掉旧的，编出来的永远是最新的。
+- **不能发的时候不采集**。离上一帧不到 0.9 个间隔时引擎干脆不去取桌面（桌面复制会把这段时间里最新的画面留着，到时一取就是最新的）。
+  第一版每个桌面画面都转换（360 Hz 的副屏一秒 360 次，只发 120 次）：GPU 和零拷贝时编码器与转换共用的 D3D11 设备（及其锁）一直被占着，
+  从采集到写出 7.3 ms（中位，编码器那一段 5.7 ms）；改成到时才取以后是 1.96 ms（1080p120，下面 §11.5 的同一套测法）。
+- **GPU 优先级**：控制模式的引擎像 Sunshine / Vibepollo 那样把自己的 GPU 工作排到别的程序前面（`D3DKMTSetProcessSchedulingPriorityClass` 设 HIGH，
+  NVIDIA 上 REALTIME 曾让驱动卡死；`IDXGIDevice::SetGPUThreadPriority(7)`），日志里写拿到了什么（Windows 可能不给非管理员的进程）。本机这一项单独量不出差别
+  （GPU 不忙），留着给开着游戏的主播。
+- **引擎到应用**。视频管道里不是 MPEG-TS，而是一帧一条记录（`encode/frames.rs`）：长度、帧号、标志（关键帧 / 重复 / 被要求的）、从采集到写出的微秒数、
+  编码用的微秒数，后面是 HEVC 访问单元（Annex B，关键帧前带 VPS / SPS / PPS）。长度在前，应用读到一帧就知道一帧结束了，不用等下一帧。没有 ffmpeg、
+  没有分发器和 remux 子进程。stdin 照旧收 `keyframe` 和 `bitrate`。
+- **声音**。引擎的声音管道（f32、48 kHz、立体声）也由应用自己读，切成 5 ms 的 16 bit PCM 包。不压缩（约 1.5 Mbit/s）：不用另起 ffmpeg，
+  观众那边也不用解码器。
+- 应用（`app/src/low_latency_host.rs`）：第一位控制模式的观众被放进来时启动引擎（等第一帧出来再回答 join，和观看一样），最后一位走了 10 s 后停；
+  引擎意外退出 1 s 后重启（帧号接着数，观众不会看到号往回走）。开播页改码率时直接发给运行中的编码器（`nvEncReconfigureEncoder`，不出关键帧），
+  改别的（帧率、分辨率……）重启引擎；关掉"提供控制模式"会断开控制模式的观众。
+
+### 11.3 传输：分片、纠错、不重发
+
+控制模式的数据报走旁路通道（§8.9），只发给 join 带 `ll` 的会话（`SideUse::LowLatency`），第一个字节区分用途：`V` 一帧的分片、`A` 声音（主播→观众），
+`R` 请求和报告（观众→主播）、`r` 回答（主播→观众）；远程控制是 1 / 2，按需关键帧是 `K` / `k`，不会混。
+
+- **加密**（`low_latency::seal`）：每个数据报 = 种类（1 字节）+ 计数器（8 字节，每个方向从 1 起）+ ChaCha20-Poly1305 密文 + 16 字节标签；
+  密钥 = HMAC-SHA256(这个会话的远程控制密钥（§8.10，和观众设备协商出来的那把）, "hdrcast/v1/low-latency")，nonce = 方向 + 计数器，
+  附加数据 = "HDRCLL1" + 前 9 字节。接收端记着最近 8192 个计数器，重放和更旧的一律丢掉。组里的其他人读不到画面（观看的画面是组派生口令的 SRT AES）。
+- **分片**（`low_latency::video`）：一帧的载荷 = 帧头（帧长、主播从采集到发出的 µs、编码 µs）+ 访问单元，切成大小相等的偶数字节分片，每片最多 1162 字节
+  （加上 12 字节的分片头和 25 字节的封装是 1199 字节，在旁路通道 1200 字节的上限里，IPv6 最小 MTU 也装得下）。分片头：帧号、关键帧标志、片号、
+  数据片数、校验片数。
+- **前向纠错**：校验片 = 数据片的 20 %（Moonlight 的默认值），至少 2 片；Reed-Solomon over GF(2^16)（`reed-solomon-simd`，Leopard 算法，纯 Rust，
+  x86-64 和 AArch64 有 SIMD）。一帧一个块，收到任意"数据片数"那么多片就能还原，没有 Moonlight 那种一块最多 255 片、大帧要分 4 块的限制。
+  4K 关键帧 2 MB 是 1722 + 345 片。
+- **发送**：一帧的数据报分批交给 socket（每批 32 个），批与批之间按 800 Mbit/s 的速度停顿（Sunshine 的 `ratecontrol`：千兆的 80 %）：不是一下子全砸出去，
+  也不为一帧拖太久。多位控制模式观众依次发。
+- **不重发**。观众（`app/src/low_latency_viewer.rs` + `Assembler`）按帧号收：数据片齐了直接交出，不齐但总片数够了用校验片还原；
+  后一帧的分片到了、或者这一帧 50 ms 没有新分片，这一帧就算丢了（一帧的包是连着发的，隔这么久说明剩下的丢在路上了）。
+  丢了一帧后面的帧都解不了：画面停在上一帧（什么都不写给 mpv），马上请求关键帧（`R` 1：请求号 + 丢的帧号），之后每 1.5 个往返（20～250 ms）再问一次，
+  直到关键帧到。主播（一路编码给所有控制模式观众）：丢失之后已经发过关键帧 → 回答"已发"；250 ms 内已经向编码器要过 → "正在做"；
+  否则发 `keyframe` 给引擎 → "正在做"。新开的 mpv（启动或崩溃重启）也是先等关键帧。
+- **报告**：观众每 0.5 s 发一次（`R` 2：自己的时钟、往返时间、显示 / 丢失的帧数、FEC 补回的分片数、等关键帧的次数），主播原样回声（`r` 2）→ 观众得到往返时间；
+  主播把这些显示在开播页的观众一行。
+
+### 11.4 观众：播放
+
+- **画面**：mpv 照旧负责解码、显示和远程控制的输入（§3.1、§9），只是输入换成 stdin 上的原始 HEVC（`mpv_command::build_low_latency`）。每写完一帧接着写一个
+  AUD（访问单元分隔符，NAL 类型 35）：mpv 的 HEVC 解析器要看到下一个访问单元的开头才交出这一帧，有了 AUD 就不用等下一帧。选项（Windows）：
+  `--untimed --video-latency-hacks=yes --hwdec-threads=1 --vd-lavc-threads=1 --cache=no --framedrop=no --demuxer-lavf-format=hevc
+  --demuxer-lavf-o-add=fflags=+nobuffer --demuxer-lavf-probe-info=nostreams --demuxer-lavf-analyzeduration=0.1 --stream-buffer-size=4k --aid=no
+  --d3d11-sync-interval=0`，其余（显卡 API、硬解、HDR、窗口、输入、全屏）和观看相同。macOS 没有 `--d3d11-sync-interval`。
+- **mpv 自己的延迟**（2026-10-29 本机实测，RTX 4090，360 Hz 的 1080p 副屏；`latprobe`：把编了帧号条码的 HEVC 按时写进 mpv 的 stdin，用桌面复制读回屏幕上的条码，
+  写入 → 出现在桌面上的时间，每格约 1100 帧）：
+
+  | mpv 设置 | 中位 | 范围（p10～p90） |
+  |---|---|---|
+  | 默认 `--hwdec-threads=4`，30 / 60 / 120 fps | 105.7 / 53.9 / 29.0 ms | 一直是约 3 帧 |
+  | `--hwdec-threads=1`（d3d11va） | **6.0 ms** | 5.1～6.6 ms |
+  | 再加 `--d3d11-sync-interval=0` | **4.0 ms** | 3.8～5.2 ms |
+  | 软解（`--hwdec=no`） | 6.2 ms | 5.5～6.8 ms |
+  | `--hwdec=nvdec --hwdec-threads=1` | 6.5 ms | 5.7～7.0 ms |
+  | `--hwdec=d3d11va-copy`（4 线程） | 89.0 ms | |
+
+  罪魁是 mpv 给硬解开的 4 个帧线程（`--hwdec-threads` 默认 4）：解码器按帧并行，就要压着 3 帧；交换链深度、`--video-sync`、`--vo=gpu` / `gpu-next`
+  都只差 1～2 ms。观看模式有 1.5 s 的缓冲，这 50 ms 无所谓，所以没改。
+- **声音**：不经过 mpv（它的音频缓冲和同步会拖住画面），应用自己放（`hdrcast_capture::playback`：Windows 是 WASAPI 共享模式、自己的 48 kHz 16 bit 立体声
+  由系统转换，设备里只留约 20 ms；macOS 是 AudioQueue，3 个 10 ms 缓冲）。前面一个 30 ms 的抖动缓冲（`AudioJitter`）：丢的包补静音，太晚的扔掉，
+  网络一阵阵来时砍到目标值，两端声卡时钟的漂移靠偶尔（百分之一）丢一帧或重复一帧跟住。静音按钮作用在这里。
+- 观看页和悬浮窗在控制模式下显示：延迟（主播从采集到发出 + 半个往返；不含解码和显示）、显示的帧率、码率、丢失的帧和 FEC 补回的包；
+  停帧等关键帧时说明。延迟预设不显示。
+
+### 11.5 实测（端到端）
+
+测法（2026-10-30，本机，两个实例、本机信令，见 windows-checklist §15）：一个置顶、点不着的小窗口把当前 QPC 时间（0.1 ms 为单位，24 位，加同步和校验位）
+画成条码，每次桌面合成画一次，放在主播采集的那块屏上；观众的 mpv 窗口放在 1080p 360 Hz 的副屏上；再用桌面复制读副屏上 mpv 画面里的条码，和这张桌面画面的
+呈现时间（`LastPresentTime`）相减。包括：条码窗口的合成、主播的采集、转换、编码、封装、FEC、加密、发送、观众的接收、拼帧、mpv 的解码和显示、桌面合成；
+不包括显示器扫描出来的时间（哪个程序都一样）。主播和观众在同一块 RTX 4090 上（编码和 4K 的解码、色调映射抢同一块 GPU），网络是回环。
+
+| 采集 | 设置 | 中位 | p10～p90 | p99 |
+|---|---|---|---|---|
+| 1080p SDR（360 Hz 副屏） | 120 fps、20 Mbps、零拷贝、每帧都转换（第一版） | 18.1 ms | 13.3～22.5 | 27.0 |
+| 同上 | 走内存（`HDRCAST_NO_ZERO_COPY=1`） | 15.5 ms | 11.0～19.3 | 23.4 |
+| 同上 | **零拷贝、到时才取（现在）** | **14.5 ms** | 10.2～19.4 | 22.3 |
+| 同上 | 丢包：每 3 s 连丢 40 个数据报 + 随机 2 %（`HDRCAST_SIMULATE_LOSS=3:40:2`） | 15.1 ms | 11.0～20.4 | 23.8 |
+| 4K HDR（AW3225QF，240 Hz） | 120 fps、40 Mbps、零拷贝、P010 / Main10 PQ | **21.3 ms** | 16.5～27.2 | 151.6 |
+
+- 丢包那一次（约 36 s）：FEC 补回 1351 个分片；12 次连丢共丢了 32 帧，每次都在下一两帧就由关键帧接上，连开头加起来画面一共停了 0.52 s；声音丢了 221 个包、
+  断了 6 次。（回环上往返只有 0.1 ms：真实线路上一次丢帧大约停一个往返加一帧。）
+- 4K 那一格的 p99 是少数几次一百多毫秒的停顿，同一块 GPU 上同时做 4K 编码、4K 解码和 HDR→SDR 的色调映射；分开两台电脑时应该没有。
+- 主播从采集到发出（`hostMs`）：1080p 1.5～3 ms，4K HDR 3～6 ms。
+- 作为对照：观看模式最快的"快速"预设（SRT 300 ms）加上 mpv 的缓冲是 1 s 以上（§5、§3.1）。
+
+### 11.6 局限
+
+- 主播只能是有 NVIDIA 显卡的 Windows 电脑（NVENC 在引擎里）；AMD / Intel / Mac 主播不提供控制模式。
+- **macOS 观众的播放和声音没在真机上跑过**（AudioQueue 只做过类型检查）；mpv 的 `--hwdec-threads=1` 对 VideoToolbox 是否同样必要也没量过。
+- 丢一帧就要等关键帧（一个往返左右，关键帧本身又大）；Sunshine 的参考帧失效（RFI，`nvEncInvalidateRefFrames`）能更快、更小地恢复，还没做。
+- 没有自适应码率，FEC 固定 20 %：丢包多的线路上画面会频繁停顿，这时应该降码率，或者用观看模式。
+- 声音不加 FEC，丢的包是一小段静音；不压缩，约 1.5 Mbit/s。
+- 一个引擎的画面给所有控制模式观众，任何一位丢帧要来的关键帧大家都收到。

@@ -95,6 +95,47 @@ fn side_datagrams_reach_the_handler_both_ways_over_a_punched_path() {
     assert!(!viewer.send_side(b"gone"));
 }
 
+#[test]
+fn a_direct_session_has_no_remux_child_and_takes_a_picture_s_datagrams_in_one_go() {
+    // control mode (docs/design.md §11): the viewer's stream is the host's own side datagrams
+    let keys = random_keys();
+    let (fw_h6, fw_h4, fw_v6, fw_v4) = (StatefulFirewall::new(), StatefulFirewall::new(), StatefulFirewall::new(), StatefulFirewall::new());
+    let host = HostLink::new(&keys, &loopback(&fw_h6, &fw_h4)).unwrap();
+    let viewer = ViewerLink::new(&keys, &loopback(&fw_v6, &fw_v4), 0).unwrap();
+    let at_viewer: Seen<Vec<u8>> = seen();
+    let sink = at_viewer.clone();
+    viewer.set_side_handler(Arc::new(move |payload| sink.lock().unwrap().push(payload.to_vec())));
+    let at_host: Seen<Vec<u8>> = seen();
+    let sink = at_host.clone();
+    host.set_side_handler(Arc::new(move |_, payload| sink.lock().unwrap().push(payload.to_vec())));
+
+    let sid = keys::new_id();
+    host.add_direct_session(&sid, &viewer.candidates(), None).unwrap();
+    assert_eq!(host.send_side_many(&sid, [&b"too early"[..]]), 0);
+    viewer.start_session(&sid, &host.candidates()).unwrap();
+    assert!(wait_for(|| viewer.state() == LinkState::Connected, 5000), "{:?} {}", viewer.state(), viewer.reason());
+    assert!(wait_for(|| host.snapshot()[0].state == LinkState::Connected, 5000));
+
+    // a picture's worth of datagrams (a 4K keyframe is a few hundred), in order
+    let picture: Vec<Vec<u8>> = (0..300u32).map(|i| [&i.to_be_bytes()[..], &[0x5A; 1196][..]].concat()).collect();
+    assert_eq!(host.send_side_many(&sid, picture.iter().map(Vec::as_slice)), 300);
+    assert!(wait_for(|| at_viewer.lock().unwrap().len() == 300, 3000), "{} arrived", at_viewer.lock().unwrap().len());
+    assert_eq!(*at_viewer.lock().unwrap(), picture);
+    assert!(host.snapshot()[0].bytes_to_viewer >= 300 * 1224);
+    // one out of range ends the run there
+    assert_eq!(host.send_side_many(&sid, [&b"ok"[..], &[][..], &b"never"[..]]), 1);
+
+    // what the viewer sends that is not a side datagram (an SRT player it does not have) goes nowhere, harmlessly
+    assert!(viewer.send_side(b"report"));
+    assert!(wait_for(|| at_host.lock().unwrap().len() == 1, 2000));
+    let player = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    player.send_to(b"srt", (Ipv4Addr::LOCALHOST, viewer.local_port())).unwrap();
+    thread::sleep(SETTLE);
+    assert_eq!(host.snapshot()[0].state, LinkState::Connected);
+    host.remove_session(&sid, "done");
+    assert!(wait_for(|| viewer.state() == LinkState::Closed, 2000));
+}
+
 // ---- a peer made by hand --------------------------------------------------------------------------------
 
 /// The other end as a plain socket plus the state machine: it punches like a real peer, and can then send

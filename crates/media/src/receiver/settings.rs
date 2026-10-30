@@ -120,6 +120,9 @@ pub struct ReceiverSettings {
     /// The host (peer id) watched last, preselected in the live list.
     #[serde(deserialize_with = "null_as_default")]
     pub last_host: String,
+    /// Control mode (docs/design.md §11): connect for remote control with the low-latency stream instead of the
+    /// buffered one. The choice on the Watch page, kept for next time.
+    pub control_mode: bool,
 }
 
 impl Default for ReceiverSettings {
@@ -139,6 +142,7 @@ impl Default for ReceiverSettings {
             auto_catch_up: true,
             target_peak_nits: 0,
             last_host: String::new(),
+            control_mode: false,
         }
     }
 }

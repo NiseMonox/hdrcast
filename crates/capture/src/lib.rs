@@ -34,6 +34,7 @@ mod numfmt;
 pub mod output;
 pub mod pacer;
 pub mod platform;
+pub mod playback;
 // Used by the macOS backend only, but compiled (and tested) everywhere.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod repack;
@@ -59,11 +60,11 @@ mod stub;
 pub use aligner::{AudioAlignment, AudioClockAligner};
 pub use app_audio::ProcessEntry;
 pub use args::{quote_argv, CaptureArgs, CaptureArgsError, CaptureFormat, EncodeArgs, EngineEncoder, Multipass};
-pub use encode::EncoderEvent;
+pub use encode::{frames::FrameRecord, EncoderEvent};
 pub use cli::cli_main;
 pub use engine::{exit_codes, CaptureEngine, StopHandle};
 pub use output::OutputInfo;
-pub use pacer::FramePacer;
+pub use pacer::{EagerPacer, FramePacer};
 pub use platform::{
     enumerate_outputs, list_audio_apps, list_audio_devices, pipe_listening, pipe_path,
     AudioDeviceInfo, FrameLayout,

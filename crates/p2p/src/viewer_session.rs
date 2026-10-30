@@ -49,6 +49,10 @@ pub struct ViewerSessionOptions {
     pub request_control: bool,
     /// Ask the host for keyframes when part of the stream is lost: the join carries "kf" (docs/design.md §8.12).
     pub request_keyframes: bool,
+    /// Control mode (docs/design.md §11): join with "ll" when the host's live record offers it, and get the
+    /// low-latency stream on the side channel instead of SRT. A host that does not offer it is joined as before;
+    /// [`ViewerSession::low_latency`] says which it was.
+    pub request_low_latency: bool,
     /// This computer's device key: every join is signed with it, so a host can recognise this computer and
     /// agree on a remote-control key with it (docs/design.md §8.10). `None` = unsigned joins, as before 0.3.1.
     pub device: Option<Arc<DeviceKey>>,
@@ -72,6 +76,7 @@ impl Default for ViewerSessionOptions {
             router_mapping: None,
             request_control: false,
             request_keyframes: false,
+            request_low_latency: false,
             device: None,
             answer_wait_ms: 60_000,
         }
@@ -131,6 +136,8 @@ struct Inner {
     started: AtomicBool,
     host_offers_control: AtomicBool,
     host_takes_keyframes: AtomicBool,
+    /// The latest join asked for control mode (the host offered it).
+    low_latency: AtomicBool,
     keys: OnceLock<GroupKeys>,
     signal: OnceLock<SignalingClient>,
     link: OnceLock<ViewerLink>,
@@ -162,6 +169,7 @@ impl ViewerSession {
                 started: AtomicBool::new(false),
                 host_offers_control: AtomicBool::new(false),
                 host_takes_keyframes: AtomicBool::new(false),
+                low_latency: AtomicBool::new(false),
                 keys: OnceLock::new(),
                 signal: OnceLock::new(),
                 link: OnceLock::new(),
@@ -252,6 +260,12 @@ impl ViewerSession {
         self.inner.host_takes_keyframes.load(Ordering::Acquire)
     }
 
+    /// The current session is in control mode: its stream comes on the side channel, not through SRT (docs/design.md
+    /// §11). False when control mode was not asked for, or the host did not offer it when this session joined.
+    pub fn low_latency(&self) -> bool {
+        self.inner.low_latency.load(Ordering::Acquire)
+    }
+
     /// The remote-control key agreed with the host's device for session `sid` (docs/design.md §8.10). `None`
     /// when the host is older than 0.3.1, or `sid` is not the current session: use the group-derived key then.
     pub fn control_key(&self, sid: &str) -> Option<[u8; 32]> {
@@ -286,6 +300,7 @@ impl ViewerSession {
         let announced = match purpose {
             SideUse::RemoteControl => self.host_offers_control(),
             SideUse::Keyframes => self.host_takes_keyframes(),
+            SideUse::LowLatency => self.low_latency(),
         };
         announced && self.inner.link.get().is_some_and(|link| link.send_side(payload))
     }
@@ -467,6 +482,7 @@ impl Inner {
         let Some(entry) = signal.get_live(ct)?.into_iter().find(|entry| entry.record.host_id == self.o.host_id) else {
             self.host_offers_control.store(false, Ordering::Release);
             self.host_takes_keyframes.store(false, Ordering::Release);
+            self.low_latency.store(false, Ordering::Release);
             return Ok(Attempt::Retry("Not live right now".to_string()));
         };
         let record = entry.record;
@@ -479,6 +495,8 @@ impl Inner {
         }
         self.host_offers_control.store(record.remote_control == Some(true), Ordering::Release);
         self.host_takes_keyframes.store(record.keyframes, Ordering::Release);
+        let low_latency = self.o.request_low_latency && record.low_latency;
+        self.low_latency.store(low_latency, Ordering::Release);
         if record.max_viewers > 0 && record.viewers >= record.max_viewers {
             return Ok(Attempt::Retry(format!("{} is full ({} viewers)", record.name, record.max_viewers)));
         }
@@ -500,6 +518,7 @@ impl Inner {
             remote_control: self.o.request_control,
             device: None,
             keyframes: self.o.request_keyframes,
+            low_latency,
         };
         let exchange = self.o.device.as_ref().map(|device| {
             let exchange = Exchange::new();

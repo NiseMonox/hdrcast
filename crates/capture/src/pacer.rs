@@ -110,8 +110,78 @@ impl FramePacer {
     }
 }
 
+/// When control mode sends a picture (design.md section 11.2): a new one the moment it is captured, but never
+/// sooner than one frame interval after the previous one (`--fps` is the most there will be), and with nothing new
+/// on the screen the last one again every `idle` ticks, so that the viewer can tell a still screen from a lost
+/// picture. There is no fixed beat to wait for: a key press shows up in the next desktop image, not one interval
+/// later.
+#[derive(Debug, Clone)]
+pub struct EagerPacer {
+    min_interval: i64,
+    idle: i64,
+    last: Option<i64>,
+}
+
+impl EagerPacer {
+    /// # Panics
+    /// When `fps` is 0 or `idle_ticks` is not positive.
+    pub fn new(fps: u32, ticks_per_second: i64, idle_ticks: i64) -> Self {
+        assert!(fps > 0 && idle_ticks > 0, "fps and the idle interval must be positive");
+        // a little under the interval, so a display that refreshes at exactly `fps` is never held back a frame
+        let min_interval = ticks_per_second * 9 / (10 * i64::from(fps));
+        Self { min_interval, idle: idle_ticks, last: None }
+    }
+
+    /// Whether to send now; `fresh`: a picture that has not been sent is waiting.
+    pub fn due(&self, now_ticks: i64, fresh: bool) -> bool {
+        self.ticks_until_due(now_ticks, fresh) == 0
+    }
+
+    /// Ticks until [`due`](Self::due) turns true (0 if it is).
+    pub fn ticks_until_due(&self, now_ticks: i64, fresh: bool) -> i64 {
+        let Some(last) = self.last else { return 0 };
+        let wait = if fresh { self.min_interval } else { self.idle };
+        (last + wait - now_ticks).max(0)
+    }
+
+    /// A picture was sent at `now_ticks`.
+    pub fn sent(&mut self, now_ticks: i64) {
+        self.last = Some(now_ticks);
+    }
+}
+
 /// `(a * b + bias) / c` with the multiplication kept exact (nanosecond ticks times a frame index or a frame
 /// rate leave the range of an i64 within minutes).
 fn mul_div(a: i64, b: i64, c: i64, bias: i64) -> i64 {
     ((i128::from(a) * i128::from(b) + i128::from(bias)) / i128::from(c)) as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MS: i64 = 1_000_000;
+
+    #[test]
+    fn a_new_picture_goes_at_once_unless_the_last_one_left_less_than_an_interval_ago() {
+        let mut pacer = EagerPacer::new(60, 1000 * MS, 100 * MS);
+        assert!(pacer.due(0, true), "the first picture never waits");
+        pacer.sent(0);
+        // 60 fps: an interval is 16.7 ms, of which 90 % (15 ms) must have passed
+        assert!(!pacer.due(10 * MS, true));
+        assert_eq!(pacer.ticks_until_due(10 * MS, true), 5 * MS);
+        assert!(pacer.due(15 * MS, true));
+        pacer.sent(15 * MS);
+        // a key press after a quiet second goes out the moment it is captured, with no beat to wait for
+        assert!(pacer.due(1015 * MS + 3, true));
+    }
+
+    #[test]
+    fn with_nothing_new_the_last_picture_goes_again_after_the_idle_interval() {
+        let mut pacer = EagerPacer::new(120, 1000 * MS, 100 * MS);
+        pacer.sent(0);
+        assert!(!pacer.due(99 * MS, false));
+        assert_eq!(pacer.ticks_until_due(40 * MS, false), 60 * MS);
+        assert!(pacer.due(100 * MS, false));
+    }
 }

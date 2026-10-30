@@ -44,6 +44,10 @@ pub struct HostControl {
     last_heard_us: i64,
     last_reply_us: i64,
     announce: u8,
+    /// What the injector was last told about whether this viewer controls.
+    active: bool,
+    /// Pointer moves and events handed to the injector so far.
+    input_events: u64,
 }
 
 impl HostControl {
@@ -62,7 +66,16 @@ impl HostControl {
             last_heard_us: 0,
             last_reply_us: i64::MIN / 2,
             announce: 0,
+            active: false,
+            input_events: 0,
         }
+    }
+
+    /// How many pointer moves and key, button, wheel and text events this viewer has had applied. Nothing is logged
+    /// of what they are (it could be a password), but "any arrived at all" tells a viewer that sends nothing from a
+    /// host that drops what it gets.
+    pub fn input_events(&self) -> u64 {
+        self.input_events
     }
 
     fn grant_state(&self) -> GrantState {
@@ -102,8 +115,19 @@ impl HostControl {
         if !self.granted() {
             self.release_all();
         }
+        self.sync_active();
         // UDP: say it a few times so the viewer's side follows promptly even if one answer is lost.
         self.announce = 3;
+    }
+
+    /// Tells the injector when this viewer starts and stops controlling, so that it can get ready before the first
+    /// key (and, after the last one has been let go of, close whatever it opened).
+    fn sync_active(&mut self) {
+        let granted = self.granted();
+        if granted != self.active {
+            self.active = granted;
+            self.injector.activate(granted);
+        }
     }
 
     /// A datagram from the viewer's side of the channel. Returns the answer to send back, if one is due.
@@ -116,6 +140,7 @@ impl HostControl {
             if !self.wants {
                 self.release_all();
             }
+            self.sync_active();
         }
         if self.granted() {
             self.apply(&msg);
@@ -135,6 +160,7 @@ impl HostControl {
     fn apply(&mut self, msg: &ViewerMessage) {
         if msg.pointer_inside && (msg.pointer_x, msg.pointer_y) != self.pointer {
             self.pointer = (msg.pointer_x, msg.pointer_y);
+            self.input_events += 1;
             self.injector.pointer(msg.pointer_x, msg.pointer_y);
         }
         if msg.events.is_empty() {
@@ -159,6 +185,7 @@ impl HostControl {
                 continue;
             }
             self.applied_seq = seq;
+            self.input_events += 1;
             match event.kind {
                 EventKind::KeyDown => {
                     let Some(key) = Key::from_code(event.code) else { continue };
@@ -344,6 +371,20 @@ mod tests {
     }
 
     #[test]
+    fn the_host_counts_what_it_handed_to_the_injector() {
+        let (mut viewer, mut host, rec) = pair(Grant::Allow);
+        let mut now = 0;
+        exchange(&mut viewer, &mut host, &mut now, 3);
+        assert_eq!(host.input_events(), 0, "a viewer that only listens has sent nothing");
+        viewer.pointer(0.25, 0.75, true);
+        viewer.key_binding("d-", "a");
+        viewer.key_binding("u-", "a");
+        exchange(&mut viewer, &mut host, &mut now, 3);
+        assert_eq!(rec.take(), ["move 16384,49151", "a down", "a up"]);
+        assert_eq!(host.input_events(), 3);
+    }
+
+    #[test]
     fn a_host_that_refuses_or_has_it_off_says_so() {
         let (mut viewer, mut host, rec) = pair(Grant::Off);
         let mut now = 0;
@@ -481,6 +522,54 @@ mod tests {
         viewer.key_binding("d-", "VOLUME_UP");      // not forwarded
         exchange(&mut viewer, &mut host, &mut now, 3);
         assert_eq!(rec.take(), ["Backspace down", "Backspace down", "Backspace up", "wheel 0 -120", "中 down", "中 up"]);
+    }
+
+    #[derive(Clone, Default)]
+    struct Activations(Arc<Mutex<Vec<bool>>>);
+
+    impl Activations {
+        fn seen(&self) -> Vec<bool> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl Injector for Activations {
+        fn pointer(&mut self, _x: u16, _y: u16) {}
+        fn button(&mut self, _button: Button, _down: bool) {}
+        fn wheel(&mut self, _axis: u8, _delta: i16) {}
+        fn modifier(&mut self, _bit: u8, _down: bool) {}
+        fn key(&mut self, _key: Key, _down: bool) {}
+        fn activate(&mut self, on: bool) {
+            self.0.lock().unwrap().push(on);
+        }
+    }
+
+    #[test]
+    fn the_injector_hears_when_control_starts_and_stops() {
+        for policy in [Grant::Ask, Grant::Allow] {
+            let activations = Activations::default();
+            let mut host = HostControl::new(&KEY, policy, Box::new(activations.clone()));
+            let mut viewer = ViewerControl::new(&KEY, false, 0);
+            let mut now = 0;
+            exchange(&mut viewer, &mut host, &mut now, 3);
+            assert!(activations.seen().is_empty(), "{policy:?}: nobody asked");
+            viewer.set_wants(true);
+            exchange(&mut viewer, &mut host, &mut now, 3);
+            if policy == Grant::Ask {
+                assert!(activations.seen().is_empty(), "waiting for the user's answer");
+                host.decide(true);
+            }
+            assert_eq!(activations.seen(), [true], "{policy:?}");
+            exchange(&mut viewer, &mut host, &mut now, 3);
+            assert_eq!(activations.seen(), [true], "said once, not with every datagram");
+            viewer.set_wants(false);
+            exchange(&mut viewer, &mut host, &mut now, 3);
+            assert_eq!(activations.seen(), [true, false], "{policy:?}: given back");
+            viewer.set_wants(true);
+            exchange(&mut viewer, &mut host, &mut now, 3);
+            host.decide(false);
+            assert_eq!(activations.seen(), [true, false, true, false], "{policy:?}: taken back");
+        }
     }
 
     #[test]

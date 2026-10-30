@@ -10,15 +10,20 @@
 //!
 //! While watching, the panel over the player (`overlay.rs`) changes the decoder and the sound at once and the delay
 //! by joining again (the delay is agreed on when joining). Closing the player's window stops watching.
+//!
+//! In control mode (docs/design.md §11) the join asks a host that offers it for the low-latency stream instead: the
+//! picture comes in side datagrams (`low_latency_viewer.rs`) and goes straight into mpv's stdin, with no buffer.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::thread;
 use std::time::Duration;
 
 use hdrcast_core::common::srt_buffer_sizing;
 use hdrcast_control::keys;
 use hdrcast_core::group::keys::GroupKeys;
 use hdrcast_media::keyframe;
+use hdrcast_media::low_latency;
 use hdrcast_media::receiver::mpv_command;
 use hdrcast_media::receiver::settings::{HwDecMode, ReceiverFrontend, ReceiverSettings};
 use hdrcast_p2p::{LinkAddresses, SideUse, SimulatedLoss, ViewerSession, ViewerSessionOptions, ViewerSessionState};
@@ -27,6 +32,7 @@ use serde_json::{json, Value};
 use crate::commands;
 use crate::control_viewer::ViewerControlLink;
 use crate::keyframe_viewer::KeyframeLink;
+use crate::low_latency_viewer::LowLatencyLink;
 use crate::mpv_runner::{self, MpvRunner};
 use crate::net_report::{self, End, NetReport};
 use crate::overlay;
@@ -41,6 +47,10 @@ struct Session {
     runner: MpvRunner,
     control: Option<Arc<ViewerControlLink>>,
     keyframes: Arc<KeyframeLink>,
+    /// Control mode was asked for: the stream of a session that joined in it comes through here.
+    low_latency: Option<Arc<LowLatencyLink>>,
+    /// The player runs for control mode (its stdin fed by `low_latency`) rather than for SRT.
+    player_low_latency: AtomicBool,
     keys: GroupKeys,
     settings: ReceiverSettings,
     host_id: String,
@@ -95,7 +105,7 @@ pub fn start(app: &Arc<AppState>, host_id: &str) -> Result<(), Vec<String>> {
         let loss = SimulatedLoss::parse(&spec, Some(app.logger()));
         match &loss {
             Some(loss) => app.log(&format!("[test] {SIMULATE_LOSS_ENV}: {} on the way in", loss.describe())),
-            None => app.log(&format!("[test] {SIMULATE_LOSS_ENV}={spec} is not <seconds>[:<packets>]: ignored")),
+            None => app.log(&format!("[test] {SIMULATE_LOSS_ENV}={spec} is not <seconds>[:<packets>[:<percent>]]: ignored")),
         }
         let loss: Arc<dyn hdrcast_p2p::PacketFilter> = Arc::new(loss?);
         Some(LinkAddresses { filter_v6: Some(loss.clone()), filter_v4: Some(loss), ..LinkAddresses::detect() })
@@ -110,6 +120,8 @@ pub fn start(app: &Arc<AppState>, host_id: &str) -> Result<(), Vec<String>> {
             request_control: true,
             // and asks for keyframes when it loses part of the stream (only hosts that take requests)
             request_keyframes: true,
+            // control mode, from a host that offers it (the others are watched as always)
+            request_low_latency: settings.control_mode,
             addresses,
             device: Some(app.device.clone()),
             map_router_port: state::router_mapping_wanted(),
@@ -133,11 +145,21 @@ pub fn start(app: &Arc<AppState>, host_id: &str) -> Result<(), Vec<String>> {
             Arc::new(move |payload| sender.upgrade().is_some_and(|s| s.viewer.send_side_for(SideUse::Keyframes, payload))),
             app.logger(),
         );
+        let low_latency = settings.control_mode.then(|| {
+            let sender = weak.clone();
+            LowLatencyLink::start(
+                Arc::new(move |payload| sender.upgrade().is_some_and(|s| s.viewer.send_side_for(SideUse::LowLatency, payload))),
+                app.logger(),
+                app.watch.muted.load(Ordering::SeqCst),
+            )
+        });
         Session {
             viewer,
             runner,
             control,
             keyframes,
+            low_latency,
+            player_low_latency: AtomicBool::new(false),
             keys,
             settings,
             host_id: host_id.to_string(),
@@ -148,10 +170,15 @@ pub fn start(app: &Arc<AppState>, host_id: &str) -> Result<(), Vec<String>> {
     });
 
     {
-        // the side channel carries remote control and keyframe answers: they tell themselves apart by their first byte
-        let (control, keyframes) = (session.control.clone(), session.keyframes.clone());
+        // the side channel carries remote control, keyframe answers and control mode's stream: they tell themselves
+        // apart by their first byte
+        let (control, keyframes, fast) = (session.control.clone(), session.keyframes.clone(), session.low_latency.clone());
         session.viewer.set_side_handler(Arc::new(move |payload| {
-            if keyframe::is_keyframe_datagram(payload) {
+            if low_latency::is_low_latency_datagram(payload) {
+                if let Some(fast) = &fast {
+                    fast.on_datagram(payload);
+                }
+            } else if keyframe::is_keyframe_datagram(payload) {
                 keyframes.on_datagram(payload);
             } else if let Some(control) = &control {
                 control.on_datagram(payload);
@@ -194,12 +221,19 @@ pub fn start(app: &Arc<AppState>, host_id: &str) -> Result<(), Vec<String>> {
     });
 
     let shown = if session.host_name.is_empty() { "the host" } else { session.host_name.as_str() };
-    app.log(&format!("[app] watching {shown} (latency {} ms)", session.settings.latency_ms));
+    if session.settings.control_mode {
+        app.log(&format!("[app] connecting to {shown} in control mode (low latency, when the host offers it)"));
+    } else {
+        app.log(&format!("[app] watching {shown} (latency {} ms)", session.settings.latency_ms));
+    }
     if let Err(e) = session.viewer.start() {
         if let Some(control) = &session.control {
             control.stop();
         }
         session.keyframes.stop();
+        if let Some(fast) = &session.low_latency {
+            fast.stop();
+        }
         return Err(vec![format!("Could not start: {e}")]);
     }
     *app.watch.session.lock().unwrap() = Some(session);
@@ -215,7 +249,7 @@ fn receiver_ffmpeg(settings: &ReceiverSettings) -> Option<std::path::PathBuf> {
 
 impl Session {
     /// The session's state changed (called on its threads).
-    fn on_changed(&self, app: &AppState) {
+    fn on_changed(&self, app: &Arc<AppState>) {
         let connected = self.viewer.state() == ViewerSessionState::Connected;
         match self.viewer.sid().filter(|_| connected && self.viewer.host_takes_keyframes()) {
             Some(sid) => self.keyframes.session(&sid, self.keys.keyframe_key(&sid)),
@@ -234,8 +268,25 @@ impl Session {
                 None => control.session_ended(),
             }
         }
+        if let Some(fast) = &self.low_latency {
+            match self.viewer.sid().filter(|_| connected && self.viewer.low_latency()) {
+                Some(sid) => fast.session(&sid, &self.viewer.control_key(&sid).unwrap_or_else(|| self.keys.control_key(&sid))),
+                None => fast.session_ended(),
+            }
+        }
         if connected && !self.runner.is_running() && !self.mpv_started.swap(true, Ordering::SeqCst) {
             self.start_player(app);
+        } else if connected && self.runner.is_running() && self.viewer.low_latency() != self.player_low_latency.load(Ordering::SeqCst) {
+            // joined again in the other mode (the host switched control mode on or off): a player for that one
+            let (runner, app) = (self.runner.clone(), app.clone());
+            let low = self.viewer.low_latency();
+            thread::spawn(move || {
+                runner.stop();
+                if let Some(session) = current(&app) {
+                    app.log(if low { "[app] the host offers control mode now: switching to it" } else { "[app] the host no longer offers control mode: watching" });
+                    session.start_player(&app);
+                }
+            });
         }
     }
 
@@ -248,6 +299,25 @@ impl Session {
         };
         let ffmpeg = receiver_ffmpeg(s);
         let endpoint = mpv_command::default_ipc_endpoint(std::process::id());
+        if let (true, Some(fast)) = (self.viewer.low_latency(), &self.low_latency) {
+            let plan = match mpv_command::build_low_latency(s, &endpoint, &mpv, app.platform) {
+                Ok(plan) => plan,
+                Err(e) => {
+                    app.log(&format!("[app] cannot build the mpv command: {e}"));
+                    return;
+                }
+            };
+            app.log("[app] control mode: HdrCast hands mpv each picture the moment it is complete (no buffer, no SRT)");
+            self.player_low_latency.store(true, Ordering::SeqCst);
+            self.runner.set_stdin_feed(Some(fast.feed()));
+            self.runner.start(s.clone(), plan);
+            return;
+        }
+        if self.settings.control_mode {
+            app.log("[app] this host does not offer control mode: watching with the usual delay");
+        }
+        self.player_low_latency.store(false, Ordering::SeqCst);
+        self.runner.set_stdin_feed(None);
         let mut plan = match mpv_command::build(s, self.viewer.local_port(), &self.viewer.srt_passphrase(), &endpoint, &mpv, ffmpeg.as_deref(), app.platform) {
             Ok(plan) => plan,
             Err(e) => {
@@ -290,9 +360,13 @@ fn end(app: &AppState) -> bool {
         control.stop();
     }
     session.keyframes.stop();
+    if let Some(fast) = &session.low_latency {
+        fast.stop();
+    }
     session.runner.set_guard_tap(None);
     session.runner.set_ipc_tap(None, None);
     session.runner.on_player_message(None);
+    session.runner.set_stdin_feed(None);
     session.runner.stop();
     session.viewer.stop();
     true
@@ -332,6 +406,9 @@ pub fn set_mute(app: &AppState, muted: bool) {
     app.watch.muted.store(muted, Ordering::SeqCst);
     if let Some(session) = current(app) {
         session.runner.set_mute(muted);
+        if let Some(fast) = &session.low_latency {
+            fast.set_muted(muted);
+        }
         app.log(if muted { "[app] sound off" } else { "[app] sound on" });
     }
 }
@@ -438,6 +515,10 @@ pub fn status(app: &AppState) -> Value {
         "hostName": if learned.is_empty() { session.host_name.clone() } else { learned },
         "hostDeviceCode": viewer.host_device_key().as_deref().map(hdrcast_core::group::device::code_of).unwrap_or_default(),
         "hostOnDemand": viewer.host_on_demand(),
+        // control mode was asked for, and whether this session is in it (the host offered it)
+        "controlMode": session.settings.control_mode,
+        "lowLatency": viewer.low_latency(),
+        "ll": session.low_latency.as_ref().filter(|_| viewer.low_latency()).map(|fast| fast.status()),
         // agreed on when joining: a new one takes joining again
         "latencyMs": session.settings.latency_ms,
         "overlay": overlay::is_expanded(app),

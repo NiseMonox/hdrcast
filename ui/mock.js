@@ -2,7 +2,8 @@
 // URL switches: ?fresh (no group yet), ?live (already sharing), ?watching, ?knock (somebody asks to watch),
 // ?off (not available to connect), ?mac, ?lang=zh|ja|en, ?theme=dark|light,
 // ?nohdr (the system refuses HDR capture: an HDR display is sent as SDR, as on a Mac without it),
-// ?autostart=on|disabled|other (the sign-in entry). overlay.html?watching is the button over the player
+// ?autostart=on|disabled|other (the sign-in entry), ?helper=on|old|missing|notneeded (the input service's
+// row in Settings). overlay.html?watching is the button over the player
 // (overlay.html?watching&panel the panel it opens into).
 
 const q = new URLSearchParams(location.search);
@@ -26,12 +27,12 @@ const db = {
   sender: {
     outputIndex: 0, outputDeviceName: '\\\\.\\DISPLAY1', outputFriendlyName: 'AW3225QF', fps: 60, scale: 0, hdrMode: 0, cursor: true,
     sdrWhite: 80, encoder: 0, quality: 1, bitrateMbps: 40, gopSeconds: 1, bufferSeconds: 0.25, bFrames: true, lookahead: true, keyframeOnRequest: false,
-    audio: true, audioDevice: 'default', audioCodec: 1, audioBitrateKbps: 192, audioExcludeApp: '', maxViewers: 4, uploadMbps: 0,
-    ffmpegPath: '', settingsVersion: 1,
+    audio: true, audioDevice: 'default', audioCodec: 1, audioBitrateKbps: 192, audioExcludeApp: '', maxViewers: 4, uploadMbps: 0, endWhenViewersLeave: true,
+    controlMode: true, controlBitrateMbps: 30, controlFps: 60, ffmpegPath: '', settingsVersion: 1,
   },
   receiver: {
     latencyMs: 1500, expectedBitrateMbps: 100, displayMode: 0, toneMapping: 'bt.2390', hwDec: 1, bufferSeconds: 1.5,
-    fullscreen: false, fullscreenScreen: 0, frontend: 0, mpvPath: '', ffmpegPath: '', autoCatchUp: true, targetPeakNits: 0, lastHost: '',
+    fullscreen: false, fullscreenScreen: 0, frontend: 0, mpvPath: '', ffmpegPath: '', autoCatchUp: true, targetPeakNits: 0, lastHost: '', controlMode: q.has('control'),
   },
   access: {
     rev: 0,
@@ -54,6 +55,7 @@ const db = {
   watch: { active: false, hostId: '', hostName: '', startedMs: 0, want: null },
   viewers: [],
   knocks: [],
+  endedUnwatched: 0,
   seen: [{ key: 'k-jiuyi', code: 'B7WP-3N6S-KCE1', name: 'Hana', source: 'asked' }],
   autostart: {
     supported: true,
@@ -61,12 +63,21 @@ const db = {
     other: q.get('autostart') === 'other' ? (mac ? '/Users/me/Downloads/HdrCast.app/Contents/MacOS/HdrCast' : 'D:\\HdrCast-0.3.0\\HdrCast.exe') : null,
     disabled: q.get('autostart') === 'disabled',
   },
+  // the input service (Windows only)
+  inputHelper: {
+    supported: !mac,
+    installed: q.get('helper') === 'on' || q.get('helper') === 'old',
+    outdated: q.get('helper') === 'old',
+    running: false,
+    notNeeded: q.get('helper') === 'notneeded',
+    bundled: q.get('helper') !== 'missing',
+  },
 };
 
 const hosts = [
-  { hostId: 'h1', name: 'Hana', sinceMs: now() - 23 * 60000, mbps: 40, viewers: 1, maxViewers: 4, codec: 'hevc', ipv6: false, openIpv4: true, control: true, onDemand: false, deviceCode: 'B7WP-3N6S-KCE1' },
-  { hostId: 'h2', name: 'Leo', sinceMs: now() - 95 * 60000, mbps: 25, viewers: 3, maxViewers: 3, codec: 'hevc', ipv6: true, openIpv4: null, control: false, onDemand: false, deviceCode: '' },
-  { hostId: 'h3', name: 'NiseMono desktop', sinceMs: now() - 300 * 60000, mbps: 60, viewers: 0, maxViewers: 4, codec: 'hevc', ipv6: true, openIpv4: true, control: true, onDemand: true, deviceCode: 'H2C8-5RVJ-9MZ4' },
+  { hostId: 'h1', name: 'Hana', sinceMs: now() - 23 * 60000, mbps: 40, viewers: 1, maxViewers: 4, codec: 'hevc', ipv6: false, openIpv4: true, control: true, onDemand: false, deviceCode: 'B7WP-3N6S-KCE1', lowLatency: false },
+  { hostId: 'h2', name: 'Leo', sinceMs: now() - 95 * 60000, mbps: 25, viewers: 3, maxViewers: 3, codec: 'hevc', ipv6: true, openIpv4: null, control: false, onDemand: false, deviceCode: '', lowLatency: false },
+  { hostId: 'h3', name: 'NiseMono desktop', sinceMs: now() - 300 * 60000, mbps: 60, viewers: 0, maxViewers: 4, codec: 'hevc', ipv6: true, openIpv4: true, control: true, onDemand: true, deviceCode: 'H2C8-5RVJ-9MZ4', lowLatency: true },
 ];
 
 function plan() {
@@ -91,7 +102,21 @@ function mode() {
   return db.access.available ? 'available' : 'off';
 }
 
+// A broadcast ends 2 s after everyone who watched has left, when the switch is on (share.rs).
+function endIfEveryoneLeft() {
+  const s = db.share;
+  if (s.live && db.viewers.some((v) => now() - v.joinedMs > 2500)) s.watched = true;
+  const alone = s.live && s.watched && db.sender.endWhenViewersLeave && db.viewers.length === 0;
+  s.aloneSinceMs = alone ? s.aloneSinceMs || now() : 0;
+  if (alone && now() - s.aloneSinceMs >= 2000) {
+    db.share = { state: 'idle', live: false, detail: 'Stopped', startedMs: 0 };
+    db.endedUnwatched += 1;
+    emit('log', { lines: ['[app] everyone who watched has left: the broadcast ended; still available to the group'] });
+  }
+}
+
 function status() {
+  endIfEveryoneLeft();
   const s = db.share;
   const up = s.startedMs ? (now() - s.startedMs) / 1000 : 0;
   const streaming = s.state === 'streaming';
@@ -126,12 +151,20 @@ function status() {
       knocks: db.knocks.map((k) => ({ ...k, waitingSec: Math.floor((now() - k.sinceMs) / 1000), limitSec: 50 })),
       problem: null,
       device: DEVICE,
+      endsInSec: s.aloneSinceMs ? Math.ceil((2000 - (now() - s.aloneSinceMs)) / 1000) : null,
+      endedUnwatched: db.endedUnwatched,
+      controlMode: { offered: !mac && db.sender.controlMode, engine: { state: 'idle', detail: '', fps: null, unavailable: false } },
     },
     plan: p,
     watch: {
       active: w.active, hostId: w.hostId, hostName: w.hostName,
       hostDeviceCode: host?.deviceCode || '', hostOnDemand: !!host?.onDemand,
       latencyMs: w.latencyMs || db.receiver.latencyMs, overlay: !!w.overlay, muted: !!w.muted,
+      controlMode: db.receiver.controlMode, lowLatency: !!(w.active && db.receiver.controlMode && host?.lowLatency),
+      ll: w.active && connected && db.receiver.controlMode && host?.lowLatency ? {
+        rttMs: 1.8 + wobble * 0.4, shown: Math.floor(Math.max(0, wup - 2) * 60), lost: 2, restored: 41, keyframeWaits: 2,
+        waiting: false, frozenSec: 0.07, hostMs: 6.4 + wobble, encodeMs: 2.9, mbps: 12 + wobble * 8, fps: 118 + wobble * 2, sound: true, soundLost: 0, soundUnderruns: 0,
+      } : null,
       session: w.active ? {
         state: connected ? 'connected' : asks ? 'approval' : wup > 1 ? 'punching' : 'joining',
         status: connected ? `Connected to ${w.hostName} (IPv6 [2400:aaaa::1]:51234, ping 38 ms)` : asks ? `Waiting for ${w.hostName} to answer` : `Connecting to ${w.hostName}`,
@@ -165,6 +198,8 @@ function scheduleViewers() {
       net: { lossPercent: 0.4, lostForGood: 0, mbps: 43.6, rttMs: 83 } },
     { sid: 's3', name: 'Mika', deviceCode: 'P0VD-2KQN-71XA', verified: true, ipv6: true, path: '[2400:aaaa::7]:50112', rttMs: 12, latencyMs: 1500, overheadPercent: 25, control: 'none',
       net: { lossPercent: 0, lostForGood: 0, mbps: 43.6, rttMs: 12 } },
+    { sid: 's4', name: 'NiseMac', deviceCode: 'Q4ZD-81HM-X0RT', verified: true, ipv6: true, path: '[2400:aaaa::9]:50113', rttMs: 2, latencyMs: 1500, overheadPercent: 25, control: 'granted',
+      mode: 'control', net: null, ll: { rttMs: 1.9, shown: 5400, lost: 1, restored: 23, keyframeRequests: 1, mbps: 14.2, reportAgeSec: 0.2 } },
   ];
   people.forEach((p, i) => setTimeout(() => {
     if (db.share.state === 'streaming' || db.share.state === 'starting') {
@@ -206,7 +241,13 @@ const api = {
       startupInvite: null,
       startHidden: false,
       autostart: db.autostart,
+      inputHelper: db.inputHelper,
     };
+  },
+  input_helper_get: () => db.inputHelper,
+  input_helper_set({ on }) {
+    db.inputHelper = { ...db.inputHelper, installed: on, outdated: false, running: false };
+    return db.inputHelper;
   },
   autostart_get: () => db.autostart,
   autostart_set({ on }) {

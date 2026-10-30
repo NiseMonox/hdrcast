@@ -257,6 +257,50 @@ mod mpv_command_line {
     }
 
     #[test]
+    fn control_mode_reads_raw_hevc_from_stdin_with_nothing_buffered_on_the_way() {
+        let s = ReceiverSettings { fullscreen: true, ..settings(DisplayMode::HdrPassthrough) };
+        let plan = mpv_command::build_low_latency(&s, &endpoint(7), Path::new("mpv"), Platform::Windows).unwrap();
+        let a = &plan.mpv_args;
+        assert_eq!(a.last().unwrap(), "-");
+        assert!(!plan.uses_ffmpeg_pipe());
+        // the picture and the window are the watching ones: decoder, HDR, IPC, the player's input, fullscreen
+        let watching = build(&s, 7, "mpv").mpv_args;
+        for kept in ["vo", "gpu-api", "hwdec", "target-colorspace-hint", "input-ipc-server", "input-default-bindings", "osc", "fs", "fs-screen", "title", "media-controls"] {
+            assert_eq!(flag(a, kept), flag(&watching, kept), "{kept}");
+        }
+        // stdin is not a terminal
+        assert_eq!(flag(a, "input-terminal"), "no");
+        // none of the buffering
+        for gone in ["cache-secs", "cache-pause-initial", "cache-pause-wait", "demuxer-readahead-secs", "demuxer-max-bytes", "video-sync", "demuxer-lavf-probesize"] {
+            assert!(!has(a, gone), "{gone}");
+        }
+        for (name, value) in [
+            ("cache", "no"),
+            ("untimed", ""),
+            ("video-latency-hacks", "yes"),
+            // the measured one: four decoder threads held three pictures back
+            ("hwdec-threads", "1"),
+            ("vd-lavc-threads", "1"),
+            ("framedrop", "no"),
+            ("demuxer-lavf-format", "hevc"),
+            ("demuxer-lavf-probe-info", "nostreams"),
+            ("stream-buffer-size", "4k"),
+            ("d3d11-sync-interval", "0"),
+            ("aid", "no"),
+        ] {
+            assert!(has(a, name), "{name} missing: {a:?}");
+            assert_eq!(flag(a, name), value, "{name}");
+        }
+        assert_eq!(a.iter().filter(|x| x.starts_with("--cache=")).count(), 1);
+        assert_eq!(a.iter().filter(|x| x.starts_with("--demuxer-lavf-format=")).count(), 1);
+        // macOS: VideoToolbox, no Direct3D option
+        let mac = mpv_command::low_latency_args(&s, "/tmp/ipc.sock", Platform::MacOs);
+        assert_eq!(flag(&mac, "hwdec"), "videotoolbox");
+        assert!(!has(&mac, "d3d11-sync-interval") && !has(&mac, "gpu-api"));
+        assert_eq!(mpv_command::build_low_latency(&s, "x", Path::new(""), Platform::Windows), Err(MpvPlanError::MpvPathRequired));
+    }
+
+    #[test]
     fn automatic_uses_the_pipe_whenever_ffmpeg_is_there() {
         let auto = settings(DisplayMode::Auto);
         assert_eq!(auto.frontend, ReceiverFrontend::Auto, "the default");

@@ -388,6 +388,7 @@ pub fn engine_encode_args(s: &EncoderSettings) -> Option<EncodeArgs> {
             QualityPreset::Quality => Multipass::Full,
         },
         aq_strength: 8,
+        low_latency: false,
     })
 }
 

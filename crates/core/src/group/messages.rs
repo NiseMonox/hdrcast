@@ -136,6 +136,10 @@ pub struct LiveRecord {
     /// encoder runs inside HdrCast. Written only when true, last; absent means no, and then nothing of the kind may
     /// be sent to it (a host older than 0.3.3 would hand the datagram to SRT).
     pub keyframes: bool,
+    /// "ll": the host offers control mode, the low-latency stream for remote control (docs/design.md §11): a viewer
+    /// may join with "ll" and gets the picture in side datagrams instead of through SRT. Written only when true,
+    /// last; absent means no (hosts older than 0.3.7, or one whose encoder cannot do it).
+    pub low_latency: bool,
 }
 
 impl Default for LiveRecord {
@@ -155,6 +159,7 @@ impl Default for LiveRecord {
             device_key: None,
             on_demand: false,
             keyframes: false,
+            low_latency: false,
         }
     }
 }
@@ -189,6 +194,9 @@ impl LiveRecord {
         if self.keyframes {
             p.insert("kf".to_string(), Value::from(true));
         }
+        if self.low_latency {
+            p.insert("ll".to_string(), Value::from(true));
+        }
         p
     }
 
@@ -209,6 +217,7 @@ impl LiveRecord {
             device_key: text(p, "dk").filter(|k| device::parse_public_key(k).is_some()).map(str::to_string),
             on_demand: field(p, "od").and_then(json::as_bool).unwrap_or(false),
             keyframes: field(p, "kf").and_then(json::as_bool).unwrap_or(false),
+            low_latency: field(p, "ll").and_then(json::as_bool).unwrap_or(false),
         };
         (r.host_id == expected_host).then_some(r)
     }
@@ -267,6 +276,9 @@ pub struct JoinRequest {
     /// "kf": the viewer asks for a keyframe when it loses part of the stream, and understands the host's answers
     /// on the side channel (docs/design.md §8.12). Written only when true, last; absent means no.
     pub keyframes: bool,
+    /// "ll": control mode (docs/design.md §11): the viewer wants the low-latency stream in side datagrams instead of
+    /// SRT. Only sent to a host whose live record says "ll". Written only when true, last; absent means no.
+    pub low_latency: bool,
 }
 
 impl JoinRequest {
@@ -289,6 +301,9 @@ impl JoinRequest {
         if self.keyframes {
             p.insert("kf".to_string(), Value::from(true));
         }
+        if self.low_latency {
+            p.insert("ll".to_string(), Value::from(true));
+        }
         p
     }
 
@@ -306,6 +321,7 @@ impl JoinRequest {
             remote_control: field(p, "rc").and_then(json::as_bool).unwrap_or(false),
             device: DeviceProof::read(p, true),
             keyframes: field(p, "kf").and_then(json::as_bool).unwrap_or(false),
+            low_latency: field(p, "ll").and_then(json::as_bool).unwrap_or(false),
         };
         if !keys::is_valid_id(&j.session_id) || !keys::is_valid_id(&j.viewer_id) {
             return None;
@@ -426,7 +442,7 @@ mod tests {
         let open = LiveRecord { open_ipv4: Some(false), ..live };
         assert!(Value::Object(open.to_payload()).to_string().ends_with(r#","viewers":1,"open4":false}"#));
 
-        let join = JoinRequest { session_id: "S".into(), viewer_id: "V".into(), name: "n".into(), time_ms: 3, candidates: vec![], latency_ms: 3500, overhead_percent: 50, remote_control: false, device: None, keyframes: false };
+        let join = JoinRequest { session_id: "S".into(), viewer_id: "V".into(), name: "n".into(), time_ms: 3, candidates: vec![], latency_ms: 3500, overhead_percent: 50, remote_control: false, device: None, keyframes: false, low_latency: false };
         assert_eq!(Value::Object(join.to_payload()).to_string(), r#"{"v":1,"t":3,"sid":"S","viewer":"V","name":"n","cands":[],"latency":3500,"overhead":50}"#);
 
         let answer = JoinAnswer { session_id: "S".into(), time_ms: 4, ok: false, reason: JoinAnswer::REASON_FULL.into(), candidates: vec![], device: None };
@@ -522,6 +538,36 @@ mod tests {
         // and without anything else optional it still comes last
         let bare = JoinRequest { remote_control: false, device: None, keyframes: true, ..join };
         assert!(Value::Object(bare.to_payload()).to_string().ends_with(r#","latency":3500,"overhead":50,"kf":true}"#));
+    }
+
+    #[test]
+    fn the_control_mode_flag_comes_after_everything_only_when_set() {
+        let host = keys::new_id();
+        let dk = device::DeviceKey::generate().public_key().to_string();
+        let live = LiveRecord { host_id: host.clone(), name: "n".into(), mbps: 40, max_viewers: 4, device_key: Some(dk.clone()), on_demand: true, keyframes: true, ..LiveRecord::default() };
+        let plain = Value::Object(live.to_payload()).to_string();
+        assert!(plain.ends_with(r#","od":true,"kf":true}"#), "{plain}");
+        assert!(!plain.contains(r#""ll""#));
+        assert!(!LiveRecord::from_payload(&live.to_payload(), &host).unwrap().low_latency);
+        let offering = LiveRecord { low_latency: true, ..live.clone() };
+        let text = Value::Object(offering.to_payload()).to_string();
+        assert_eq!(text, format!(r#"{}{}"#, &plain[..plain.len() - 1], r#","ll":true}"#));
+        assert_eq!(LiveRecord::from_payload(&offering.to_payload(), &host).unwrap(), offering);
+        for value in ["false", "1", "\"no\"", "null"] {
+            let odd = object(&format!(r#"{{"host":"{host}","ll":{value}}}"#));
+            assert!(!LiveRecord::from_payload(&odd, &host).unwrap().low_latency, "{value}");
+        }
+
+        let (sid, viewer) = (keys::new_id(), keys::new_id());
+        let proof = DeviceProof { key: dk.clone(), exchange: "E".into(), signature: "S".into() };
+        let join = JoinRequest { session_id: sid, viewer_id: viewer, name: "n".into(), latency_ms: 300, overhead_percent: 25, remote_control: true, device: Some(proof), keyframes: true, ..JoinRequest::default() };
+        let plain = Value::Object(join.to_payload()).to_string();
+        assert!(plain.ends_with(r#","ds":"S","kf":true}"#), "{plain}");
+        let asking = JoinRequest { low_latency: true, ..join.clone() };
+        let text = Value::Object(asking.to_payload()).to_string();
+        assert_eq!(text, format!(r#"{}{}"#, &plain[..plain.len() - 1], r#","ll":true}"#));
+        assert_eq!(JoinRequest::from_payload(&asking.to_payload()), Some(asking));
+        assert!(!JoinRequest::from_payload(&join.to_payload()).unwrap().low_latency);
     }
 
     #[test]

@@ -17,7 +17,7 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::access::AccessSettings;
 use crate::state::{self, AppState, UiSettings};
-use crate::{autostart, clipboard, status, tray, window};
+use crate::{autostart, clipboard, input_helper, status, tray, window};
 
 type Shared<'a> = State<'a, Arc<AppState>>;
 type CmdResult<T = Value> = Result<T, String>;
@@ -39,6 +39,7 @@ pub fn app_init(app: State<'_, Arc<AppState>>) -> Value {
         // started at sign-in: the page leaves the window hidden
         "startHidden": start_hidden,
         "autostart": autostart,
+        "inputHelper": input_helper::view(),
         "defaultName": invite_flow::default_display_name(group),
         "ui": inner.ui,
         "sender": inner.sender,
@@ -60,6 +61,7 @@ pub fn app_init(app: State<'_, Arc<AppState>>) -> Value {
         "caps": {
             "audioExclude": cfg!(windows),
             "clipboardWatch": cfg!(windows),
+            "adminInput": cfg!(windows),
         },
         "logs": app.logs.history(),
         "status": status,
@@ -178,6 +180,32 @@ pub fn autostart_set(app: Shared<'_>, on: bool) -> CmdResult {
         "[app] HdrCast will no longer start when you sign in"
     });
     Ok(now.view())
+}
+
+/// Whether the input service is set up and running (the page looks again whenever Settings opens).
+#[tauri::command(async)]
+pub fn input_helper_get() -> Value {
+    input_helper::view()
+}
+
+/// Sets the input service up or takes it away; Windows asks for permission, and the call returns when the
+/// user has answered. The error is a sentence to show.
+#[tauri::command(async)]
+pub fn input_helper_set(app: Shared<'_>, on: bool) -> CmdResult {
+    match input_helper::set(on) {
+        Ok(view) => {
+            app.log(if on {
+                "[app] input service set up: viewers who control this computer can type into windows of programs run as administrator"
+            } else {
+                "[app] input service removed"
+            });
+            Ok(view)
+        }
+        Err(e) => {
+            app.log(&format!("[app] input service: {e}"));
+            Err(e)
+        }
+    }
 }
 
 /// The words of the icon's menu and tooltip, in the page's language.

@@ -136,6 +136,62 @@ pub fn build(
     })
 }
 
+/// The launch plan for control mode (docs/design.md §11.3): mpv plays the HEVC pictures HdrCast writes to its stdin
+/// the moment each one is complete, with nothing buffered on the way: no cache, no waiting for timestamps
+/// (`--untimed`; the stream has none), no frame threads in the decoder. Measured on this design's PC (RTX 4090,
+/// 360 Hz monitor): a picture is on the screen 6 ms after it was written; mpv's default of four decoder threads for
+/// hardware decoding held three pictures back (54 ms at 60 fps).
+pub fn build_low_latency(
+    s: &ReceiverSettings,
+    ipc_endpoint: &str,
+    mpv_exe: &Path,
+    platform: Platform,
+) -> Result<MpvLaunchPlan, MpvPlanError> {
+    if mpv_exe.as_os_str().is_empty() {
+        return Err(MpvPlanError::MpvPathRequired);
+    }
+    Ok(MpvLaunchPlan {
+        mpv_exe: mpv_exe.to_path_buf(),
+        mpv_args: low_latency_args(s, ipc_endpoint, platform),
+        ipc_endpoint: ipc_endpoint.to_string(),
+        url: "-".to_string(),
+        ffmpeg_exe: None,
+        ffmpeg_args: None,
+    })
+}
+
+/// mpv arguments for control mode: the picture options of [`mpv_args`] (decoder, HDR, window, input) with the
+/// buffering ones replaced, reading raw HEVC (Annex B) from stdin.
+pub fn low_latency_args(s: &ReceiverSettings, ipc_endpoint: &str, platform: Platform) -> Vec<String> {
+    let watching = mpv_args(s, ipc_endpoint, "-", true, platform);
+    let buffering = [
+        "--cache=",
+        "--demuxer-readahead-secs=",
+        "--cache-secs=",
+        "--cache-pause-initial=",
+        "--cache-pause-wait=",
+        "--demuxer-max-bytes=",
+        "--video-sync=",
+        "--framedrop=",
+        "--demuxer-lavf-probesize=",
+        "--demuxer-lavf-analyzeduration=",
+        "--demuxer-lavf-format=",
+    ];
+    let mut a: Vec<String> = watching.into_iter().filter(|arg| !buffering.iter().any(|b| arg.starts_with(b))).collect();
+    a.pop(); // the input, put back last
+    a.extend(words(
+        "--untimed --video-latency-hacks=yes --hwdec-threads=1 --vd-lavc-threads=1 --cache=no --framedrop=no \
+         --demuxer-lavf-format=hevc --demuxer-lavf-o-add=fflags=+nobuffer --demuxer-lavf-probe-info=nostreams \
+         --demuxer-lavf-analyzeduration=0.1 --stream-buffer-size=4k --aid=no",
+    ));
+    if platform == Platform::Windows {
+        // present at once instead of on the next vertical blank (2 ms less on a 360 Hz monitor, more on a 60 Hz one)
+        a.push("--d3d11-sync-interval=0".to_string());
+    }
+    a.push("-".to_string());
+    a
+}
+
 /// ffmpeg's side of the pipe: receive SRT and write its payload to stdout as it came (`-f data` in and out:
 /// nothing is demuxed or remuxed), so that the guard sees the stream's own continuity counters and timestamps.
 pub fn ffmpeg_pipe_args(url: &str) -> Vec<String> {
