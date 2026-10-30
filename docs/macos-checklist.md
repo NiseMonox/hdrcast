@@ -1,9 +1,15 @@
 # macOS 验证清单（采集引擎）
 
 采集引擎的 macOS 后端（`crates/capture/src/mac/` + `src/unix/`，ScreenCaptureKit）是**在 Windows 上写的**：那台机器只能做
-`cargo check --target aarch64-apple-darwin / x86_64-apple-darwin`（类型检查通过、clippy 干净），**一行都没运行过，也没链接过**。
+`cargo check --target aarch64-apple-darwin / x86_64-apple-darwin`（类型检查通过、clippy 干净），写的时候没法运行，也没法链接。
 下面是在真 Mac 上的第一次运行，按顺序做；每一步写了命令、预期输出、以及它验证的是哪一条"没法在 Windows 上验证的假设"
 （编号 A1…A20，汇总在文末，按出错可能性从高到低排）。
+
+> **进度（2026-10-30）**：已经在真 Mac（Apple 芯片、macOS 26.5.2）上用 Mac 版（`fix/macos-first-run` 分支）做了一部分：
+> 构建通过（没有 warning，没有 `Undefined symbols`），`hdrcast-core`、`hdrcast-media`、`hdrcast` 的 `cargo test` 通过；
+> 第 2、3 步；第 12 步的构建、启动和找到工具；第 13 步观看 Windows 主播，HDR 正常。**其余各步还没做**，包括采集 dump 和音频
+> （第 4–10 步）、开播（第 14 步）、远程控制（第 15 步）和控制模式（第 17 步）。main 在 Mac 上用不了（窗口出不来，Homebrew 的
+> ffmpeg / mpv 不带 SRT），Mac 需要的修改只在那个分支上，照着做时请看那个分支里的这份清单。
 
 **请把每一步的终端输出原样留下来**（`2> engine.log` 里的日志尤其重要）：引擎会在日志里把系统实际给它的东西打印出来
 （HDR 预设的像素格式、第一帧的格式 / 每行字节数 / 色彩标签、音频格式），这些就是对假设的回答。
@@ -325,7 +331,7 @@ wait %1; head -3 /tmp/hc-perf.log; tail -5 /tmp/hc-stats.jsonl
 # 第二部分：整个应用（HdrCast.app）
 
 上面只验证了采集引擎。应用的其余部分（界面、点对点、mpv 编排、远程控制）是平台无关的 Rust，已经在 Windows 上实测过；
-macOS 特有的只有下面几处，同样**只做过类型检查**（`cargo check -p hdrcast --target aarch64-apple-darwin`）。
+macOS 特有的只有下面几处，写的时候同样只做过类型检查（`cargo check -p hdrcast --target aarch64-apple-darwin`；真机上做过哪些见开头的进度）。
 采集引擎的第 1–8 步通过之后再做这一部分。
 
 ## 12. 构建与启动

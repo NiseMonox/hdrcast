@@ -20,7 +20,7 @@
 - **为远程控制的控制模式（0.3.7）**：在观看页选 **控制** 而不是 **观看**，有 NVIDIA 显卡的主播就会发一路专门用来操作电脑的流，和 Sunshine / Vibepollo 发给 Moonlight 的一样：NVENC 超低延迟调优、采到一帧就发一帧、用 Reed-Solomon 校验代替重发，mpv 收齐一帧就显示。同一台电脑上从屏幕到屏幕实测：1080p 14.5 ms、4K HDR 21 ms，而不是几秒（[控制模式](#控制模式)）。
 - **界面有英文、中文和日文**（**设置 → 语言**；「跟随系统」按系统语言显示）。
 
-> **现状（0.3.1）**：Windows 上的采集、编码、点对点、播放和界面已在真机上测过；**macOS 的代码只在 Windows 上做过类型检查，还没有在 Mac 上跑过**，第一次运行请按 [docs/macos-checklist.md](docs/macos-checklist.md) 逐步核对。
+> **现状（0.3.7）**：Windows 上的采集、编码、点对点、播放和界面已在真机上测过。Mac 版是 [`fix/macos-first-run`](https://github.com/NiseMonox/hdrcast/tree/fix/macos-first-run) 分支：main 加上 Mac 需要的修改（main 本身在 Mac 上连窗口都出不来）。在 Apple 芯片的 Mac（macOS 26.5.2）上能构建、测试通过，观看可用，HDR 也正常；**从 Mac 开播和远程控制还没有在 Mac 上试过**，步骤见 [docs/macos-checklist.md](docs/macos-checklist.md)。
 
 ## 需要什么
 

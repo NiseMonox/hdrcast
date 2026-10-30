@@ -45,9 +45,11 @@ sharer's computer. No relay server, no public IPv4 address, no port forwarding t
   1080p and 21 ms in 4K HDR, instead of seconds ([Control mode](#control-mode)).
 - **English, Chinese and Japanese** in the app (**Settings → Language**; Automatic follows the system).
 
-> **Status (0.3.1):** on Windows, capture, encoding, peer-to-peer, playback and the UI have been tested on real machines.
-> **The macOS code has only been type-checked on Windows and has never run on a Mac**: for a first run, go through
-> [docs/macos-checklist.md](docs/macos-checklist.md) step by step.
+> **Status (0.3.7):** on Windows, capture, encoding, peer-to-peer, playback and the UI have been tested on real machines.
+> The Mac version is the [`fix/macos-first-run`](https://github.com/NiseMonox/hdrcast/tree/fix/macos-first-run) branch:
+> main plus what a Mac needs (main's own window never appears on a Mac). On an Apple silicon Mac (macOS 26.5.2) it
+> builds, its tests pass, and watching works, HDR included. **Sharing from a Mac and remote control have not been tried
+> on a Mac yet**: [docs/macos-checklist.md](docs/macos-checklist.md) has the steps.
 
 ## What you need
 

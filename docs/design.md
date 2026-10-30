@@ -619,8 +619,9 @@ Cargo workspace（Rust 1.85+，edition 2021）。全部用普通线程和阻塞 
   - 设备密钥（§8.10）：签名绑定组 / 主播 / 会话 / 时间 / 候选、规范写法、双方算出同一把控制密钥；真信令服务器上的准入：
     晚到的放行（观众先显示等待、再重新打洞）、为别的会话签的 join 被拒且不交给应用、旧观众被拒后停止重试、签名的新观众照样能看不认设备的主播。
 - 需要缺的工具时（Python、ffmpeg、mpv、0.2.4 的发行目录）测试会在 stderr 打印 `SKIPPED` 后通过；`HDRCAST_TOOLS` 指向工具目录。
-- 真机清单：`docs/windows-checklist.md`（含"单机回环"的做法）、`docs/macos-checklist.md`。**macOS 的全部代码只在 Windows 上做过类型检查**
-  （`cargo check --target aarch64-apple-darwin`；整个应用还需要给构建脚本一个假的 C 编译器），没有运行过。
+- 真机清单：`docs/windows-checklist.md`（含"单机回环"的做法）、`docs/macos-checklist.md`。macOS 的代码是在 Windows 上写的，当时只能做类型检查
+  （`cargo check --target aarch64-apple-darwin`；整个应用还需要给构建脚本一个假的 C 编译器）。之后在 Apple 芯片的 Mac 上用 Mac 版（`fix/macos-first-run`
+  分支）做过构建、测试、采集自检和观看（HDR 正常）；开播、远程控制还没在 Mac 上试过，见 macos-checklist 开头的进度。
 
 ## 8. 点对点模式协议（v1）
 
@@ -1072,7 +1073,7 @@ answer: "hdrcast/v1/answer-device" gid  sid  t  ok(true|false)  reason  cands  �
     把需要的特权打开；真的 `HdrCastInput serve --stop-event` 在事件被置位后以 0 退出；手动运行 `service` 会说"要由 Windows 当服务运行"（`tests/input_program.rs`、`cargo test -p hdrcast-control -- --ignored`）。
   - **没验证过**：注册服务、普通权限 `StartService`（服务访问控制）、服务管理器的状态流程、`WTSQueryUserToken` 按 SID 找会话、把 SYSTEM 令牌移到用户会话后真的在那里起进程并注入、停止时的优雅退出、UAC 流程——都要真的装一个服务，见 windows-checklist §9。
 
-## 10. macOS（0.3.0 起，尚未在真机上运行）
+## 10. macOS（0.3.0 起；Mac 版在 `fix/macos-first-run` 分支，观看已在真机上验证）
 
 | Windows | macOS |
 |---|---|
