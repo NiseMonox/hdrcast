@@ -4,6 +4,8 @@
 //!
 //! Option names are shared across platforms, so the macOS argument list is checked against whatever mpv is at
 //! hand too. That proves its names exist and its plain values parse; it does not replace a run on a real Mac.
+//! The exception is a video backend's own options: only an mpv built with Direct3D 11 (Windows) lists
+//! `--d3d11-…`, so elsewhere those are left out with a note.
 //!
 //! Skipped, with a note, when mpv is missing (see tests/common/mod.rs).
 
@@ -91,6 +93,9 @@ fn every_generated_mpv_option_exists() {
     };
     let known = known_options(&mpv);
     assert!(known.len() > 100, "could not read mpv's option list");
+    // control mode's --d3d11-sync-interval (Windows) is unknown to an mpv without Direct3D 11, a Mac's say
+    let has_d3d11 = known.keys().any(|name| name.starts_with("d3d11-"));
+    let mut not_here = BTreeSet::new();
 
     for platform in PLATFORMS {
         let mut unknown = BTreeSet::new();
@@ -112,6 +117,10 @@ fn every_generated_mpv_option_exists() {
                 let Some((name, _)) = split_option(arg) else {
                     continue;
                 };
+                if !has_d3d11 && name.starts_with("d3d11-") {
+                    not_here.insert(name.to_string());
+                    continue;
+                }
                 names.insert(name.to_string());
                 // mpv accepts --no-<flag> for every boolean option.
                 let bare = name.strip_prefix("no-").unwrap_or(name);
@@ -127,6 +136,11 @@ fn every_generated_mpv_option_exists() {
         note(&format!(
             "mpv knows all {} option names of the {platform:?} argument lists",
             names.len()
+        ));
+    }
+    if !not_here.is_empty() {
+        note(&format!(
+            "this mpv has no Direct3D 11, so {not_here:?} went unchecked (an mpv on Windows checks them)"
         ));
     }
 }
