@@ -9,7 +9,8 @@
 //! (docs/design.md §8.12).
 //!
 //! While watching, the panel over the player (`overlay.rs`) changes the decoder and the sound at once and the delay
-//! by joining again (the delay is agreed on when joining). Closing the player's window stops watching.
+//! by joining again (the delay is agreed on when joining); while this viewer controls the host, it can have the host
+//! share another of its displays. Closing the player's window, or Disconnect on the panel, stops watching.
 //!
 //! In control mode (docs/design.md §11) the join asks a host that offers it for the low-latency stream instead: the
 //! picture comes in side datagrams (`low_latency_viewer.rs`) and goes straight into mpv's stdin, with no buffer.
@@ -452,6 +453,12 @@ pub fn want_control(app: &AppState, want: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Has the host share its display `id` (the panel over the player, while this viewer controls the host).
+pub fn pick_display(app: &AppState, id: u8) -> Result<(), String> {
+    let session = current(app).ok_or("Not watching.")?;
+    session.control.as_ref().ok_or("This host does not offer remote control.")?.pick_display(id)
+}
+
 pub fn status(app: &AppState) -> Value {
     let Some(session) = current(app) else {
         return json!({ "active": false, "hostId": "", "hostName": "", "session": null, "player": null, "control": "off" });
@@ -505,9 +512,11 @@ pub fn status(app: &AppState) -> Value {
             })),
         })
     });
-    let control = match &session.control {
-        Some(link) if viewer.state() == ViewerSessionState::Connected && viewer.host_offers_control() => link.state(),
-        _ => "off",
+    let (control, displays) = match &session.control {
+        Some(link) if viewer.state() == ViewerSessionState::Connected && viewer.host_offers_control() => {
+            (link.state(), link.displays_view())
+        }
+        _ => ("off", Value::Null),
     };
     json!({
         "active": true,
@@ -532,5 +541,7 @@ pub fn status(app: &AppState) -> Value {
         },
         "player": player,
         "control": control,
+        // the host's displays while this viewer controls it (a host from 0.3.9 on), for the panel over the player
+        "displays": displays,
     })
 }

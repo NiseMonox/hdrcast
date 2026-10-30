@@ -132,6 +132,16 @@ function status() {
     if (host.onDemand) control = w.want === false ? 'allowed' : 'granted';
     else control = w.want === true ? (wup - w.wantAt > 2 ? 'granted' : 'requested') : 'offered';
   }
+  // the host's displays, told to the viewer in control
+  const displays = control === 'granted' ? {
+    list: [
+      { id: 0, name: 'AW3225QF', width: 3840, height: 2160, hz: 240, hdr: true },
+      { id: 1, name: 'AW2523HF', width: 1920, height: 1080, hz: 360, hdr: false },
+      { id: 4, name: 'Living Room TV', width: 1920, height: 1080, hz: 60, hdr: false },
+    ],
+    shared: w.display ?? 0,
+    pending: w.displayPending ?? null,
+  } : null;
   const p = plan();
   const sentHdr = p.hdr && !q.has('nohdr');
   return {
@@ -180,6 +190,7 @@ function status() {
         guard: playing ? { frozen: wobble > 0.9, losses: 3, freezes: 2, heldBack: 95 } : null,
       } : null,
       control,
+      displays,
     },
     live: { hosts, error: null, loaded: true },
     group: db.group,
@@ -325,6 +336,11 @@ const api = {
     return { ok: true };
   },
   watch_set_mute({ muted }) { db.watch = { ...db.watch, muted }; },
+  watch_set_display({ id }) {
+    db.watch = { ...db.watch, displayPending: id };
+    // the host's capture starts again on that display
+    setTimeout(() => { db.watch = { ...db.watch, display: id, displayPending: null }; }, 1500);
+  },
   overlay_init() {
     return {
       platform: mac ? 'macos' : 'windows', ui: db.ui, receiver: db.receiver, latencyPresets: LATENCY_PRESETS, hwDecModes: HWDEC_MODES,

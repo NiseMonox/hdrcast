@@ -4,6 +4,8 @@
 //!
 //! Option names are shared across platforms, so the macOS argument list is checked against whatever mpv is at
 //! hand too. That proves its names exist and its plain values parse; it does not replace a run on a real Mac.
+//! The exception is a video backend's own options: only an mpv built with Direct3D 11 (Windows) lists
+//! `--d3d11-…`, so elsewhere those are left out with a note.
 //!
 //! Skipped, with a note, when mpv is missing (see tests/common/mod.rs).
 
@@ -20,6 +22,10 @@ use hdrcast_media::sender::encoder_probe;
 use hdrcast_media::Platform;
 
 const PLATFORMS: [Platform; 2] = [Platform::Windows, Platform::MacOs];
+
+/// Options of the Mac's argument lists that only an mpv built for macOS has: an mpv without any `--macos-…` option
+/// (Windows') leaves them unchecked, with a note; an mpv on a Mac checks them.
+const MAC_ONLY: [&str; 2] = ["macos-menu-shortcuts", "native-fs"];
 
 /// mpv's own list: option name -> the rest of its line (type, choices, default).
 fn known_options(mpv: &Path) -> HashMap<String, String> {
@@ -91,10 +97,15 @@ fn every_generated_mpv_option_exists() {
     };
     let known = known_options(&mpv);
     assert!(known.len() > 100, "could not read mpv's option list");
+    // control mode's --d3d11-sync-interval (Windows) is unknown to an mpv without Direct3D 11, a Mac's say
+    let has_d3d11 = known.keys().any(|name| name.starts_with("d3d11-"));
+    let mut not_here = BTreeSet::new();
 
     for platform in PLATFORMS {
         let mut unknown = BTreeSet::new();
         let mut names = BTreeSet::new();
+        // the Mac's own options, when this mpv is not a Mac's
+        let mut mac_only = BTreeSet::new();
         for s in variants() {
             let plan = mpv_command::build(
                 &s,
@@ -112,11 +123,19 @@ fn every_generated_mpv_option_exists() {
                 let Some((name, _)) = split_option(arg) else {
                     continue;
                 };
+                if !has_d3d11 && name.starts_with("d3d11-") {
+                    not_here.insert(name.to_string());
+                    continue;
+                }
                 names.insert(name.to_string());
                 // mpv accepts --no-<flag> for every boolean option.
                 let bare = name.strip_prefix("no-").unwrap_or(name);
                 if !known.contains_key(name) && !known.contains_key(bare) {
-                    unknown.insert(name.to_string());
+                    if MAC_ONLY.contains(&name) && !known.keys().any(|known| known.starts_with("macos-")) {
+                        mac_only.insert(name.to_string());
+                    } else {
+                        unknown.insert(name.to_string());
+                    }
                 }
             }
         }
@@ -125,8 +144,14 @@ fn every_generated_mpv_option_exists() {
             "{platform:?}: mpv does not know these options: {unknown:?}"
         );
         note(&format!(
-            "mpv knows all {} option names of the {platform:?} argument lists",
-            names.len()
+            "mpv knows all {} option names of the {platform:?} argument lists{}",
+            names.len() - mac_only.len(),
+            if mac_only.is_empty() { String::new() } else { format!(" ({mac_only:?}: not an mpv for macOS, unchecked)") }
+        ));
+    }
+    if !not_here.is_empty() {
+        note(&format!(
+            "this mpv has no Direct3D 11, so {not_here:?} went unchecked (an mpv on Windows checks them)"
         ));
     }
 }
@@ -255,6 +280,8 @@ fn mpv_accepts_the_generated_command_line() {
                         && !a.starts_with("--vo=") // no window during a test run
                         && !a.starts_with("--gpu-api=")
                         && !a.starts_with("--hwdec=")
+                        // the Mac's own options: only an mpv on a Mac has them
+                        && (cfg!(target_os = "macos") || !MAC_ONLY.iter().any(|o| a.starts_with(&format!("--{o}="))))
                 })
                 .cloned()
                 .collect();

@@ -620,6 +620,13 @@ pub fn watch_set_mute(app: Shared<'_>, muted: bool) {
     crate::watch::set_mute(&app, muted);
 }
 
+/// Another of the host's displays, from the panel over the player: the viewer who controls the host may pick the
+/// one it shares (docs/design.md §9.2).
+#[tauri::command(async)]
+pub fn watch_set_display(app: Shared<'_>, id: u8) -> CmdResult<()> {
+    crate::watch::pick_display(&app, id)
+}
+
 // ---- the panel over the player ------------------------------------------------------------------------------------
 // Async, all of them: laying the panel out waits for the main thread.
 

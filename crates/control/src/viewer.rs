@@ -36,6 +36,8 @@ pub enum ControlState {
 pub struct ViewerControl {
     channel: Channel,
     wants: bool,
+    /// The keys come from a Mac's keyboard (see [`ViewerControl::with_mac_keyboard`]).
+    mac_keyboard: bool,
     grant: Option<GrantState>,
     pointer: (u16, u16, bool),
     dirty: bool,
@@ -53,6 +55,7 @@ impl ViewerControl {
         Self {
             channel: Channel::viewer(key),
             wants: wants_control,
+            mac_keyboard: false,
             grant: None,
             pointer: (0, 0, false),
             dirty: false,
@@ -61,6 +64,13 @@ impl ViewerControl {
             started_us: now_us,
             last_send_us: i64::MIN / 2,
         }
+    }
+
+    /// The keys come from a Mac's keyboard, where Command is the key for Ctrl's shortcuts: the host is told, and
+    /// one that is not a Mac takes Command as Ctrl and Control as the Windows key (docs/design.md §9).
+    pub fn with_mac_keyboard(mut self, mac: bool) -> Self {
+        self.mac_keyboard = mac;
+        self
     }
 
     pub fn state(&self, now_us: i64) -> ControlState {
@@ -181,6 +191,7 @@ impl ViewerControl {
         let events: Vec<Event> = self.pending.iter().take(MAX_EVENTS_PER_PACKET).map(|(_, e)| *e).collect();
         let msg = ViewerMessage {
             wants_control: self.wants,
+            mac_keyboard: self.mac_keyboard,
             pointer_x: self.pointer.0,
             pointer_y: self.pointer.1,
             pointer_inside: self.pointer.2 && self.granted(),

@@ -461,9 +461,10 @@ mod mpv_command_line {
 mod macos {
     use super::*;
 
-    /// The macOS list: the Windows one without `--gpu-api=d3d11`, with VideoToolbox as the hardware decoder.
+    /// The macOS list: the Windows one without `--gpu-api=d3d11`, with VideoToolbox as the hardware decoder and
+    /// macOS's window options in place of Windows' media overlay one.
     #[test]
-    fn the_mac_argument_list_differs_only_in_the_gpu_api_and_the_decoder() {
+    fn the_mac_argument_list_differs_only_in_the_gpu_api_the_decoder_and_the_window_options() {
         let s = ReceiverSettings {
             display_mode: DisplayMode::HdrPassthrough,
             ..settings(DisplayMode::Auto)
@@ -504,6 +505,8 @@ mod macos {
             "--force-window=yes",
             "--osc=no",
             "--osd-bar=no",
+            "--macos-menu-shortcuts=no",
+            "--native-fs=no",
             "--title=HdrCast",
             "--msg-level=all=info",
             "--term-status-msg=",
@@ -511,8 +514,8 @@ mod macos {
         ];
         assert_eq!(mac.mpv_args, expected);
 
-        // the same settings on Windows: two arguments more (the D3D11 API, no Windows media overlay), one
-        // different, the rest identical
+        // the same settings on Windows: two arguments of its own (the D3D11 API, no Windows media overlay) where the
+        // Mac has two (no menu bar shortcuts, full screen on the same Space), one different, the rest identical
         let windows = mpv_command::build(
             &s,
             LOCAL_PORT,
@@ -528,11 +531,16 @@ mod macos {
             .iter()
             .filter(|a| *a != "--gpu-api=d3d11" && *a != "--media-controls=no")
             .collect();
-        assert_eq!(without.len(), mac.mpv_args.len());
+        let mac_without: Vec<&String> = mac
+            .mpv_args
+            .iter()
+            .filter(|a| *a != "--macos-menu-shortcuts=no" && *a != "--native-fs=no")
+            .collect();
+        assert_eq!(without.len(), mac_without.len());
         let different: Vec<_> = without
             .iter()
-            .zip(&mac.mpv_args)
-            .filter(|(w, m)| **w != *m)
+            .zip(&mac_without)
+            .filter(|(w, m)| **w != **m)
             .collect();
         assert_eq!(different.len(), 1, "{different:?}");
         assert_eq!(

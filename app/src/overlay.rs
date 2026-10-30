@@ -6,9 +6,10 @@
 //! Ctrl+Alt+O in the player window and the button on the Watch page open and fold the panel too; Esc and the panel's
 //! own fold button fold it. The button and the panel can be dragged anywhere: the place is kept relative to the
 //! player's picture, so it goes along when the player's window moves or turns full screen, and it is remembered
-//! (`overlay.json` beside the settings). Neither takes the keyboard from the player by appearing, and both are out
-//! of sight while another program is in front (on top of everything otherwise). Finding the player's window, that
-//! last part and dragging are Windows only so far: elsewhere the button sits on the screen HdrCast's window is on.
+//! (`overlay.json` beside the settings). Neither takes the keyboard from the player by appearing, and both stay on
+//! the player's window: they are on top of everything, so they go out of sight where another window would be
+//! behind them (Windows: while another program is in front; macOS: while another window covers their place on the
+//! player). On Linux the button sits on the screen HdrCast's window is on instead.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -251,6 +252,12 @@ fn create(handle: &AppHandle) -> tauri::Result<WebviewWindow> {
         // shown by `set_visible`, which never takes the keyboard from the player
         .visible(false)
         .focused(false);
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        // on every Space, so that it is there wherever the player's window is
+        .visible_on_all_workspaces(true)
+        // the first click on it counts, also while the player is the application in front
+        .accept_first_mouse(true);
     crate::window::web_view_profile(builder).build()
 }
 
@@ -307,13 +314,13 @@ impl Keeper {
         if self.handle.is_none() {
             self.handle = platform::handle(window);
         }
-        let Some(handle) = self.handle.clone() else { return };
+        let Some(handle) = self.handle.as_ref().cloned() else { return };
         if platform::being_dragged(&handle) {
             self.dragging = true;
             return;
         }
         let player = crate::watch::player_pid(app);
-        let seen = player.and_then(platform::player_area).or_else(|| {
+        let seen = player.and_then(|pid| platform::player_area(&handle, pid)).or_else(|| {
             // where the player's window cannot be looked for, the screen stands in for it
             (!platform::FINDS_PLAYER && player.is_some()).then(|| screen_area(app, window)).flatten()
         });
@@ -355,7 +362,8 @@ impl Keeper {
         }
 
         // nothing in front (a moment during a switch): as it was
-        let wanted = area.is_some() && (seen.is_some() || expanded) && platform::in_front(player).unwrap_or(self.shown);
+        let wanted =
+            area.is_some() && (seen.is_some() || expanded) && platform::in_front(&handle, player, self.placed).unwrap_or(self.shown);
         if wanted != self.shown {
             self.shown = wanted;
             platform::show(&handle, wanted);
@@ -365,6 +373,10 @@ impl Keeper {
     /// A drag ended: the button's spot is where it (or the panel) was dropped, kept on the picture.
     fn dropped(&mut self, app: &AppState, window: &WebviewWindow, handle: &platform::Handle, expanded: bool) {
         let (Some(area), Some(now)) = (self.area, platform::client_rect(handle)) else { return };
+        if self.placed == Some(now) {
+            // pressed, not moved (a Mac reports every press on it: a click on the button or in the panel)
+            return;
+        }
         let (scale, _) = monitor_at(window, area);
         let before = self.spot.unwrap_or_default();
         let spot = if expanded { spot_of_panel(now, area, scale, before) } else { spot_of(now.x, now.y, area, scale) };
@@ -380,15 +392,12 @@ impl Keeper {
     }
 }
 
-/// The scale of the screen at the middle of `area`, and the part of that screen windows may use.
+/// The scale of the screen at the middle of `area` (the one layout works in, see [`platform::layout_scale`]), and the
+/// part of that screen windows may use.
 fn monitor_at(window: &WebviewWindow, area: Rect) -> (f64, Rect) {
     let monitor = window.monitor_from_point(f64::from(area.x + area.w / 2), f64::from(area.y + area.h / 2)).ok().flatten();
     match monitor {
-        Some(m) => {
-            let work = m.work_area();
-            let screen = Rect { x: work.position.x, y: work.position.y, w: work.size.width as i32, h: work.size.height as i32 };
-            (m.scale_factor(), screen)
-        }
+        Some(m) => (platform::layout_scale(&m), platform::work_area(&m)),
         None => (1.0, area),
     }
 }
@@ -399,15 +408,21 @@ fn screen_area(app: &AppState, window: &WebviewWindow) -> Option<Rect> {
     let monitor = main
         .and_then(|w| w.current_monitor().ok().flatten())
         .or_else(|| window.primary_monitor().ok().flatten())?;
+    Some(platform::work_area(&monitor))
+}
+
+/// The part of a screen windows may use, in the window library's physical pixels.
+#[cfg(not(target_os = "macos"))]
+fn physical_work_area(monitor: &tauri::Monitor) -> Rect {
     let work = monitor.work_area();
-    Some(Rect { x: work.position.x, y: work.position.y, w: work.size.width as i32, h: work.size.height as i32 })
+    Rect { x: work.position.x, y: work.position.y, w: work.size.width as i32, h: work.size.height as i32 }
 }
 
 #[cfg(windows)]
 mod platform {
     use std::ffi::c_void;
 
-    use tauri::WebviewWindow;
+    use tauri::{Monitor, WebviewWindow};
     use windows::core::BOOL;
     use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
     use windows::Win32::Graphics::Gdi::ClientToScreen;
@@ -426,6 +441,15 @@ mod platform {
 
     pub fn handle(window: &WebviewWindow) -> Option<Handle> {
         window.hwnd().ok().map(|hwnd| hwnd.0 as isize)
+    }
+
+    /// Layout works in physical pixels here: sizes are scaled for the screen they are on.
+    pub fn layout_scale(monitor: &Monitor) -> f64 {
+        monitor.scale_factor()
+    }
+
+    pub fn work_area(monitor: &Monitor) -> Rect {
+        super::physical_work_area(monitor)
     }
 
     fn hwnd(handle: &Handle) -> HWND {
@@ -483,7 +507,7 @@ mod platform {
     }
 
     /// Where mpv (process `pid`) shows the picture on the screen; None while it has no window or is minimized.
-    pub fn player_area(pid: u32) -> Option<Rect> {
+    pub fn player_area(_handle: &Handle, pid: u32) -> Option<Rect> {
         let hwnd = player_window(pid)?;
         // SAFETY: a query on a window handle EnumWindows just returned.
         if unsafe { IsIconic(hwnd) }.as_bool() {
@@ -548,7 +572,7 @@ mod platform {
 
     /// Whether the window in front belongs to the player (process `player`) or to HdrCast itself: its windows, and
     /// anything they own. None while no window is in front (for a moment during a switch).
-    pub fn in_front(player: Option<u32>) -> Option<bool> {
+    pub fn in_front(_handle: &Handle, player: Option<u32>, _at: Option<Rect>) -> Option<bool> {
         // SAFETY: plain queries.
         let (front, owner) = unsafe {
             let front = GetForegroundWindow();
@@ -571,10 +595,245 @@ mod platform {
     }
 }
 
-/// Elsewhere the window library does the work: the button goes on the screen's corner and stays up while watching.
-#[cfg(not(windows))]
+/// macOS: the window server's list of windows (CoreGraphics) and AppKit. Places here are in points of the global
+/// display space (0, 0 at the top left of the main display), which is what the window library's logical positions
+/// are on a Mac: the layout works in points, whatever the screen's scale.
+#[cfg(target_os = "macos")]
 mod platform {
-    use tauri::{PhysicalPosition, PhysicalSize, WebviewWindow};
+    use std::sync::{Arc, Mutex};
+
+    use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication, NSWindow};
+    use objc2_core_foundation::{CFDictionary, CFNumber, CFString, CFType, CGRect};
+    use objc2_core_graphics::{
+        kCGWindowAlpha, kCGWindowBounds, kCGWindowLayer, kCGWindowNumber, kCGWindowOwnerPID, CGEvent, CGEventSource,
+        CGEventSourceStateID, CGMouseButton, CGRectMakeWithDictionaryRepresentation, CGWindowListCopyWindowInfo,
+        CGWindowListOption,
+    };
+    use tauri::{LogicalPosition, LogicalSize, Manager, Monitor, WebviewWindow};
+
+    use super::Rect;
+
+    pub const FINDS_PLAYER: bool = true;
+
+    #[derive(Default)]
+    struct Seen {
+        /// The window server's number for the player's window, as last found.
+        player_window: Option<u32>,
+        /// The left mouse button was down at the last look.
+        button_down: bool,
+        /// It went down over this window.
+        pressed_here: bool,
+    }
+
+    #[derive(Clone)]
+    pub struct Handle {
+        window: WebviewWindow,
+        seen: Arc<Mutex<Seen>>,
+    }
+
+    pub fn handle(window: &WebviewWindow) -> Option<Handle> {
+        Some(Handle { window: window.clone(), seen: Arc::default() })
+    }
+
+    pub fn layout_scale(_monitor: &Monitor) -> f64 {
+        1.0
+    }
+
+    /// The part of the screen windows may use, in points.
+    pub fn work_area(monitor: &Monitor) -> Rect {
+        let (work, scale) = (monitor.work_area(), monitor.scale_factor());
+        let points = |v: f64| (v / scale).round() as i32;
+        Rect {
+            x: points(f64::from(work.position.x)),
+            y: points(f64::from(work.position.y)),
+            w: points(f64::from(work.size.width)),
+            h: points(f64::from(work.size.height)),
+        }
+    }
+
+    /// A window on the screen, as the window server describes it.
+    struct Listed {
+        number: u32,
+        pid: i64,
+        layer: i64,
+        alpha: f64,
+        bounds: Rect,
+    }
+
+    /// The value under `key` in a window's description.
+    fn value<'a>(info: &'a CFDictionary, key: &CFString) -> Option<&'a CFType> {
+        // SAFETY: the key is a CFString, the key type of these dictionaries; the value (if any) is a CF object the
+        // dictionary keeps alive for as long as it lives itself.
+        unsafe { info.value((key as *const CFString).cast()).cast::<CFType>().as_ref() }
+    }
+
+    fn number(info: &CFDictionary, key: &CFString) -> Option<f64> {
+        value(info, key)?.downcast_ref::<CFNumber>()?.as_f64()
+    }
+
+    fn listed(info: &CFDictionary) -> Option<Listed> {
+        // SAFETY (the keys): constant CFStrings exported by CoreGraphics, valid for the life of the process.
+        let (number_key, pid_key, layer_key, alpha_key, bounds_key) =
+            unsafe { (kCGWindowNumber, kCGWindowOwnerPID, kCGWindowLayer, kCGWindowAlpha, kCGWindowBounds) };
+        let bounds = value(info, bounds_key)?.downcast_ref::<CFDictionary>()?;
+        let mut rect = CGRect::default();
+        // SAFETY: `bounds` is a rectangle in the window server's dictionary form (X, Y, Width, Height), and `rect` a
+        // valid place for the result.
+        if !unsafe { CGRectMakeWithDictionaryRepresentation(Some(bounds), &mut rect) } {
+            return None;
+        }
+        Some(Listed {
+            number: number(info, number_key)? as u32,
+            pid: number(info, pid_key)? as i64,
+            layer: number(info, layer_key).unwrap_or(0.0) as i64,
+            alpha: number(info, alpha_key).unwrap_or(1.0),
+            bounds: Rect {
+                x: rect.origin.x.round() as i32,
+                y: rect.origin.y.round() as i32,
+                w: rect.size.width.round() as i32,
+                h: rect.size.height.round() as i32,
+            },
+        })
+    }
+
+    /// The windows on the screen, frontmost first; with `above`, only those in front of that one.
+    fn windows(above: Option<u32>) -> Vec<Listed> {
+        let which = match above {
+            Some(_) => CGWindowListOption::OptionOnScreenAboveWindow,
+            None => CGWindowListOption::OptionOnScreenOnly,
+        };
+        let Some(list) = CGWindowListCopyWindowInfo(which | CGWindowListOption::ExcludeDesktopElements, above.unwrap_or(0))
+        else {
+            return Vec::new();
+        };
+        (0..list.count())
+            .filter_map(|i| {
+                // SAFETY: `i` is in bounds; the array holds one CFDictionary per window, which it keeps alive, and the
+                // element is only taken as some CF object until its type is checked.
+                let item = unsafe { list.value_at_index(i).cast::<CFType>().as_ref() }?;
+                listed(item.downcast_ref::<CFDictionary>()?)
+            })
+            .collect()
+    }
+
+    /// Where mpv (process `pid`) shows the picture: its largest window in the normal layer that is on the screen
+    /// (none while it is minimized, on another Space, or has no window yet). mpv draws the picture under its title
+    /// bar as well (the bar only shows while the mouse moves near it), so the whole window is the picture.
+    pub fn player_area(handle: &Handle, pid: u32) -> Option<Rect> {
+        let player = windows(None)
+            .into_iter()
+            .filter(|w| w.pid == i64::from(pid) && w.layer == 0 && w.alpha > 0.0 && w.bounds.w > 0 && w.bounds.h > 0)
+            .max_by_key(|w| i64::from(w.bounds.w) * i64::from(w.bounds.h));
+        handle.seen.lock().unwrap().player_window = player.as_ref().map(|w| w.number);
+        player.map(|w| w.bounds)
+    }
+
+    pub fn client_rect(handle: &Handle) -> Option<Rect> {
+        let window = &handle.window;
+        let scale = window.scale_factor().ok()?;
+        let position = window.inner_position().ok()?.to_logical::<f64>(scale);
+        let size = window.inner_size().ok()?.to_logical::<f64>(scale);
+        Some(Rect {
+            x: position.x.round() as i32,
+            y: position.y.round() as i32,
+            w: size.width.round() as i32,
+            h: size.height.round() as i32,
+        })
+    }
+
+    pub fn put(handle: &Handle, rect: Rect) {
+        let _ = handle.window.set_size(LogicalSize::new(f64::from(rect.w.max(1)), f64::from(rect.h.max(1))));
+        let _ = handle.window.set_position(LogicalPosition::new(f64::from(rect.x), f64::from(rect.y)));
+    }
+
+    /// Shown without taking the keyboard: the window library's `show` makes the window the key one, so it is put up
+    /// with `orderFrontRegardless` instead (and taken down with `orderOut:`).
+    pub fn show(handle: &Handle, visible: bool) {
+        let app = handle.window.app_handle().clone();
+        let _ = handle.window.run_on_main_thread(move || {
+            // looked up on the main thread, which is also where windows are closed: never one that is gone
+            let Some(window) = app.get_webview_window(super::LABEL) else { return };
+            let Ok(ns_window) = window.ns_window() else { return };
+            // SAFETY: the NSWindow of the panel's window, which is open (just looked up, on the thread that closes
+            // windows); AppKit is used on the main thread.
+            let ns_window = unsafe { &*ns_window.cast::<NSWindow>() };
+            if visible {
+                ns_window.orderFrontRegardless();
+            } else {
+                ns_window.orderOut(None);
+            }
+        });
+    }
+
+    /// The left mouse button went down over this window and is still down: a drag of it (the system moves it), or a
+    /// click in it. Neither is laid out over.
+    pub fn being_dragged(handle: &Handle) -> bool {
+        let down = CGEventSource::button_state(CGEventSourceStateID::CombinedSessionState, CGMouseButton::Left);
+        let fresh = down && !handle.seen.lock().unwrap().button_down;
+        // where the press was, near enough: the pointer now (the window follows it while it is dragged)
+        let here = fresh && {
+            let pointer = CGEvent::new(None).map(|event| CGEvent::location(Some(&*event)));
+            match (pointer, client_rect(handle)) {
+                (Some(p), Some(r)) => {
+                    p.x >= f64::from(r.x) && p.x < f64::from(r.right()) && p.y >= f64::from(r.y) && p.y < f64::from(r.bottom())
+                }
+                _ => false,
+            }
+        };
+        let mut seen = handle.seen.lock().unwrap();
+        if fresh {
+            seen.pressed_here = here;
+        }
+        seen.button_down = down;
+        down && seen.pressed_here
+    }
+
+    fn is_active(pid: u32) -> bool {
+        libc::pid_t::try_from(pid)
+            .ok()
+            .and_then(NSRunningApplication::runningApplicationWithProcessIdentifier)
+            .is_some_and(|app| app.isActive())
+    }
+
+    /// HdrCast is the application in front (its window was just used).
+    pub fn is_front(_handle: &Handle) -> bool {
+        NSRunningApplication::currentApplication().isActive()
+    }
+
+    /// No other window lies over the panel's place `at` on the player's window: the windows in front of the player's
+    /// in the normal layer are looked at (HdrCast's main window counts too; this one floats above that layer). Without
+    /// a window of the player to look at, as on Windows: up while the player or HdrCast is the application in front.
+    pub fn in_front(handle: &Handle, player: Option<u32>, at: Option<Rect>) -> Option<bool> {
+        let player_window = handle.seen.lock().unwrap().player_window;
+        let (Some(pid), Some(number), Some(at)) = (player, player_window, at) else {
+            return Some(is_active(std::process::id()) || player.is_some_and(is_active));
+        };
+        let covered = windows(Some(number)).iter().any(|w| {
+            w.layer == 0
+                && w.alpha > 0.0
+                && w.pid != i64::from(pid)
+                && w.bounds.x < at.right()
+                && at.x < w.bounds.right()
+                && w.bounds.y < at.bottom()
+                && at.y < w.bounds.bottom()
+        });
+        Some(!covered)
+    }
+
+    /// Hands the keyboard to the player. HdrCast is the application in front at that moment (its panel was just
+    /// used), which is when macOS lets it pass that on.
+    #[allow(deprecated)] // "ignoring other apps": without effect from macOS 14 on, where an app in front may do this anyway
+    pub fn activate(pid: u32) {
+        if let Some(app) = libc::pid_t::try_from(pid).ok().and_then(NSRunningApplication::runningApplicationWithProcessIdentifier) {
+            let _ = app.activateWithOptions(NSApplicationActivationOptions::ActivateIgnoringOtherApps);
+        }
+    }
+}
+
+/// Elsewhere the window library does the work: the button goes on the screen's corner and stays up while watching.
+#[cfg(not(any(windows, target_os = "macos")))]
+mod platform {
+    use tauri::{Monitor, PhysicalPosition, PhysicalSize, WebviewWindow};
 
     use super::Rect;
 
@@ -586,7 +845,15 @@ mod platform {
         Some(window.clone())
     }
 
-    pub fn player_area(_pid: u32) -> Option<Rect> {
+    pub fn layout_scale(monitor: &Monitor) -> f64 {
+        monitor.scale_factor()
+    }
+
+    pub fn work_area(monitor: &Monitor) -> Rect {
+        super::physical_work_area(monitor)
+    }
+
+    pub fn player_area(_window: &Handle, _pid: u32) -> Option<Rect> {
         None
     }
 
@@ -612,7 +879,7 @@ mod platform {
         false
     }
 
-    pub fn in_front(_player: Option<u32>) -> Option<bool> {
+    pub fn in_front(_window: &Handle, _player: Option<u32>, _at: Option<Rect>) -> Option<bool> {
         Some(true)
     }
 

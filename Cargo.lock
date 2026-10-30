@@ -1437,7 +1437,7 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "hdrcast"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "arboard",
  "chrono",
@@ -1447,6 +1447,10 @@ dependencies = [
  "hdrcast-media",
  "hdrcast-p2p",
  "libc",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
  "rfd",
  "serde",
  "serde_json",
@@ -1458,7 +1462,7 @@ dependencies = [
 
 [[package]]
 name = "hdrcast-capture"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "block2",
  "dispatch2",
@@ -1480,7 +1484,7 @@ dependencies = [
 
 [[package]]
 name = "hdrcast-control"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "chacha20poly1305",
  "core-foundation",
@@ -1490,7 +1494,7 @@ dependencies = [
 
 [[package]]
 name = "hdrcast-core"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "ed25519-dalek",
  "getrandom 0.4.3",
@@ -1509,7 +1513,7 @@ dependencies = [
 
 [[package]]
 name = "hdrcast-media"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "chacha20poly1305",
  "hdrcast-capture",
@@ -1522,7 +1526,7 @@ dependencies = [
 
 [[package]]
 name = "hdrcast-p2p"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "hdrcast-core",
  "hdrcast-media",
@@ -2300,6 +2304,7 @@ checksum = "d49e936b501e5c5bf01fda3a9452ff86dc3ea98ad5f283e1455153142d97518c"
 dependencies = [
  "bitflags 2.13.2",
  "block2",
+ "libc",
  "objc2",
  "objc2-core-foundation",
  "objc2-core-graphics",

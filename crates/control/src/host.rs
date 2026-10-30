@@ -26,6 +26,10 @@ enum Decision {
 
 /// Answers are sent at most this often (plus at once when the grant changes).
 const REPLY_INTERVAL_US: i64 = 10_000;
+/// A Mac's Command key is the one its user presses for the shortcuts a PC has on Ctrl (Command+C, Command+V...):
+/// on a host that is not a Mac it acts as Ctrl, and Control as the Windows key, the way Parsec's "Swap Command and
+/// Ctrl for macOS" has it. A Mac host keeps them as they are.
+const SWAPS_COMMAND_AND_CONTROL: bool = !cfg!(target_os = "macos");
 /// Nothing heard from the viewer for this long: let go of everything it was holding down.
 const RELEASE_AFTER_US: i64 = 1_500_000;
 
@@ -36,6 +40,8 @@ pub struct HostControl {
     policy: Grant,
     decision: Decision,
     wants: bool,
+    /// The viewer types on a Mac's keyboard (it says so in every datagram).
+    mac_keyboard: bool,
     applied_seq: u32,
     pointer: (u16, u16),
     held_keys: HashSet<u32>,
@@ -58,6 +64,7 @@ impl HostControl {
             policy,
             decision: Decision::Undecided,
             wants: false,
+            mac_keyboard: false,
             applied_seq: 0,
             pointer: (u16::MAX, u16::MAX),
             held_keys: HashSet::new(),
@@ -140,6 +147,7 @@ impl HostControl {
         let plain = self.channel.open(datagram)?;
         let msg = ViewerMessage::decode(&plain)?;
         self.last_heard_us = now_us;
+        self.mac_keyboard = msg.mac_keyboard;
         if msg.wants_control != self.wants {
             self.wants = msg.wants_control;
             if !self.wants {
@@ -191,10 +199,11 @@ impl HostControl {
             }
             self.applied_seq = seq;
             self.input_events += 1;
+            let mods = self.host_mods(event.mods);
             match event.kind {
                 EventKind::KeyDown => {
                     let Some(key) = Key::from_code(event.code) else { continue };
-                    self.sync_mods(event.mods);
+                    self.sync_mods(mods);
                     self.held_keys.insert(event.code);
                     self.injector.key(key, true);
                 }
@@ -207,7 +216,7 @@ impl HostControl {
                 }
                 EventKind::ButtonDown => {
                     let Some(button) = Button::from_code(event.code) else { continue };
-                    self.sync_mods(event.mods);
+                    self.sync_mods(mods);
                     self.held_buttons.insert(event.code);
                     self.injector.button(button, true);
                 }
@@ -219,7 +228,7 @@ impl HostControl {
                     self.release_mods_if_idle();
                 }
                 EventKind::Wheel => {
-                    self.sync_mods(event.mods);
+                    self.sync_mods(mods);
                     self.injector.wheel(event.code as u8, event.arg);
                     self.release_mods_if_idle();
                 }
@@ -231,6 +240,22 @@ impl HostControl {
                 }
             }
         }
+    }
+
+    /// An event's modifiers as this computer's keys: a Mac's Command and Control trade places on a host that is not a
+    /// Mac ([`SWAPS_COMMAND_AND_CONTROL`]).
+    fn host_mods(&self, mods: u8) -> u8 {
+        if !(self.mac_keyboard && SWAPS_COMMAND_AND_CONTROL) {
+            return mods;
+        }
+        let mut swapped = mods & !(Mods::CTRL | Mods::META);
+        if mods & Mods::META != 0 {
+            swapped |= Mods::CTRL;
+        }
+        if mods & Mods::CTRL != 0 {
+            swapped |= Mods::META;
+        }
+        swapped
     }
 
     /// Presses and releases modifier keys until exactly `wanted` are down. mpv reports modifiers only as part of
@@ -511,6 +536,54 @@ mod tests {
         host.tick(now);
         assert_eq!(rec.take(), ["Tab up", "mod4 up"]);
         let _ = NamedKey::Tab;
+    }
+
+    #[test]
+    fn a_macs_command_key_acts_as_ctrl_and_its_control_key_as_the_windows_key() {
+        let rec = Recorder::default();
+        let mut host = HostControl::new(&KEY, Grant::Allow, Box::new(rec.clone()));
+        let mut viewer = ViewerControl::new(&KEY, true, 0).with_mac_keyboard(true);
+        let mut now = 0;
+        exchange(&mut viewer, &mut host, &mut now, 3);
+        // mpv on a Mac: Command is Meta, Control is Ctrl, Option is Alt
+        for name in ["Meta+c", "Ctrl+RIGHT", "Alt+Meta+z", "Meta+MBTN_LEFT"] {
+            viewer.key_binding("d-", name);
+            viewer.key_binding("u-", name);
+        }
+        exchange(&mut viewer, &mut host, &mut now, 3);
+        // Ctrl is 2 and Meta (the Windows key, or Command on a Mac host) 8
+        let (command, control) = if cfg!(target_os = "macos") { (8, 2) } else { (2, 8) };
+        assert_eq!(
+            rec.take(),
+            [
+                format!("mod{command} down"),
+                "c down".into(),
+                "c up".into(),
+                format!("mod{command} up"),
+                format!("mod{control} down"),
+                "Right down".into(),
+                "Right up".into(),
+                format!("mod{control} up"),
+                format!("mod{} down", command.min(4)),
+                format!("mod{} down", command.max(4)),
+                "z down".into(),
+                "z up".into(),
+                format!("mod{} up", command.min(4)),
+                format!("mod{} up", command.max(4)),
+                format!("mod{command} down"),
+                "Left down".into(),
+                "Left up".into(),
+                format!("mod{command} up"),
+            ]
+        );
+
+        // a PC's keyboard is taken as it is
+        let (mut pc, mut host, rec) = pair(Grant::Allow);
+        exchange(&mut pc, &mut host, &mut now, 3);
+        pc.key_binding("d-", "Meta+e");
+        pc.key_binding("u-", "Meta+e");
+        exchange(&mut pc, &mut host, &mut now, 3);
+        assert_eq!(rec.take(), ["mod8 down", "e down", "e up", "mod8 up"]);
     }
 
     #[test]

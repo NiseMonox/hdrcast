@@ -104,7 +104,9 @@ sharer's computer. No relay server, no public IPv4 address, no port forwarding t
 5. While you watch, a small round button sits on the picture (top right; drag it anywhere and it stays there next time).
    Click it, or press `Ctrl + Alt + O` in the player, for the **overlay**: what arrives (resolution, frame rate, bitrate,
    ping, loss), the **Delay** (**Apply** connects again with it: the picture stops for a few seconds), the **Decoder** and
-   **Mute** (both at once), and **Full Screen**. The player window has no controls or shortcuts of its own:
+   **Mute** (both at once), **Full Screen** and **Disconnect**. While you control the sharer, its **Display** row picks which
+   of the sharer's displays it shares (both need 0.3.9). The button and the overlay only show on the player's window: they
+   get out of the way when another window comes in front. The player window has no controls or shortcuts of its own:
    `Ctrl + Alt + Enter` switches full screen, `Esc` leaves it, and closing the window stops watching.
 
 The delay is there on purpose: this is a broadcast that rides out a bumpy connection, not a remote desktop. For remote
@@ -176,6 +178,10 @@ the overlay, stay with your player).
 and wait for them to allow it. The sharer can **Take Back** control or **Disconnect** you at any time (after a disconnect
 you cannot connect again for a minute).
 
+- On a Mac, `Command` acts as `Ctrl` on a Windows sharer and `Control` as the Windows key (`Command + C` copies), as with
+  Parsec's *Swap Command and Ctrl*; `Option` is `Alt` (0.3.9 on both sides; an older sharer takes `Command` as the Windows
+  key). Shortcuts macOS keeps for itself (`Command + Tab`, `Command + Space`, `Control + arrows`) and a key such as
+  `Control` or `Shift` pressed on its own do not reach the sharer.
 - To use the other computer, connect in **Control mode** (below): the picture is tens of milliseconds behind instead of
   the seconds of watching. Watching keeps the SRT delay and the player buffer, which is right for watching and feels slow
   for using a computer. There is no relative mouse yet (games that capture the mouse do not work).

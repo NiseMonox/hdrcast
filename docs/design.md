@@ -476,6 +476,10 @@ mpv --vo=gpu-next --gpu-api=d3d11 --hwdec=d3d11va
 - `--media-controls=no`（0.3.3 起，只在 Windows 上；mpv 0.39 起才有这个选项）：直播用不着 Windows 的媒体控制浮层。它还避免 mpv 退出时卡住：
   关掉屏幕控制栏后，mpv 0.41 打开失败时每次都卡在媒体控制（SystemMediaTransportControls）的收尾里，直到 12 s 后被杀掉，加上这个选项后 0.2 s 就退出了
   （2026-10-24 实测）。应用要等 mpv 退出才会重连，所以这一项不能省。
+- `--macos-menu-shortcuts=no --native-fs=no`（0.3.9 起，只在 macOS 上）：mpv 菜单栏的快捷键（`Cmd+Q` 退出、`Cmd+W` 关闭、`Cmd+C` / `Cmd+V` /
+  `Cmd+X` / `Cmd+Z` / `Cmd+A`、`Cmd+0/1/2` 改窗口大小、`Cmd+H`、`Cmd+M`、`Cmd+O`……）在任何绑定之前就被菜单拿走，远程控制时这些 `Command` 组合到不了
+  主播（`Cmd+Q` 还会把播放器关掉）；关掉后它们和别的键一样走输入段（§9）。全屏不再开一个自己的 Space（原生全屏），而是在当前 Space 里铺满屏幕
+  （无边框，自动隐藏菜单栏和程序坞，窗口层级不变），悬浮窗才能留在画面上（§3.3）。
 - `rcvbuf/ffs` **必须**按 码率 × 延迟 计算（否则 > 40 Mbps + 2 s 时 libsrt 会 "No room to store incoming packet" 断线）。码率由用户在 GUI 填（或默认按 100 Mbps × 延迟上限算，宁大勿小）。
 - mpv 只在打洞路径建好后启动；之后路径断了由 ViewerSession 在同一个本地端口上重新加入，mpv 每 3 s 自己重连。
 - HDR 直通只在 `--wid` 嵌入或独立窗口下都以「窗口化 HDR」工作，静态元数据只在全屏时下发 → 提供全屏按钮（`--fs`，不用 `--d3d11-exclusive-fs`）。
@@ -528,11 +532,14 @@ Moonlight 的做法是：一帧不完整就丢掉，之后的帧也全丢，直�
 ### 3.3 播放器上的悬浮窗（0.3.3 起）
 
 像 Parsec / Moonlight 那样，观看时不用切回 HdrCast 的窗口就能看状态、改观众自己能改的东西（`app/src/overlay.rs`、`ui/overlay.html` + `overlay.js`）。
-编码（码率、分辨率、帧率、编码器）是主播的事，在主播的开播页改（§2.7 的"分享中改设置"）；观众这边能改的只有延迟、解码方式和静音。
+编码（码率、分辨率、帧率、编码器）是主播的事，在主播的开播页改（§2.7 的"分享中改设置"）；观众这边能改的只有延迟、解码方式和静音，
+控制着主播时还能选主播分享哪块显示器（0.3.9 起，§9.2）。**断开连接** 停止观看。
 
 - **样子**：开始观看就有一个小圆按钮（40 × 40，半透明，鼠标移上去才不透明）停在播放画面右上角；mpv 的窗口出来之前不显示。单击按钮展开成面板（宽 300，
   高度由页面量出来交给后端，`overlay_fit`）：主播名和播放时长；收到的分辨率 / 帧率 / HDR；码率、缓冲、Ping、丢包、丢帧、实际在用的解码器；守卫的统计（§3.2）；
-  **延迟**（四个预设 + 数字框，**应用** = 重新加入，下面说明"画面会中断几秒"）；**解码方式**（四个选项，立即生效）；**全屏** / **静音**。
+  **延迟**（四个预设 + 数字框，**应用** = 重新加入，下面说明"画面会中断几秒"）；**显示器**（只在控制着 0.3.9 以上的主播、主播有两块以上的屏时出现：
+  每块一个按钮，写名字和分辨率，正在分享的那块高亮；点别的那块，切换期间写"正在切换…"，§9.2）；**解码方式**（四个选项，立即生效）；**全屏** / **静音**；
+  **断开连接**（0.3.9 起，= 观看页的 **停止**：会话、播放器和悬浮窗一起结束）。
   标题栏的"—"、`Esc`、`Alt+F4` 收起成按钮，键盘交还播放器。播放窗口里的 `Ctrl+Alt+O` 和观看页的 **悬浮窗** 按钮也能展开 / 收起（不抢键盘）。
   始终是深色（画面上不刺眼），只用黑白灰，播放中的红点是唯一的颜色。
 - **独立窗口**：Tauri 的第二个窗口（标签 `overlay`），无边框、透明（页面画圆按钮和圆角面板，周围透出画面）、置顶、不进任务栏，开始观看时建好、停止观看时销毁
@@ -553,12 +560,25 @@ Moonlight 的做法是：一帧不完整就丢掉，之后的帧也全丢，直�
   （`GetGUIThreadInfo` 的 `GUI_INMOVESIZE`，且 `hwndMoveSize` 是悬浮窗）不去动它；松手后按落点算出新的比例（拖出画面的回到画面边上），存进配置目录的
   `overlay.json`，下次观看还在那里。拖的是面板时，按钮跟着面板走：每个方向取面板远的一边（右 / 下）或近的一边，看哪个与按钮落到的半边一致；
   面板横跨中线时两边都一致，保持原来展开的方向，免得收起后按钮跳到另一个角。
-- **只在播放器前面**：只有前台窗口是 mpv、HdrCast 自己的窗口（或它们拥有的弹出窗口，`GA_ROOTOWNER`）时才显示，切到别的程序就藏起来，切回来再出现；
+- **只在播放器前面**（Windows；macOS 见最后一条）：只有前台窗口是 mpv、HdrCast 自己的窗口（或它们拥有的弹出窗口，`GA_ROOTOWNER`）时才显示，切到别的程序就藏起来，切回来再出现；
   前台一时没有窗口（切换过程中）时保持原样。没有 mpv 窗口时（连接中、重新加入、最小化）按钮不显示；展开的面板留在原处，好看到"正在重新连接"。
 - **能改的东西**：解码方式和静音见 §3.1；延迟（`watch_set_latency`）保存后 `watch::rejoin`：结束当前会话、用同一个主播重新 `start`（新的延迟在加入时谈好，
   主播三分钟内自动放行刚走的观众），悬浮窗不关，面板在这几秒里显示"正在重新连接…"。设置页里改硬解也立即生效；两边的改动通过 `receiver` 事件互相同步，
   主窗口之后保存设置时不会把悬浮窗改的值冲掉。
-- **macOS**：还没有找 mpv 窗口和判断前台的实现：按钮放在 HdrCast 窗口所在屏幕的右上角、观看期间一直显示，不跟着播放器，也不记拖动的位置（未在真机上运行）。
+- **macOS**（0.3.9 起；之前按钮放在 HdrCast 窗口所在的屏幕上、一直置顶，用户在 Mac 上看到它浮在所有程序上面。只做过类型检查）：和 Windows 一样只在播放器的
+  窗口上。位置用全局显示空间的点（主屏左上角为 0, 0，也就是窗口库在 Mac 上的逻辑坐标），布局按点算，不按屏幕的缩放乘。
+  - 找播放器：`CGWindowListCopyWindowInfo`（只要屏幕上的）里属于 mpv 进程、在普通层（layer 0）、不透明的最大窗口；最小化、在别的 Space 里时没有。
+    mpv 的标题栏盖在画面上（`fullSizeContentView`，鼠标在上面动时才出来），所以整个窗口就是画面。
+  - 什么时候藏起来：Mac 上一个程序在前台时，别的程序的窗口照样可以露在外面，所以不按"谁在前台"判断，而是每 100 ms 用 `OnScreenAboveWindow` 列出
+    mpv 窗口前面的窗口：普通层里不透明的窗口（mpv 自己的除外，HdrCast 的主窗口也算；悬浮窗自己在浮动层，不在其中）压到悬浮窗那块就藏起来
+    （`orderOut:`），挪开就回来。没有 mpv 窗口可看时
+    （连接中、重新加入）和 Windows 一样：HdrCast 或 mpv 在前台才显示。
+  - 不抢键盘：tao 的 `show()` 用 `makeKeyAndOrderFront:`，改在主线程上用 `orderFrontRegardless`（在主线程上按标签重新找窗口，不会碰到已关掉的）。
+    `accept_first_mouse`：mpv 在前台时第一下点击就算数。收起、拖完按钮后用 `NSRunningApplication activateWithOptions:` 把前台交还 mpv
+    （这时 HdrCast 在前台，系统允许它交出去）。
+  - 拖动：系统拖窗口时窗口跟着指针走、不经过应用，所以按"左键是在悬浮窗上按下的、还按着"（`CGEventSource::button_state` + 按下时指针的位置）
+    当作在拖，这期间不去摆它；松手后照落点算比例。在面板里点按钮也满足这个条件：松手时窗口没挪过就什么都不改（Windows 同样）。
+  - 全屏：mpv 用 `--native-fs=no`（§3.1），全屏还在同一个 Space 里，悬浮窗跟过去；悬浮窗设了 `visible_on_all_workspaces`，mpv 窗口被挪到别的 Space 也找得到。
 
 ## 4. 信令服务器（signal/）
 
@@ -1005,7 +1025,7 @@ answer: "hdrcast/v1/answer-device" gid  sid  t  ok(true|false)  reason  cands  �
  9  ..  ChaCha20-Poly1305(key = controlKey(sid), nonce = dir || 0 0 0 || counter, aad = "HDRCCTL1")
 ```
 
-- 观众→主播明文：版本 1、标志（bit0 = 想要控制）、指针 x / y（0..65535，跨画面）、指针是否在画面内、第一个事件的序号、事件数（≤ 32）、
+- 观众→主播明文：版本 1、标志（bit0 = 想要控制，bit1 = Mac 的键盘，0.3.9 起）、指针 x / y（0..65535，跨画面）、指针是否在画面内、第一个事件的序号、事件数（≤ 32）、
   事件 ×N（各 8 字节：类型 1 键下 / 2 键上 / 3 鼠标键下 / 4 鼠标键上 / 5 滚轮 / 6 文本，修饰键位 Shift=1 Ctrl=2 Alt=4 Meta=8，键码，参数）。
 - 主播→观众明文：版本 1、授权状态（0 不允许 / 1 要问主播（已请求时：等主播回答） / 2 已允许，与观众要不要无关）、已执行到的事件序号。
 - 指针位置取最新；按键、鼠标键、滚轮在收到确认前每 40 ms 重发，主播按序号**只执行一次**。指针移动最多每 8 ms 发一次；没事可说时每 500 ms 发一个心跳
@@ -1018,6 +1038,12 @@ answer: "hdrcast/v1/answer-device" gid  sid  t  ok(true|false)  reason  cands  �
 - 字符键：Windows 用 `VkKeyScanW` 找到当前键盘布局里打出这个字符的键和所需的 Shift / Ctrl / Alt，缺的修饰键只在这一下按键周围点一下；
   布局里打不出的字符（中文等）用 `KEYEVENTF_UNICODE` 当文本输入。虚拟键都带上扫描码（有的游戏只认它）。指针用 `SendInput` 的虚拟桌面绝对坐标，
   限制在正在分享的那块显示器的矩形里。macOS 用 Quartz 事件（§10）。
+- **Mac 的键盘**（0.3.9 起，和 Parsec 打开 "Swap Command and Ctrl for macOS" 时一样）：Mac 上的 mpv 把 `Command` 报成 `Meta`、`Option` 报成 `Alt`、
+  `Control` 报成 `Ctrl`。Mac 观众在标志的 bit1 说明这是 Mac 的键盘，不是 Mac 的主播就把 `Command` 当 `Ctrl`、`Control` 当 Win 键
+  （`Command+C` / `Command+V` 复制粘贴，`Control+D` 显示桌面），`Option` 仍是 `Alt`；Mac 主播原样（`Command` 还是 `Command`）。0.3.8 及以前的主播
+  只看 bit0，照旧把 `Command` 当 Win 键（也就是 Parsec 不打开这个开关时的样子）。Mac 上 mpv 的菜单快捷键关掉了（§3.1），`Command` 组合才到得了这里。
+  到不了主播的：macOS 自己先拿走的组合（`Command+Tab`、`Command+Space`、`Control+方向键` 切换 Space、截屏键）和单独按下的修饰键
+  （单按 `Control` 开开始菜单、单按 `Shift` 切中英文）：mpv 不报单独的修饰键。要这些得在观众端监听键盘事件（Parsec 的"沉浸模式"，要辅助功能授权），没有做。
 - **指针在哪块显示器上**（`ControlHub`）：两路流（观看的、控制模式的 §11）启动时都把采集的显示器（引擎认的名字，如 `\\.\DISPLAY2`）告诉它，
   它查出这块显示器的矩形，之后放进来的会话都按它换算。0.3.7 的控制模式漏了这一步（0.3.8 修好）：只开控制模式时指针一直落在默认的 (0,0) 1920×1080 上，
   在左上角的 4K 屏上只走到观众所指位置的一半，离左上角越远偏得越多。有会话时每秒按名字重查一次矩形（分辨率和排列会变，Sunshine、Parsec
@@ -1078,6 +1104,30 @@ answer: "hdrcast/v1/answer-device" gid  sid  t  ok(true|false)  reason  cands  �
     把需要的特权打开；真的 `HdrCastInput serve --stop-event` 在事件被置位后以 0 退出；手动运行 `service` 会说"要由 Windows 当服务运行"（`tests/input_program.rs`、`cargo test -p hdrcast-control -- --ignored`）。
   - **没验证过**：注册服务、普通权限 `StartService`（服务访问控制）、服务管理器的状态流程、`WTSQueryUserToken` 按 SID 找会话、把 SYSTEM 令牌移到用户会话后真的在那里起进程并注入、停止时的优雅退出、UAC 流程——都要真的装一个服务，见 windows-checklist §9。
 
+### 9.2 控制的人选主播分享哪块显示器（0.3.9 起）
+
+像 Parsec 的切换显示器：控制着主播的观众在悬浮窗（§3.3）里看到主播的每块显示器，点哪块，主播就分享哪块（`crates/control/src/displays.rs`、
+`app/src/control_host.rs`、`share.rs` 的 `share_display_for`）。
+
+- **谁能选**：只有此刻控制着这台电脑的观众（`HostControl::granted`）；别人收不到列表，选了也被拒绝。一个采集引擎供所有观众，别的观众的画面也跟着换。
+- **主播怎么做**：当成自己在开播页上选的：改 `sender.json` 里的显示器并保存，告诉开播页（`sender` 事件，页面之后保存设置时不会改回去），
+  再走"分享中改设置"（§2.7）：观看的流约一秒后在新的屏上重启采集和编码器，观众不断开；控制模式的引擎也重启，指针换到新的显示器上（§9"指针在哪块显示器上"）。
+  日志 `[control] <观众> switched the shared display to <名字> (宽x高)`，观众那边 `[control] asked the host to share its display <名字>`。
+- **报文**（旁路通道）：和远程控制同一个密钥、同样的密封，方向字节换成报文的种类，所以 nonce 不会和远程控制的重复：
+
+```
+ 0  1   kind     'D' 主播的列表（主播→观众）   'd' 观众的选择（观众→主播）
+ 1  8   counter  大端，每个方向严格递增
+ 9  ..  ChaCha20-Poly1305(key = controlKey(sid), nonce = kind || 0 0 0 || counter, aad = "HDRCCTL1")
+```
+
+- 列表明文：版本 1、已回答的最后一个选择的序号（u32，0 = 还没有）、标志（bit0 = 那次选择做不到：没有这块屏了）、正在分享的那块的 id（0xff = 不在列表里）、
+  块数（≤ 8），然后每块：id（主播的采集序号）、宽、高、刷新率 Hz（各 u16）、标志（bit0 = 开着 HDR）、名字的长度和名字（UTF-8，≤ 48 字节，在字符之间截断）。
+  选择明文：版本 1、序号（u32，每个会话从 1 起）、要的那块的 id。
+- 主播对控制它的观众：列表一变（分享的那块换了、有屏插拔）马上发，否则每秒发一次；显示器列表每秒重读一次。观众：选择每 250 ms 重发，直到列表回答了它；
+  回答之后悬浮窗写"正在切换…"，直到主播分享的就是它（主播重启采集要一两秒，最多等 8 s），被拒绝就马上不等了。同一个选择主播只做一次。
+- 兼容：0.3.8 及以前的主播从不发列表，悬浮窗里就没有这一栏；旧观众打不开 'D'（不是它两个方向里的报文），直接丢掉。
+
 ## 10. macOS（0.3.0 起；Mac 版在 `fix/macos-first-run` 分支，观看已在真机上验证）
 
 | Windows | macOS |
@@ -1094,6 +1144,8 @@ answer: "hdrcast/v1/answer-device" gid  sid  t  ok(true|false)  reason  cands  �
 | Windows 防火墙规则 + **放行…** | 没有对应物（界面不显示这一栏）；UPnP 照做 |
 | 稳定 IPv6 地址：`GetAdaptersAddresses` 的 SuffixOrigin / DAD 状态 | `getifaddrs` + `SIOCGIFAFLAG_IN6`（跳过 temporary / deprecated） |
 | `SendInput` | Quartz 事件（`CGEventPost`），需要"辅助功能"授权；字符键按 US 键位表给键码，表里没有的当 Unicode 文本；双击靠自己数点击次数 |
+| 观众的 `Ctrl`、Win 键 | Mac 观众：`Command` 当 `Ctrl`、`Control` 当 Win 键（主播不是 Mac 时，0.3.9 起，§9）；mpv 的菜单快捷键关掉（`--macos-menu-shortcuts=no`） |
+| 悬浮窗：`EnumWindows` 找 mpv 的窗口，切到别的程序就藏起来 | `CGWindowListCopyWindowInfo` 找 mpv 的窗口，别的程序的窗口压到悬浮窗时藏起来；mpv 用 `--native-fs=no` 在同一个 Space 里全屏（0.3.9 起，§3.3） |
 | 剪贴板里有邀请时自动提示 | 不做（macOS 会向用户报告每一次读剪贴板）；用 **我有邀请码** / **粘贴邀请码** |
 | Mica | 侧边栏毛玻璃（`NSVisualEffectView`），系统的红黄绿按钮 |
 | 通知区域图标：左键打开窗口，右键菜单 | 菜单栏图标，单击出菜单（打开 / 退出）；窗口藏起来时点程序坞图标（`RunEvent::Reopen`）也打开窗口；程序坞图标一直在 |

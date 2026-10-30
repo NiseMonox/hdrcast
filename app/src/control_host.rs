@@ -2,7 +2,8 @@
 //! the key and the rule of that session, fed from the P2P side channel, answered through it, and ticked so that
 //! nothing a viewer held down stays down when they vanish. Every viewer's pointer is confined to the display that
 //! is shared, which each stream names when it starts and which is looked up again every second, because it moves
-//! when its resolution or the arrangement of the displays changes.
+//! when its resolution or the arrangement of the displays changes. A viewer who controls this computer is also told
+//! which displays it has, and may pick the one that is shared (docs/design.md §9.2).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use hdrcast_control::displays::{self, Display, HostDisplays};
 use hdrcast_control::inject::{self, ScreenRect};
 use hdrcast_control::{Button, Grant, HostControl, Injector, Key, Mods, SystemInjector};
 
@@ -19,6 +21,18 @@ pub type SendFn = Arc<dyn Fn(&str, &[u8]) -> bool + Send + Sync>;
 
 /// Finds a display's rectangle by the name the capture engine knows it by.
 type FindDisplay = Arc<dyn Fn(&str) -> Option<ScreenRect> + Send + Sync>;
+
+/// One of this computer's displays as a viewer in control sees it, with the name the capture engine knows it by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostDisplay {
+    pub device_name: String,
+    pub display: Display,
+}
+
+/// This computer's displays, as they are now.
+pub type ListDisplays = Arc<dyn Fn() -> Vec<HostDisplay> + Send + Sync>;
+/// A viewer who controls this computer (by name) wants the display of that device name shared.
+pub type ShareDisplay = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
 /// With this set, what a viewer does is written to the log instead of done: for trying remote control with host
 /// and viewer on the same computer, where real input would feed back into the player window it comes from.
@@ -88,6 +102,8 @@ pub fn grant_of(policy: u8) -> Grant {
 
 struct Entry {
     control: HostControl,
+    /// What this viewer is told about the displays, and its picks.
+    displays: HostDisplays,
     name: String,
     requested: bool,
     granted: bool,
@@ -103,6 +119,16 @@ struct Inner {
     display: ScreenRect,
     /// When `display` was last looked up.
     display_checked: Instant,
+    /// This computer's displays as last listed (every [`DISPLAY_CHECK`] while there are sessions), and when.
+    listed: Vec<HostDisplay>,
+    listed_at: Option<Instant>,
+}
+
+impl Inner {
+    /// The id of the shared display in the list, when it is in there.
+    fn shared_id(&self) -> Option<u8> {
+        self.listed.iter().find(|d| d.device_name.eq_ignore_ascii_case(&self.display_name)).map(|d| d.display.id)
+    }
 }
 
 impl Inner {
@@ -129,6 +155,8 @@ pub struct ControlHub {
     /// What viewers do is written to the log instead of done ([`DRY_RUN_ENV`]).
     dry_run: bool,
     find_display: FindDisplay,
+    /// Where the displays come from and who shares the one a viewer picks ([`ControlHub::on_display_picks`]).
+    display_picks: Mutex<Option<(ListDisplays, ShareDisplay)>>,
     started: Instant,
     stopped: AtomicBool,
 }
@@ -146,11 +174,14 @@ impl ControlHub {
                 display_name: String::new(),
                 display: MAIN_DISPLAY,
                 display_checked: Instant::now(),
+                listed: Vec::new(),
+                listed_at: None,
             }),
             send,
             log,
             dry_run,
             find_display,
+            display_picks: Mutex::new(None),
             started: Instant::now(),
             stopped: AtomicBool::new(false),
         });
@@ -220,6 +251,54 @@ impl ControlHub {
         (self.log)(&format!("[control] a viewer's pointer moves on {name}: {}x{} at ({}, {})", rect.width, rect.height, rect.x, rect.y));
     }
 
+    /// Where this computer's displays come from (`list`, asked every [`DISPLAY_CHECK`] while there are sessions), and
+    /// who shares the one a viewer in control picks (`share`, with the viewer's name and the display's device name).
+    /// Until this is set, nobody is told about the displays.
+    pub fn on_display_picks(&self, list: ListDisplays, share: ShareDisplay) {
+        *self.display_picks.lock().unwrap() = Some((list, share));
+        self.inner.lock().unwrap().listed_at = None;
+    }
+
+    /// Lists the displays again when that is due.
+    fn list_displays(&self) {
+        let list = {
+            let inner = self.inner.lock().unwrap();
+            if inner.sessions.is_empty() || inner.listed_at.is_some_and(|at| at.elapsed() < DISPLAY_CHECK) {
+                return;
+            }
+            self.display_picks.lock().unwrap().as_ref().map(|(list, _)| list.clone())
+        };
+        let Some(list) = list else { return };
+        // not under the hub's lock: the list comes from the app's state
+        let listed = list();
+        let mut inner = self.inner.lock().unwrap();
+        inner.listed = listed;
+        inner.listed_at = Some(Instant::now());
+    }
+
+    /// A viewer's pick of another display: passed on when the viewer controls this computer and the display is
+    /// there; otherwise the viewer is told it was refused.
+    fn on_display_pick(&self, sid: &str, payload: &[u8]) {
+        let wanted = {
+            let mut guard = self.inner.lock().unwrap();
+            let inner = &mut *guard;
+            let Some(entry) = inner.sessions.get_mut(sid) else { return };
+            let Some(id) = entry.displays.on_datagram(payload) else { return };
+            match inner.listed.iter().find(|d| d.display.id == id) {
+                Some(d) if entry.control.granted() => Some((entry.name.clone(), d.device_name.clone())),
+                _ => {
+                    entry.displays.refuse();
+                    None
+                }
+            }
+        };
+        let Some((viewer, device_name)) = wanted else { return };
+        let share = self.display_picks.lock().unwrap().as_ref().map(|(_, share)| share.clone());
+        if let Some(share) = share {
+            share(&viewer, &device_name);
+        }
+    }
+
     /// A viewer was let in: its datagrams are sealed with `key`, and `policy` (0 off, 1 ask, 2 allow) is what it
     /// may do. Datagrams of sessions nobody registered are ignored.
     pub fn register(&self, sid: &str, name: &str, key: &[u8; 32], policy: u8) {
@@ -232,6 +311,7 @@ impl ControlHub {
         };
         let entry = Entry {
             control: HostControl::new(key, grant_of(policy), injector),
+            displays: HostDisplays::new(key),
             name: name.to_string(),
             requested: false,
             granted: false,
@@ -243,6 +323,10 @@ impl ControlHub {
     /// A side-channel datagram from the viewer of session `sid` (the link has checked where it came from).
     pub fn on_datagram(&self, sid: &str, payload: &[u8]) {
         if self.stopped.load(Ordering::SeqCst) {
+            return;
+        }
+        if displays::is_display_datagram(payload) {
+            self.on_display_pick(sid, payload);
             return;
         }
         let now = self.now_us();
@@ -285,14 +369,30 @@ impl ControlHub {
 
     fn tick(&self) {
         self.check_display();
+        self.list_displays();
         let now = self.now_us();
         let mut out = Vec::new();
         let mut notes = Vec::new();
         {
-            let mut inner = self.inner.lock().unwrap();
+            let mut guard = self.inner.lock().unwrap();
+            let shared = guard.shared_id();
+            let inner = &mut *guard;
+            let listed: Vec<Display> = if inner.sessions.values().any(|e| e.control.granted()) {
+                inner.listed.iter().map(|d| d.display.clone()).collect()
+            } else {
+                Vec::new()
+            };
             for (sid, entry) in inner.sessions.iter_mut() {
                 if let Some(datagram) = entry.control.tick(now) {
                     out.push((sid.clone(), datagram));
+                }
+                // the displays, to whoever controls this computer
+                if entry.control.granted() && !listed.is_empty() {
+                    if let Some(datagram) = entry.displays.poll(&listed, shared, now) {
+                        out.push((sid.clone(), datagram));
+                    }
+                } else {
+                    entry.displays.reset();
                 }
                 Self::note_changes(entry, &mut notes);
             }
@@ -362,6 +462,7 @@ impl ControlHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hdrcast_control::displays::ViewerDisplays;
     use hdrcast_control::ViewerControl;
 
     const KEY: [u8; 32] = [7; 32];
@@ -379,6 +480,8 @@ mod tests {
         /// What the hub sent to the viewer.
         outbox: Arc<Mutex<Vec<Vec<u8>>>>,
         viewer: ViewerControl,
+        /// The display lists among it, set aside by [`Rig::exchange`].
+        lists: Vec<Vec<u8>>,
         now: i64,
     }
 
@@ -394,7 +497,7 @@ mod tests {
             });
             let find: FindDisplay = Arc::new(move |name: &str| known.lock().unwrap().get(name).copied());
             let hub = ControlHub::start_with(send, log, true, find);
-            Rig { hub, displays, lines, outbox, viewer: ViewerControl::new(&KEY, true, 0), now: 0 }
+            Rig { hub, displays, lines, outbox, viewer: ViewerControl::new(&KEY, true, 0), lists: Vec::new(), now: 0 }
         }
 
         /// The viewer is let in (it may control) and takes control.
@@ -416,7 +519,11 @@ mod tests {
                 self.hub.on_datagram("s1", &datagram);
             }
             for answer in std::mem::take(&mut *self.outbox.lock().unwrap()) {
-                self.viewer.on_datagram(&answer);
+                if displays::is_display_datagram(&answer) {
+                    self.lists.push(answer);
+                } else {
+                    self.viewer.on_datagram(&answer);
+                }
             }
         }
 
@@ -465,6 +572,43 @@ mod tests {
                 "[control] (dry run) Mac: pointer to 25.0%, 75.0% = 640, 1199 on the desktop",
             ]
         );
+    }
+
+    #[test]
+    fn the_viewer_in_control_hears_of_the_displays_and_its_pick_is_passed_on() {
+        let mut rig = Rig::new(&[(SHARED, FOUR_K)]);
+        let display = |id: u8, name: &str| Display { id, name: name.to_string(), width: 1920, height: 1080, refresh_hz: 60, hdr: false };
+        let listed = vec![
+            HostDisplay { device_name: SHARED.to_string(), display: display(0, "AW3225QF") },
+            HostDisplay { device_name: OTHER.to_string(), display: display(1, "AW2523HF") },
+        ];
+        let picks = Arc::new(Mutex::new(Vec::new()));
+        let into = picks.clone();
+        rig.hub.on_display_picks(
+            Arc::new(move || listed.clone()),
+            Arc::new(move |viewer, device| into.lock().unwrap().push(format!("{viewer} -> {device}"))),
+        );
+        rig.hub.set_display(SHARED);
+        rig.take_control();
+        rig.hub.tick();
+        rig.exchange();
+        let mut displays = ViewerDisplays::new(&KEY);
+        for list in std::mem::take(&mut rig.lists) {
+            displays.on_datagram(&list, 0);
+        }
+        let list = displays.list().expect("the viewer in control was told the displays");
+        assert_eq!((list.displays.len(), list.shared), (2, Some(0)));
+
+        assert!(displays.pick(1, 0));
+        rig.hub.on_datagram("s1", &displays.poll(0).unwrap());
+        assert_eq!(*picks.lock().unwrap(), [r"Mac -> \\.\DISPLAY1"]);
+
+        // control taken back: a pick is refused
+        rig.hub.decide("s1", false).unwrap();
+        assert!(displays.pick(0, 1_000_000));
+        rig.hub.on_datagram("s1", &displays.poll(1_000_000).unwrap());
+        assert_eq!(picks.lock().unwrap().len(), 1);
+        rig.hub.stop();
     }
 
     #[test]

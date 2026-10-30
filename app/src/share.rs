@@ -12,6 +12,9 @@
 //! A viewer in control mode (§11) gets the low-latency stream instead: a capture engine of its own encodes for it
 //! (`low_latency_host.rs`), started when the first such viewer is let in and stopped a little after the last one
 //! left. It runs next to the buffered stream when both kinds of viewers are there.
+//!
+//! A viewer who controls this computer may pick which of its displays is shared (§9.2): that is done as if this
+//! computer's user had picked it on the Share page.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -19,7 +22,8 @@ use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hdrcast_capture::{CaptureArgs, CaptureFormat, EncodeArgs, EngineEncoder};
+use hdrcast_capture::{CaptureArgs, CaptureFormat, EncodeArgs, EngineEncoder, OutputInfo};
+use hdrcast_control::displays::{self, Display};
 use hdrcast_core::common::firewall::row as firewall_row;
 use hdrcast_core::group::device;
 use hdrcast_core::group::keys::GroupKeys;
@@ -28,13 +32,14 @@ use hdrcast_media::keyframe;
 use hdrcast_media::low_latency;
 use hdrcast_media::sender::encoder_profiles;
 use hdrcast_media::sender::ffmpeg_command::{self, AudioCodec, FfmpegPlan};
-use hdrcast_media::sender::settings::HdrMode;
+use hdrcast_media::sender::settings::{HdrMode, SenderSettings};
 use hdrcast_p2p::{JoinTicket, P2pHost, P2pHostOptions, SideUse, SwitchableStream, ViewerInfo, ViewerState};
 use serde_json::{json, Value};
+use tauri::Emitter;
 
 use crate::access::{AccessSettings, Connect, Control};
 use crate::commands;
-use crate::control_host::ControlHub;
+use crate::control_host::{ControlHub, HostDisplay};
 use crate::keyframe_host::KeyframeHub;
 use crate::low_latency_host::{LowLatencyHost, LowLatencyPlan};
 use crate::net_report::{self, End, NetReport};
@@ -405,6 +410,17 @@ fn start_hosting(app: &Arc<AppState>) -> Result<Arc<Session>, Vec<String>> {
     session.host.on_stream_event(move |sid, event| keyframes.stream_event(sid, event));
     let keyframes = session.keyframes.clone();
     session.runner.on_news(move |news| keyframes.encoder_news(news));
+    // the viewer in control may share another display (§9.2)
+    let (list_app, pick_app) = (weak_app.clone(), weak_app.clone());
+    session.hub.on_display_picks(
+        Arc::new(move || list_app.upgrade().map(|app| host_displays(&app.inner.lock().unwrap().outputs)).unwrap_or_default()),
+        Arc::new(move |viewer, device_name| {
+            let Some(app) = pick_app.upgrade() else { return };
+            let (viewer, device_name) = (viewer.to_string(), device_name.to_string());
+            // not on the network's thread: the settings are saved and the streams start again
+            thread::spawn(move || share_display_for(&app, &viewer, &device_name));
+        }),
+    );
 
     if let Err(e) = session.host.start() {
         app.log(&format!("[app] cannot start the group session: {e}"));
@@ -486,6 +502,52 @@ pub fn settings_changed(app: &AppState) {
     session.host.announce_now();
     apply_while_streaming(app, &session);
     apply_to_control_mode(app, &session);
+}
+
+/// This computer's displays as a viewer in control sees them (§9.2): the first eight, by their capture index.
+fn host_displays(outputs: &[OutputInfo]) -> Vec<HostDisplay> {
+    outputs
+        .iter()
+        .filter(|o| o.attached_to_desktop)
+        .filter_map(|o| {
+            let display = Display {
+                id: u8::try_from(o.index).ok()?,
+                name: if o.friendly_name.is_empty() { format!("Display {}", o.index + 1) } else { o.friendly_name.clone() },
+                width: u16::try_from(o.width).unwrap_or(0),
+                height: u16::try_from(o.height).unwrap_or(0),
+                refresh_hz: o.refresh_rate.round().clamp(0.0, f64::from(u16::MAX)) as u16,
+                hdr: o.hdr,
+            };
+            Some(HostDisplay { device_name: o.device_name.clone(), display })
+        })
+        .take(displays::MAX_DISPLAYS)
+        .collect()
+}
+
+/// A viewer who controls this computer picked another display (§9.2): it is shared as if this computer's user had
+/// picked it on the Share page. The setting is saved, the page shows it, and the streams that run start again on it.
+fn share_display_for(app: &AppState, viewer: &str, device_name: &str) {
+    let sender = {
+        let mut inner = app.inner.lock().unwrap();
+        let Some(output) = inner.outputs.iter().find(|o| o.device_name.eq_ignore_ascii_case(device_name)).cloned() else { return };
+        if state::selected_output(&inner.sender, &inner.outputs).is_some_and(|o| o.device_name == output.device_name) {
+            return;
+        }
+        inner.sender.output_index = output.index as i32;
+        inner.sender.output_device_name = output.device_name.clone();
+        inner.sender.output_friendly_name = output.friendly_name.clone();
+        if let Err(e) = inner.sender.save(&SenderSettings::default_path()) {
+            app.log(&format!("[app] could not save settings: {e}"));
+        }
+        let name = if output.friendly_name.is_empty() { output.device_name.as_str() } else { output.friendly_name.as_str() };
+        app.log(&format!("[control] {viewer} switched the shared display to {name} ({}x{})", output.width, output.height));
+        inner.sender.clone()
+    };
+    // the Share page keeps it (a later save of the page does not undo it)
+    if let Some(handle) = app.handle.get() {
+        let _ = handle.emit("sender", &sender);
+    }
+    settings_changed(app);
 }
 
 /// The settings changed: control mode's engine, when it runs, follows them (§11). A new bitrate goes to it without a

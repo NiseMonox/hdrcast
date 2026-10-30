@@ -207,6 +207,7 @@ fn run_app(startup_invite: Option<String>, background: bool, instance: instance:
             commands::watch_set_hwdec,
             commands::watch_set_latency,
             commands::watch_set_mute,
+            commands::watch_set_display,
             commands::overlay_init,
             commands::overlay_toggle,
             commands::overlay_expand,
