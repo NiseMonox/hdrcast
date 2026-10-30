@@ -36,6 +36,34 @@ windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security", 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.190"
 
+# The panel over the player (src/overlay.rs): mpv's window, the mouse, and handing the keyboard back to mpv
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6.5", default-features = false, features = ["std"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "libc",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSWindow",
+] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "CFArray",
+    "CFBase",
+    "CFCGTypes",
+    "CFDictionary",
+    "CFNumber",
+    "CFString",
+] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "CGEvent",
+    "CGEventSource",
+    "CGEventTypes",
+    "CGGeometry",
+    "CGWindow",
+] }
+
 [features]
 # custom-protocol = a production build: the UI in ../ui is embedded in the executable.
 default = ["custom-protocol"]

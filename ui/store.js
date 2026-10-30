@@ -96,6 +96,11 @@ export async function boot() {
     const { latencyMs, hwDec } = receiver;
     setState({ settings: { ...state.settings, receiver: { ...state.settings.receiver, latencyMs, hwDec } } });
   });
+  // a viewer who controls this computer had another display shared: the Share page shows it, and keeps it
+  listen('sender', (sender) => {
+    const { outputIndex, outputDeviceName, outputFriendlyName } = sender;
+    setState({ settings: { ...state.settings, sender: { ...state.settings.sender, outputIndex, outputDeviceName, outputFriendlyName } } });
+  });
   listen('log', (payload) => {
     const logs = state.logs.concat(payload.lines);
     setState({ logs: logs.length > MAX_LOG_LINES ? logs.slice(logs.length - MAX_LOG_LINES) : logs });

@@ -245,6 +245,10 @@ const en = {
   'overlay.rejoiningText': 'Taking the new delay: the player starts again in a moment.',
   'overlay.notWatching': 'Not watching.',
   'overlay.exitFullscreen': 'Exit Full Screen',
+  'overlay.disconnect': 'Disconnect',
+  'overlay.display': 'Display',
+  'overlay.displayNote': 'the host’s screens',
+  'overlay.switching': 'switching…',
 
   'preset.Japan': 'Japan',
   'preset.Australia': 'Australia',
@@ -651,6 +655,10 @@ const zh = {
   'overlay.rejoiningText': '正在换成新的延迟，播放器马上会重新打开。',
   'overlay.notWatching': '没有在观看。',
   'overlay.exitFullscreen': '退出全屏',
+  'overlay.disconnect': '断开连接',
+  'overlay.display': '显示器',
+  'overlay.displayNote': '主播的屏幕',
+  'overlay.switching': '正在切换…',
 
   'preset.Japan': '日本',
   'preset.Australia': '澳大利亚',
@@ -1057,6 +1065,10 @@ const ja = {
   'overlay.rejoiningText': '新しい遅延に切り替えています。まもなくプレーヤーが再開します。',
   'overlay.notWatching': '視聴していません。',
   'overlay.exitFullscreen': 'フルスクリーン解除',
+  'overlay.disconnect': '切断',
+  'overlay.display': 'ディスプレイ',
+  'overlay.displayNote': 'ホストの画面',
+  'overlay.switching': '切り替え中…',
 
   'preset.Japan': '日本',
   'preset.Australia': 'オーストラリア',

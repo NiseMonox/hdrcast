@@ -78,7 +78,8 @@ fn connect(display: ScreenRect, fixed_pipe: Option<&str>) -> Result<std::fs::Fil
 /// What the injector and the thread that brings the input program up share.
 #[derive(Default)]
 struct Link {
-    pipe: Mutex<Option<std::fs::File>>,
+    /// The connection to the input program, and the display its `Hello` told it about.
+    pipe: Mutex<Option<(std::fs::File, ScreenRect)>>,
     connecting: AtomicBool,
     /// Somebody is controlling: the input program is wanted.
     wanted: AtomicBool,
@@ -147,7 +148,7 @@ impl ElevatedInjector {
                     let mut slot = link.pipe.lock().unwrap();
                     // control may have been given back while the program came up: then nobody wants the connection
                     if link.wanted.load(Ordering::SeqCst) {
-                        *slot = Some(file);
+                        *slot = Some((file, display));
                         drop(slot);
                         link.told.store(false, Ordering::SeqCst);
                         notices("[control] input goes through the HdrCast input service: windows of programs run as administrator react too");
@@ -171,10 +172,16 @@ impl ElevatedInjector {
     /// Sends a frame to the input program; `false` when there is none (or it just went away) and the caller has to inject.
     fn via_helper(&mut self, frame: Frame) -> bool {
         let mut slot = self.link.pipe.lock().unwrap();
-        if let Some(file) = slot.as_mut() {
-            let mut bytes = Vec::with_capacity(36);
+        if let Some((file, told)) = slot.as_mut() {
+            let mut bytes = Vec::with_capacity(72);
+            // The shared display changed since the input program heard of it: a new Hello first (which also makes
+            // it let go of what it holds; the display hardly ever changes in the middle of a key press).
+            if *told != self.display {
+                Frame::Hello(self.display).encode(&mut bytes);
+            }
             frame.encode(&mut bytes);
             if file.write_all(&bytes).is_ok() {
+                *told = self.display;
                 return true;
             }
             *slot = None;
@@ -254,6 +261,12 @@ impl Injector for ElevatedInjector {
             *self.link.pipe.lock().unwrap() = None;
         }
     }
+
+    fn set_display(&mut self, display: ScreenRect) {
+        // the input program hears of it with the next input (`via_helper`)
+        self.display = display;
+        self.direct.set_display(display);
+    }
 }
 
 // ---- being refused -------------------------------------------------------------------------------------------------
@@ -306,6 +319,34 @@ mod tests {
         assert_eq!(rec.wait_for(3), ["move 1,2", "mod1 down", "Char('a') down"]);
         injector.activate(false);
         assert_eq!(rec.wait_for(5)[3..], ["Char('a') up", "mod1 up"]);
+        server.stop();
+    }
+
+    #[test]
+    fn a_display_that_changed_reaches_the_helper_before_the_next_input() {
+        let rec = Recorder::default();
+        let sid = setup::user_sid().unwrap();
+        let pipe = format!("{}-test-client-display-{}", pipe_name(&sid), std::process::id());
+        let displays = Arc::new(Mutex::new(Vec::<ScreenRect>::new()));
+        let (into, made) = (rec.clone(), displays.clone());
+        let make: MakeInjector = Arc::new(move |display| {
+            made.lock().unwrap().push(display);
+            Box::new(into.clone())
+        });
+        let server = Server::start(&pipe, &sid, make).expect("the server starts");
+        let (notices, said) = notices();
+        let mut injector = ElevatedInjector::with_pipe(SCREEN, notices, &pipe);
+        injector.activate(true);
+        assert!(wait_until(|| said.lock().unwrap().iter().any(|l| l.contains("goes through"))), "{:?}", said.lock().unwrap());
+        injector.pointer(1, 2);
+        assert_eq!(rec.wait_for(1), ["move 1,2"]);
+        // the shared display gets another resolution while the viewer controls
+        let other = ScreenRect { x: 0.0, y: 0.0, width: 2560.0, height: 1600.0 };
+        injector.set_display(other);
+        injector.pointer(3, 4);
+        injector.pointer(5, 6);
+        assert_eq!(rec.wait_for(3), ["move 1,2", "move 3,4", "move 5,6"]);
+        assert_eq!(*displays.lock().unwrap(), [SCREEN, other], "told once, before the first move on it");
         server.stop();
     }
 

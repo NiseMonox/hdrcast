@@ -53,6 +53,9 @@ pub struct Event {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ViewerMessage {
     pub wants_control: bool,
+    /// The keys come from a Mac's keyboard: Command arrives as Meta, Control as Ctrl (flags bit 1, 0.3.9 on; older
+    /// hosts read bit 0 only).
+    pub mac_keyboard: bool,
     pub pointer_x: u16,
     pub pointer_y: u16,
     pub pointer_inside: bool,
@@ -84,7 +87,7 @@ impl ViewerMessage {
         let n = self.events.len().min(MAX_EVENTS_PER_PACKET);
         let mut out = Vec::with_capacity(12 + n * 8);
         out.push(VERSION);
-        out.push(self.wants_control as u8);
+        out.push(self.wants_control as u8 | (self.mac_keyboard as u8) << 1);
         out.extend_from_slice(&self.pointer_x.to_be_bytes());
         out.extend_from_slice(&self.pointer_y.to_be_bytes());
         out.push(self.pointer_inside as u8);
@@ -118,6 +121,7 @@ impl ViewerMessage {
         }
         Some(Self {
             wants_control: b[1] & 1 != 0,
+            mac_keyboard: b[1] & 2 != 0,
             pointer_x: u16::from_be_bytes([b[2], b[3]]),
             pointer_y: u16::from_be_bytes([b[4], b[5]]),
             pointer_inside: b[6] != 0,
@@ -167,6 +171,16 @@ impl Channel {
 
     pub fn host(key: &[u8; 32]) -> Self {
         Self::new(key, DIR_HOST, DIR_VIEWER)
+    }
+
+    /// The host's end of the messages about the shared display ([`crate::displays`]): the same key, with the kinds
+    /// of those messages as direction bytes, so that no nonce is ever used twice.
+    pub fn displays_host(key: &[u8; 32]) -> Self {
+        Self::new(key, crate::displays::LIST, crate::displays::PICK)
+    }
+
+    pub fn displays_viewer(key: &[u8; 32]) -> Self {
+        Self::new(key, crate::displays::PICK, crate::displays::LIST)
     }
 
     fn new(key: &[u8; 32], send_dir: u8, recv_dir: u8) -> Self {
@@ -219,6 +233,7 @@ mod tests {
     fn sample() -> ViewerMessage {
         ViewerMessage {
             wants_control: true,
+            mac_keyboard: false,
             pointer_x: 12345,
             pointer_y: 54321,
             pointer_inside: true,
@@ -236,6 +251,18 @@ mod tests {
         assert_eq!(ViewerMessage::decode(&m.encode()), Some(m));
         let h = HostMessage { state: GrantState::Granted, acked_seq: 0xDEAD_BEEF };
         assert_eq!(HostMessage::decode(&h.encode()), Some(h));
+    }
+
+    #[test]
+    fn a_macs_keyboard_is_said_in_a_bit_older_hosts_do_not_read() {
+        let mac = ViewerMessage { mac_keyboard: true, ..sample() };
+        let b = mac.encode();
+        assert_eq!(b[1], 0b11);
+        assert_eq!(ViewerMessage::decode(&b), Some(mac));
+        // what 0.3.8 makes of it: it wants control (bit 0), nothing else changed
+        assert_eq!(b[1] & 1, 1);
+        let not = ViewerMessage { wants_control: false, ..sample() };
+        assert_eq!(not.encode()[1], 0, "a PC's keyboard: the byte 0.3.8 sends");
     }
 
     #[test]

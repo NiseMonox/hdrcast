@@ -2133,6 +2133,10 @@ input[type="range"].slider:disabled {
   gap: 6px;
 }
 
+.ov-foot .wide {
+  grid-column: 1 / -1;
+}
+
 .ov .btn[aria-pressed="true"] {
   background: var(--fill-strong);
 }
@@ -2162,6 +2166,16 @@ input[type="range"].slider:disabled {
 
 .ov-chips.two {
   grid-template-columns: 1fr 1fr;
+}
+
+.ov-chips.three {
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.ov-chip .name {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .ov-chip {

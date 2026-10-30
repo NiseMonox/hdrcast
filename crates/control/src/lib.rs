@@ -14,15 +14,19 @@
 //!  9  ..  ChaCha20-Poly1305(key = sub("ctl/" + sid), nonce = dir || 0 0 0 || counter, aad = "HDRCCTL1")
 //! ```
 //!
-//! Viewer -> host plaintext: version, flags (bit 0 = wants control), pointer x/y (0..=65535 across the picture),
-//! pointer-over-picture flag, then the oldest events the host has not acknowledged yet (first sequence number,
-//! count, 8 bytes each). Host -> viewer plaintext: version, grant state, last event sequence applied.
-//! Pointer positions are latest-wins; keys, buttons and wheel steps are resent until acknowledged, and the host
-//! applies them once, in order.
+//! Viewer -> host plaintext: version, flags (bit 0 = wants control, bit 1 = a Mac's keyboard), pointer x/y
+//! (0..=65535 across the picture), pointer-over-picture flag, then the oldest events the host has not acknowledged
+//! yet (first sequence number, count, 8 bytes each). Host -> viewer plaintext: version, grant state, last event
+//! sequence applied. Pointer positions are latest-wins; keys, buttons and wheel steps are resent until
+//! acknowledged, and the host applies them once, in order. A host that is not a Mac takes a Mac's Command key as
+//! Ctrl and its Control key as the Windows key.
+//!
+//! The viewer in control can also have the host share another of its displays ([`displays`]).
 //!
 //! On Windows the host's own process can only reach windows of programs that run at its own integrity level or
 //! lower; [`elevated`] is the small helper that reaches the others.
 
+pub mod displays;
 pub mod elevated;
 pub mod host;
 pub mod inject;

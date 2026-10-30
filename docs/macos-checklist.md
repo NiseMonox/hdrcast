@@ -1,9 +1,15 @@
 # macOS 验证清单（采集引擎）
 
 采集引擎的 macOS 后端（`crates/capture/src/mac/` + `src/unix/`，ScreenCaptureKit）是**在 Windows 上写的**：那台机器只能做
-`cargo check --target aarch64-apple-darwin / x86_64-apple-darwin`（类型检查通过、clippy 干净），**一行都没运行过，也没链接过**。
+`cargo check --target aarch64-apple-darwin / x86_64-apple-darwin`（类型检查通过、clippy 干净），写的时候没法运行，也没法链接。
 下面是在真 Mac 上的第一次运行，按顺序做；每一步写了命令、预期输出、以及它验证的是哪一条"没法在 Windows 上验证的假设"
 （编号 A1…A20，汇总在文末，按出错可能性从高到低排）。
+
+> **进度（2026-10-30）**：已经在真 Mac（Apple 芯片、macOS 26.5.2）上用 Mac 版（`fix/macos-first-run` 分支）做了一部分：
+> 构建通过（没有 warning，没有 `Undefined symbols`），`hdrcast-core`、`hdrcast-media`、`hdrcast` 的 `cargo test` 通过；
+> 第 2、3 步；第 12 步的构建、启动和找到工具；第 13 步观看 Windows 主播，HDR 正常。**其余各步还没做**，包括采集 dump 和音频
+> （第 4–10 步）、开播（第 14 步）、远程控制（第 15 步）和控制模式（第 17 步）。main 在 Mac 上用不了（窗口出不来，Homebrew 的
+> ffmpeg / mpv 不带 SRT），Mac 需要的修改只在那个分支上，照着做时请看那个分支里的这份清单。
 
 **请把每一步的终端输出原样留下来**（`2> engine.log` 里的日志尤其重要）：引擎会在日志里把系统实际给它的东西打印出来
 （HDR 预设的像素格式、第一帧的格式 / 每行字节数 / 色彩标签、音频格式），这些就是对假设的回答。
@@ -326,7 +332,7 @@ wait %1; head -3 /tmp/hc-perf.log; tail -5 /tmp/hc-stats.jsonl
 # 第二部分：整个应用（HdrCast.app）
 
 上面只验证了采集引擎。应用的其余部分（界面、点对点、mpv 编排、远程控制）是平台无关的 Rust，已经在 Windows 上实测过；
-macOS 特有的只有下面几处，同样**只做过类型检查**（`cargo check -p hdrcast --target aarch64-apple-darwin`）。
+macOS 特有的只有下面几处，写的时候同样只做过类型检查（`cargo check -p hdrcast --target aarch64-apple-darwin`；真机上做过哪些见开头的进度）。
 采集引擎的第 1–8 步通过之后再做这一部分。
 
 ## 12. 构建与启动
@@ -360,9 +366,8 @@ open dist/HdrCast.app
       不亮 → 把 mpv 的日志（**日志** 页筛"播放器"）发回来；macOS 上 mpv 的 HDR 直通可能还需要 `--gpu-api=vulkan` 之类的选项，
       现在的参数表（`crates/media/src/receiver/mpv_command.rs`）故意没加任何没把握的选项。
 - [ ] **全屏** 按钮、**停止** 按钮可用；停止后 mpv 进程消失（`pgrep mpv` 无输出）。直接退出 HdrCast 时 mpv 也跟着退出。
-- [ ] 悬浮窗（design.md §3.3，macOS 上只有最简单的做法）：观看时 HdrCast 窗口所在屏幕的右上角有个小圆按钮，单击展开成面板，"—" 收起；
-      面板里 **静音**、**解码方式** 立即生效。圆按钮的四角应该是透明的（看得到后面的东西）；是黑色方块 → 透明窗口在这里不生效，截图发回来。
-      它不跟着播放器、也拖不走（这两样只做了 Windows）。
+- [ ] 悬浮窗（design.md §3.3）：观看时 mpv 画面的右上角有个小圆按钮，单击展开成面板，"—" 收起；面板里 **静音**、**解码方式** 立即生效。
+      圆按钮的四角应该是透明的（看得到后面的东西）；是黑色方块 → 透明窗口在这里不生效，截图发回来。跟着播放器走、拖动、断开连接见第 18 步。
 - [ ] 播放窗口里滚轮、空格、`q` 都没反应（`--input-default-bindings=no`）；`Ctrl+Option+Enter` 切全屏；点窗口的关闭按钮 = 停止观看。
 
 ## 14. 开播（观众是 Windows）
@@ -383,7 +388,7 @@ open dist/HdrCast.app
 
 - [ ] Mac 当**观众**：Windows 主播在"谁可以连接"里把这台 Mac 的控制设成"自动获得"（或"询问我"，Mac 上点 **请求控制**、主播允许），
       连上后在 mpv 窗口里移动鼠标、点击、打字、滚轮，主播那边跟着动。
-      `Command` 键组合会作为 `Meta+…` 发过去（主播是 Windows 时等于 Win 键组合；`Ctrl + C` 这类要按 `Control`，不是 `Command`）。
+      0.3.9 起（双方都要）：主播是 Windows 时 `Command` 当 `Ctrl`、`Control` 当 Win 键，详见第 18 步；0.3.8 的主播把 `Command` 当 Win 键。
 - [ ] Mac 当**主播**：在"谁可以连接"里把观众的控制设成"询问我"，观众请求后点允许 → 第一次会要求在"系统设置 → 隐私与安全性 → 辅助功能"里勾选 HdrCast；
       勾选后再点一次允许。观众的指针被限制在正在分享的那块显示器上；双击、拖拽窗口、滚动、`Shift` 组合键都正常。
       - 验证：`crates/control/src/inject/mac.rs`（Quartz 事件、US 键位表、双击计数）。键位不对（例如 `;` 打出别的字符）说明主播用的不是 US 键盘布局：把现象发回来。
@@ -418,6 +423,30 @@ mpv 用 `crates/media/src/receiver/mpv_command.rs` 里的 `low_latency_args`（`
 - [ ] 延迟：主播屏幕上开一个毫秒秒表，用手机同时拍主播的屏幕和 Mac 上的 mpv 窗口，读数之差就是从屏幕到屏幕的延迟。
       Windows 观众在同一台电脑上是 14.5 ms（1080p 120 fps）；Mac 多一两个刷新周期正常。多出 50 ms 以上 → mpv 在 VideoToolbox 上还在攒帧：
       把 **设置 → 硬件解码** 改成 `videotoolbox-copy` 再拍一次，两次的照片和 mpv 日志（**日志** 页筛"播放器"）都发回来。
-- [ ] 移动鼠标、打字：和第 15 步一样能控制，指针跟手。
+- [ ] 移动鼠标、打字：和第 15 步一样能控制，指针跟手。指针落点：Mac 上指到画面的四个角和正中，主播的指针也在那里（0.3.7 的主播只走到一半，0.3.8 修好，
+      见 design §9"指针在哪块显示器上"）；主播日志有 `[control] a viewer's pointer moves on \\.\DISPLAYn: 宽x高 at (x, y)`。
 - [ ] 主播端拔一下网线（或关掉 Wi-Fi）两三秒再接上：画面停住，面板写着"传输中丢了一帧：画面停在上一帧，等关键帧"；接上后一两秒内画面接着动，
       不用重新连接（连接 15 s 收不到东西才算断）。
+
+## 18. 悬浮窗只在播放窗口上、Mac 的按键、断开连接、切换显示器（0.3.9；Mac 当观众，主播是 Windows，两边都要 0.3.9）
+
+Mac 这边的做法见 design §3.3 的 macOS 一条和 §9、§9.2；全部只做过类型检查，下面每一项都是第一次在真机上跑。
+
+- [ ] **只在播放窗口上**：小圆按钮出现在 mpv 画面的右上角（离边 12 点），不再在 HdrCast 窗口所在屏幕的角上。拖动、缩放 mpv 窗口：按钮跟着走。
+      切到别的程序、把它的窗口（HdrCast 自己的主窗口也一样）拖到按钮上面：按钮藏起来；挪开又出来。别的程序在前台、但窗口没压到按钮时，
+      按钮留在画面上（这是有意的：它只是画面的一部分）。
+      最小化 mpv、切到别的桌面（Space）：按钮不见；回来又在。按钮不对（位置偏、跟不上、一直不出来）→ 截图 + 日志发回来。
+- [ ] **不抢键盘**：按钮出现时，mpv 仍是前台程序（菜单栏左上角还是 mpv），在 mpv 里打字照常到主播。
+- [ ] **点击和拖动**：mpv 在前台时单击按钮，一下就展开（不需要点两下）；"—" 或 `Esc` 收起后前台回到 mpv（菜单栏是 mpv），直接打字就到主播。
+      拖按钮到画面左下角松手，它留在那里；退出 HdrCast 再观看还在左下。拖的时候按钮不往回跳。
+- [ ] **全屏**：`Control+Option+Enter` 或面板里的 **全屏**：mpv 铺满屏幕，没有切到新桌面的动画（`--native-fs=no`），按钮还在画面上。退出全屏同样。
+- [ ] **按键**（主播 Windows）：在主播上开记事本，Mac 上 `Command+A` 全选、`Command+C` / `Command+V` 复制粘贴、`Command+Z` 撤销、`Command+S` 保存都照
+      Windows 的 `Ctrl` 组合生效；`Control+D` 显示桌面、`Control+E` 打开资源管理器、`Control+R` 打开运行（Win 键组合）；`Option+Tab` 切回上一个窗口（`Alt+Tab`）。
+      `Command+Q`、`Command+W`、`Command+H`、`Command+M` 都发给主播（mpv 不会退出、关闭、隐藏或最小化，`--macos-menu-shortcuts=no`）。
+      不这样 → 主播日志里看这位观众的输入到了没有（`[control] … input is arriving`），把现象发回来。已知到不了的：`Command+Tab`、`Command+空格`、
+      `Control+方向键`（macOS 自己用），单独按 `Control`（开始菜单）或 `Shift`（切中英文）。
+- [ ] **断开连接**：面板最下面的 **断开连接**：mpv 和悬浮窗一起关掉，观看页回到"未在观看"，日志 `[app] stopped watching`。
+- [ ] **切换显示器**（主播有两块以上的屏）：控制着主播时，面板里有 **显示器** 一栏，每块屏一个按钮（名字、分辨率），正在分享的那块高亮。点另一块：
+      显示"正在切换…"，一两秒后画面换成那块屏，高亮跟过去；指针落点跟着换（指四个角对得上）。主播日志
+      `[control] <Mac 的名字> switched the shared display to <名字> (宽x高)`，主播开播页的显示器选择也变了。点 **只看不控** 后这一栏消失。
+      0.3.8 的主播：没有这一栏（正常）。

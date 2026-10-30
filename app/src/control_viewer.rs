@@ -3,13 +3,16 @@
 //!
 //! While the host allows control, an input section is switched on in mpv that sends every key to this IPC
 //! client instead of acting on it (see `hdrcast_control::keys`); Ctrl+Alt+Enter stays with the player and
-//! toggles full screen.
+//! toggles full screen. On a Mac the host is told that the keys come from a Mac's keyboard (Command where a PC
+//! has Ctrl). While this viewer controls the host, the host also says which displays it has, and the panel over
+//! the player can have it share another one (`hdrcast_control::displays`).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use hdrcast_control::displays::{self, ViewerDisplays};
 use hdrcast_control::{keys, ControlState, ViewerControl};
 use hdrcast_media::receiver::mpv_ipc::{observed, MpvIpcMessage, MpvIpcMessageKind};
 use serde_json::{json, Value};
@@ -33,6 +36,8 @@ struct Osd {
 #[derive(Default)]
 struct Inner {
     control: Option<ViewerControl>,
+    /// The host's displays, heard while this viewer controls it.
+    displays: Option<ViewerDisplays>,
     /// The user gave control back ("Just Watch"): not taken again by itself until they ask for it.
     released: bool,
     sid: String,
@@ -89,7 +94,8 @@ impl ViewerControlLink {
             return;
         }
         inner.sid = sid.to_string();
-        inner.control = key.map(|k| ViewerControl::new(&k, false, self.now_us()));
+        inner.control = key.map(|k| ViewerControl::new(&k, false, self.now_us()).with_mac_keyboard(cfg!(target_os = "macos")));
+        inner.displays = key.map(|k| ViewerDisplays::new(&k));
         inner.last_state = None;
     }
 
@@ -104,9 +110,49 @@ impl ViewerControlLink {
 
     /// A side-channel datagram from the host.
     pub fn on_datagram(&self, payload: &[u8]) {
-        if let Some(control) = self.inner.lock().unwrap().control.as_mut() {
+        let now = self.now_us();
+        let mut inner = self.inner.lock().unwrap();
+        if displays::is_display_datagram(payload) {
+            if let Some(displays) = inner.displays.as_mut() {
+                displays.on_datagram(payload, now);
+            }
+        } else if let Some(control) = inner.control.as_mut() {
             control.on_datagram(payload);
         }
+    }
+
+    /// The user wants the host to share its display `id` (from the host's list). The error is a sentence to show.
+    pub fn pick_display(&self, id: u8) -> Result<(), String> {
+        let now = self.now_us();
+        let name = {
+            let mut guard = self.inner.lock().unwrap();
+            let inner = &mut *guard;
+            let granted = inner.control.as_ref().is_some_and(ViewerControl::granted);
+            let displays = inner.displays.as_mut().filter(|_| granted).ok_or("Only while you control the host.")?;
+            if !displays.pick(id, now) {
+                return Err("The host has no such display.".to_string());
+            }
+            displays.list().and_then(|l| l.displays.iter().find(|d| d.id == id)).map(|d| d.name.clone()).unwrap_or_default()
+        };
+        (self.log)(&format!("[control] asked the host to share its display {name}"));
+        Ok(())
+    }
+
+    /// The host's displays for the page while this viewer controls it (null otherwise): the list, the one shared and
+    /// the one asked for that is not shared yet.
+    pub fn displays_view(&self) -> Value {
+        let inner = self.inner.lock().unwrap();
+        let granted = inner.control.as_ref().is_some_and(ViewerControl::granted);
+        let Some((list, pending)) = inner.displays.as_ref().filter(|_| granted).and_then(|d| Some((d.list()?, d.pending())))
+        else {
+            return Value::Null;
+        };
+        let shown: Vec<Value> = list
+            .displays
+            .iter()
+            .map(|d| json!({ "id": d.id, "name": d.name, "width": d.width, "height": d.height, "hz": d.refresh_hz, "hdr": d.hdr }))
+            .collect();
+        json!({ "list": shown, "shared": list.shared, "pending": pending })
     }
 
     /// A (re)started mpv is reachable: ask who we are in it; its input section has to be defined again.
@@ -178,8 +224,9 @@ impl ViewerControlLink {
     fn poll(&self) {
         let now = self.now_us();
         let mut note = None;
-        let datagram = {
-            let mut inner = self.inner.lock().unwrap();
+        let (datagram, pick) = {
+            let mut guard = self.inner.lock().unwrap();
+            let inner = &mut *guard;
             let released = inner.released;
             let Some(control) = inner.control.as_mut() else { return };
             // This computer may control the host as soon as it connects: take it, unless the user gave it back.
@@ -204,13 +251,22 @@ impl ViewerControlLink {
                     ControlState::Off => "[control] off",
                 });
             }
-            Self::sync_section(&mut inner, granted);
-            datagram
+            // the host only talks about its displays to whoever controls it
+            let pick = match inner.displays.as_mut() {
+                Some(displays) if granted => displays.poll(now),
+                Some(displays) => {
+                    displays.forget();
+                    None
+                }
+                None => None,
+            };
+            Self::sync_section(inner, granted);
+            (datagram, pick)
         };
         if let Some(line) = note {
             (self.log)(line);
         }
-        if let Some(datagram) = datagram {
+        for datagram in [datagram, pick].into_iter().flatten() {
             (self.send)(&datagram);
         }
     }
@@ -252,6 +308,7 @@ impl ViewerControlLink {
     pub fn session_ended(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.control = None;
+        inner.displays = None;
         inner.sid.clear();
         let _ = &inner.last_state;
         Self::sync_section(&mut inner, false);
@@ -261,6 +318,7 @@ impl ViewerControlLink {
         self.stopped.store(true, Ordering::SeqCst);
         let mut inner = self.inner.lock().unwrap();
         inner.control = None;
+        inner.displays = None;
         Self::sync_section(&mut inner, false);
         inner.ipc = None;
     }

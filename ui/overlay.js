@@ -1,8 +1,9 @@
 // The panel over the player (docs/design.md §3.3). Folded, it is a small round button on the picture; opened, it
 // shows what the stream is doing and the three things a viewer can change while watching: the decoder and the sound
 // at once, the delay by joining the host again (the delay is agreed on when joining). Resolution, frame rate and
-// bitrate are the host's to set. It is a small window of its own: the backend keeps it on the player's window and
-// sizes it (to the button, or to the height this page measures), and both can be dragged.
+// bitrate are the host's to set; which of its displays it shares, the viewer who controls it may pick. Disconnect
+// stops watching. It is a small window of its own: the backend keeps it on the player's window and sizes it (to the
+// button, or to the height this page measures), and both can be dragged.
 
 import { html, render, useEffect, useRef, useState } from './vendor/preact-htm.js';
 import { invoke, listen, win } from './api.js';
@@ -163,13 +164,45 @@ function Watching({ w }) {
           ? html`<div class="ov-guard">${t('watch.guardFrozen')}</div>`
           : player?.guard?.losses > 0 && html`<div class="ov-guard">${t('watch.guardSummary', { losses: player.guard.losses, held: player.guard.heldBack, freezes: player.guard.freezes })}</div>`}
         <${Delay} w=${w} />`}
+    <${Displays} w=${w} />
     <${Decoder} />
     <div class="ov-foot">
       <button class="btn small" disabled=${!player || player.state === 'idle'} onClick=${() => invoke('watch_fullscreen').catch(() => {})}>
         <${Icon} name="expand" />${player?.fullscreen ? t('overlay.exitFullscreen') : t('watch.fullscreenBtn')}</button>
       <button class="btn small" aria-pressed=${w.muted ? 'true' : 'false'} onClick=${toggleMute}>
         <${Icon} name=${w.muted ? 'muted' : 'speaker'} />${w.muted ? t('overlay.unmute') : t('overlay.mute')}</button>
+      <button class="btn small wide" onClick=${() => invoke('watch_stop').catch(() => {})}>
+        <${Icon} name="x" />${t('overlay.disconnect')}</button>
     </div>`;
+}
+
+/** The host's displays, while this viewer controls it: the one shared is marked, a click has the host share another
+ *  (its capture starts again on it, a second or two). Hosts before 0.3.9 say nothing about their displays. */
+function Displays({ w }) {
+  const [problem, setProblem] = useState(null);
+  const d = w.displays;
+  if (!d || d.list.length < 2) return null;
+  const switching = d.pending != null;
+  const pick = async (id) => {
+    if (switching || id === d.shared) return;
+    setProblem(null);
+    try {
+      await invoke('watch_set_display', { id });
+    } catch (e) {
+      setProblem(String(e));
+    }
+  };
+  const marked = switching ? d.pending : d.shared;
+  return html`<div class="ov-section">
+    <div class="ov-label"><span>${t('overlay.display')}</span><span class="spacer"></span>
+      <span class="ov-now">${switching ? t('overlay.switching') : t('overlay.displayNote')}</span></div>
+    <div class=${'ov-chips ' + (d.list.length === 3 || d.list.length > 4 ? 'three' : 'two')}>
+      ${d.list.map((m) => html`<button class=${'ov-chip' + (m.id === marked ? ' on' : '')} disabled=${switching && m.id !== marked}
+        title=${`${m.name} · ${m.width}×${m.height} · ${m.hz} Hz${m.hdr ? ' · HDR' : ''}`} onClick=${() => pick(m.id)}>
+        <span class="name">${m.name}</span><small>${m.width}×${m.height}${m.hdr ? ' HDR' : ''}</small></button>`)}
+    </div>
+    ${problem && html`<div class="ov-note warn">${problem}</div>`}
+  </div>`;
 }
 
 /** The delay: chosen here, taken by joining the host again (Apply). */

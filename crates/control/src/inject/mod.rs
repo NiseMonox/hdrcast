@@ -22,6 +22,13 @@ pub struct ScreenRect {
     pub height: f64,
 }
 
+impl ScreenRect {
+    /// Where a pointer position (`x` and `y` 0..=65535 across this display) is in global coordinates.
+    pub fn point(&self, x: u16, y: u16) -> (f64, f64) {
+        (self.x + (x as f64 / 65535.0) * (self.width - 1.0), self.y + (y as f64 / 65535.0) * (self.height - 1.0))
+    }
+}
+
 /// Says something worth knowing to the host's log, in its words ("[control] ...").
 pub type Notices = Arc<dyn Fn(&str) + Send + Sync>;
 
@@ -39,6 +46,9 @@ pub trait Injector: Send {
     /// The viewer this injector serves is (`true`) or is no longer (`false`) controlling this computer. The first
     /// input follows soon after a `true`: a chance to get ready (Windows: start the input service).
     fn activate(&mut self, _on: bool) {}
+    /// The shared display is somewhere else now (another resolution or arrangement of the displays, or another
+    /// display shared): the pointer positions that follow mean places on `display`.
+    fn set_display(&mut self, _display: ScreenRect) {}
 }
 
 /// The real thing for this operating system.
@@ -117,6 +127,9 @@ impl Injector for SystemInjector {
     }
     fn activate(&mut self, on: bool) {
         self.inner.activate(on)
+    }
+    fn set_display(&mut self, display: ScreenRect) {
+        self.inner.set_display(display)
     }
 }
 

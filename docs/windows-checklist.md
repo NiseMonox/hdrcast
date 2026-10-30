@@ -266,6 +266,10 @@ remux 子进程的 `inputbw=5465531`，观众走 `ffmpeg -f data` → 守卫 →
 - [ ] 播放窗口里的滚轮、空格、`q`、`m`、`9` / `0`、`f`、双击都没有反应；`Ctrl+Alt+Enter` 切全屏，`Esc` 退出全屏；把文件拖进播放窗口不会替换直播；
       拖画面不会移动窗口。点播放窗口的关闭按钮 = 停止观看（日志 `[app] the player window was closed`、`[app] stopped watching`），不会 3 s 后又弹出来。
 - [ ] 远程控制中：除了 `Ctrl+Alt+Enter` / `Ctrl+Alt+O`，`Esc` 和其他键都到了主播那边；点悬浮窗不会把点击发给主播。
+- [ ] 面板最下面的 **断开连接**（0.3.9）：播放器和悬浮窗一起关掉，观看页回到未在观看，日志 `[app] stopped watching`。
+- [ ] 切换显示器（0.3.9，design §9.2；主播有两块以上的屏）：控制着主播时面板里有 **显示器** 一栏，正在分享的那块高亮；点另一块，显示"正在切换…"，
+      一两秒后画面换成那块屏。主播日志 `[control] <名字> switched the shared display to <名字> (宽x高)`，主播开播页选中的显示器跟着变，
+      之后改别的设置不会把它改回去；控制模式下指针落在新的屏上。只看不控时这一栏消失；主播是 0.3.8 时没有这一栏。
 
 主播端（design.md §2.7）：
 
@@ -286,6 +290,8 @@ remux 子进程的 `inputbw=5465531`，观众走 `ffmpeg -f data` → 守卫 →
 - [ ] 观看页面板：**延迟**（主播从采集到发出 + 半个往返）几毫秒到十几毫秒、帧率接近设定值、码率、**丢失的画面**；悬浮窗同样，没有延迟预设。
       开播页这位观众一行带"控制模式"、ping、Mbps。
 - [ ] 鼠标、键盘照控制规则工作（§9）；声音从观众的默认输出出来，静音按钮有效。
+- [ ] 指针落点：观众把指针依次放到画面的四个角和正中，主播的指针每次都在共享显示器的同一个位置（不是缩在左上角那一块里）。主播日志有
+      `[control] a viewer's pointer moves on \\.\DISPLAYn: 宽x高 at (x, y)`，宽高是那块显示器此刻的分辨率；控制中改它的分辨率，一秒内日志再说一次，指针仍然对得上。
 - [ ] 最后一位控制模式观众走后 10 s：主播日志 `nobody is in control mode: stopping its stream until somebody connects`。
 - [ ] 开播页改控制模式的码率：`control mode now at … Mbps: the running encoder took it`；改帧率：`control mode's settings changed: starting its capture and encoder again`，
       观众停顿一下后继续。关掉 **提供控制模式**：控制模式的观众被断开。

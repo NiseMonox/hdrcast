@@ -203,8 +203,9 @@ pub fn ffmpeg_pipe_args(url: &str) -> Vec<String> {
 
 /// mpv arguments; `input` is the srt:// URL or "-" for stdin.
 ///
-/// Windows gets exactly what 0.2.4 passed. macOS differs in two places only: no `--gpu-api=d3d11` (mpv picks
-/// the API of its own build there), and VideoToolbox where Windows names D3D11VA. The HDR logic is the same:
+/// Windows gets exactly what 0.2.4 passed. macOS differs in three places only: no `--gpu-api=d3d11` (mpv picks
+/// the API of its own build there), VideoToolbox where Windows names D3D11VA, and its own window options
+/// (`--macos-menu-shortcuts=no --native-fs=no`) where Windows has `--media-controls=no`. The HDR logic is the same:
 /// gpu-next with `--target-colorspace-hint`, tone mapping and the target peak. The macOS list was checked
 /// against the option list of mpv 0.41 but STILL NEEDS A RUN ON A REAL MAC.
 pub fn mpv_args(
@@ -281,6 +282,13 @@ pub fn mpv_args(
         // on-screen controller off, a load failure left mpv 0.41 stuck in the media controls' shutdown every time
         // (12 s until killed; 0.2 s with this), and the app restarts mpv only once it has exited.
         a.push("--media-controls=no".to_string());
+    }
+    if platform == Platform::MacOs {
+        // Command's shortcuts belong to the host under remote control: mpv's menu bar takes Cmd+Q, Cmd+W, Cmd+C,
+        // Cmd+V... before any binding sees them (Cmd+Q quit the player). And full screen stays on this Space instead
+        // of getting one of its own, so that HdrCast's panel can stay on the picture (docs/design.md §3.3).
+        a.push("--macos-menu-shortcuts=no".to_string());
+        a.push("--native-fs=no".to_string());
     }
     a.push(format!("--title={WINDOW_TITLE}"));
     a.push("--msg-level=all=info".to_string());
