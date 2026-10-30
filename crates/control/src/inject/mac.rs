@@ -190,10 +190,8 @@ impl MacInjector {
 
 impl super::Injector for MacInjector {
     fn pointer(&mut self, x: u16, y: u16) {
-        self.position = CGPoint::new(
-            self.display.x + (x as f64 / 65535.0) * (self.display.width - 1.0),
-            self.display.y + (y as f64 / 65535.0) * (self.display.height - 1.0),
-        );
+        let (px, py) = self.display.point(x, y);
+        self.position = CGPoint::new(px, py);
         // While a button is down the move must be a drag of that button, or windows and selections do not follow.
         let (kind, button) = if self.left {
             (CGEventType::LeftMouseDragged, CGMouseButton::Left)
@@ -268,5 +266,9 @@ impl super::Injector for MacInjector {
                 None => self.post_key(0, down, 0, Some(c)),
             },
         }
+    }
+
+    fn set_display(&mut self, display: ScreenRect) {
+        self.display = display;
     }
 }

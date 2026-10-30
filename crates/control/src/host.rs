@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use crate::inject::Injector;
+use crate::inject::{Injector, ScreenRect};
 use crate::keys::{Button, Key, Mods};
 use crate::wire::{Channel, EventKind, GrantState, HostMessage, ViewerMessage};
 
@@ -100,6 +100,11 @@ impl HostControl {
     pub fn decide(&mut self, allow: bool) {
         self.decision = if allow { Decision::Allowed } else { Decision::Refused };
         self.after_change();
+    }
+
+    /// The shared display is somewhere else now: this viewer's pointer follows it ([`Injector::set_display`]).
+    pub fn set_display(&mut self, display: ScreenRect) {
+        self.injector.set_display(display);
     }
 
     /// The standing rule changed in the settings. Turning it off takes control back from everyone.

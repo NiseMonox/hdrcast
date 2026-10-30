@@ -272,6 +272,12 @@ fn build_low_latency_plan(inner: &Inner) -> Result<LowLatencyPlan, Vec<String>> 
     })
 }
 
+/// The display both streams capture, as the capture engine names it (empty when none is selected): remote control's
+/// pointer is confined to it.
+fn shared_display(inner: &Inner) -> String {
+    state::selected_output(&inner.sender, &inner.outputs).map(|o| o.device_name.clone()).unwrap_or_default()
+}
+
 /// Control mode can be offered: switched on, and an NVIDIA GPU to encode on (the engine drives NVENC itself; one
 /// that found out it cannot made `low_latency` unavailable).
 fn offers_control_mode(inner: &Inner, low_latency: Option<&LowLatencyHost>) -> bool {
@@ -486,9 +492,9 @@ pub fn settings_changed(app: &AppState) {
 /// break; anything else of its picture starts it again (its viewers ask for a keyframe and go on). Switched off,
 /// whoever is in control mode is disconnected (they may connect again to watch).
 fn apply_to_control_mode(app: &AppState, session: &Arc<Session>) {
-    let (offered, wanted) = {
+    let (offered, wanted, display) = {
         let inner = app.inner.lock().unwrap();
-        (offers_control_mode(&inner, Some(&session.low_latency)), build_low_latency_plan(&inner))
+        (offers_control_mode(&inner, Some(&session.low_latency)), build_low_latency_plan(&inner), shared_display(&inner))
     };
     if !offered {
         for viewer in session.host.viewers().into_iter().filter(|v| v.low_latency) {
@@ -521,6 +527,8 @@ fn apply_to_control_mode(app: &AppState, session: &Arc<Session>) {
     app.log("[app] control mode's settings changed: starting its capture and encoder again");
     thread::spawn(move || {
         let _one_at_a_time = session.starting.lock().unwrap();
+        // another display may be shared now
+        session.hub.set_display(&display);
         low_latency.start(wanted);
     });
 }
@@ -747,14 +755,16 @@ fn ensure_streaming(app: &Arc<AppState>, session: &Session) -> Result<(), String
 fn ensure_low_latency(app: &Arc<AppState>, session: &Session) -> Result<(), String> {
     let _one_at_a_time = session.starting.lock().unwrap();
     if !matches!(session.low_latency.state(), RunnerState::Starting | RunnerState::Streaming) {
-        let plan = {
+        let (plan, display) = {
             let inner = app.inner.lock().unwrap();
             if !offers_control_mode(&inner, Some(&session.low_latency)) {
                 return Err("control mode is not offered on this computer".to_string());
             }
-            build_low_latency_plan(&inner)
+            (build_low_latency_plan(&inner), shared_display(&inner))
         };
         let plan = plan.map_err(|problems| problems.join(" "))?;
+        // the pointer of whoever controls is confined to the display this engine captures, as with the buffered stream
+        session.hub.set_display(&display);
         app.log(&format!("[app] {}", plan.summary));
         session.low_latency.start(plan);
     }
@@ -778,8 +788,7 @@ fn start_runner(app: &AppState, session: &Session) -> Result<(), Vec<String>> {
     let (plan, display, bitrate, max) = {
         let inner = app.inner.lock().unwrap();
         let plan = build_plan(app, &inner)?;
-        let display = state::selected_output(&inner.sender, &inner.outputs).map(|o| o.device_name.clone()).unwrap_or_default();
-        (plan, display, inner.sender.bitrate_bps(), inner.sender.max_viewers.max(1) as u32)
+        (plan, shared_display(&inner), inner.sender.bitrate_bps(), inner.sender.max_viewers.max(1) as u32)
     };
     *session.problem.lock().unwrap() = None;
     session.hub.set_display(&display);

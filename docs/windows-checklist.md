@@ -286,6 +286,8 @@ remux 子进程的 `inputbw=5465531`，观众走 `ffmpeg -f data` → 守卫 →
 - [ ] 观看页面板：**延迟**（主播从采集到发出 + 半个往返）几毫秒到十几毫秒、帧率接近设定值、码率、**丢失的画面**；悬浮窗同样，没有延迟预设。
       开播页这位观众一行带"控制模式"、ping、Mbps。
 - [ ] 鼠标、键盘照控制规则工作（§9）；声音从观众的默认输出出来，静音按钮有效。
+- [ ] 指针落点：观众把指针依次放到画面的四个角和正中，主播的指针每次都在共享显示器的同一个位置（不是缩在左上角那一块里）。主播日志有
+      `[control] a viewer's pointer moves on \\.\DISPLAYn: 宽x高 at (x, y)`，宽高是那块显示器此刻的分辨率；控制中改它的分辨率，一秒内日志再说一次，指针仍然对得上。
 - [ ] 最后一位控制模式观众走后 10 s：主播日志 `nobody is in control mode: stopping its stream until somebody connects`。
 - [ ] 开播页改控制模式的码率：`control mode now at … Mbps: the running encoder took it`；改帧率：`control mode's settings changed: starting its capture and encoder again`，
       观众停顿一下后继续。关掉 **提供控制模式**：控制模式的观众被断开。

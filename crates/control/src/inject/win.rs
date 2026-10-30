@@ -172,8 +172,7 @@ impl super::Injector for WinInjector {
         if vw < 2.0 || vh < 2.0 {
             return;
         }
-        let px = self.display.x + (x as f64 / 65535.0) * (self.display.width - 1.0);
-        let py = self.display.y + (y as f64 / 65535.0) * (self.display.height - 1.0);
+        let (px, py) = self.display.point(x, y);
         // absolute coordinates run 0..=65535 across the whole virtual desktop
         let ax = ((px - vx) * 65535.0 / (vw - 1.0)).round() as i32;
         let ay = ((py - vy) * 65535.0 / (vh - 1.0)).round() as i32;
@@ -219,6 +218,10 @@ impl super::Injector for WinInjector {
                 vk_event(vk, extended, down);
             }
         }
+    }
+
+    fn set_display(&mut self, display: ScreenRect) {
+        self.display = display;
     }
 }
 
