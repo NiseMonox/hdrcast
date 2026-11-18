@@ -176,6 +176,7 @@ pub fn low_latency_args(s: &ReceiverSettings, ipc_endpoint: &str, platform: Plat
         "--demuxer-lavf-probesize=",
         "--demuxer-lavf-analyzeduration=",
         "--demuxer-lavf-format=",
+        "--mc=",
     ];
     let mut a: Vec<String> = watching.into_iter().filter(|arg| !buffering.iter().any(|b| arg.starts_with(b))).collect();
     a.pop(); // the input, put back last
@@ -260,6 +261,12 @@ pub fn mpv_args(
     a.push("--demuxer-lavf-analyzeduration=2".to_string());
     if pipe_input {
         a.push("--demuxer-lavf-format=mpegts".to_string());
+        // The guard hides pictures until the next intact keyframe (docs/design.md §3.2). When that takes 5 s or more,
+        // mpv takes the jump in the video timestamps for a reset of the stream's clock: it shows the keyframe at once,
+        // ahead of the sound by the length of the freeze, and its sync correction (at most 0.4 of a frame's time per
+        // frame by default) needed over a minute to bring the picture back (measured with mpv 0.41: 18 s ahead after
+        // an 18 s freeze). With up to 1 s per frame it is back in about 2.5 s; small drifts are corrected as before.
+        a.push("--mc=1".to_string());
     }
 
     a.push(format!("--input-ipc-server={ipc_endpoint}"));

@@ -95,7 +95,10 @@ sharer's computer. No relay server, no public IPv4 address, no port forwarding t
 ### Watching
 
 1. **Watch** lists the computers in the group that are online (refreshed every 10 s). Pick where you watch from under
-   **Delay**: Japan 1.5 s, Australia 2 s, China 3.5 s.
+   **Connection → Delay**: Japan 1.5 s, Australia 2 s, China 3.5 s. Or click **Test** next to a computer: it measures the
+   line to it for about half a minute and suggests the shortest delay and player buffer that still get nearly everything
+   through (**Use These Settings** sets them). **Player buffer** and **Resend headroom** are there too, and **Behind
+   live** adds it all up.
 2. A computer marked **LIVE** is broadcasting: click **Watch**. One that is only **Online** starts sharing when you click
    **Connect**, and its owner may have to let you in first (you see **WAITING**).
 3. On an **HDR display**, switch HDR on first (Windows: `Win + Alt + B`). On an SDR display, set **Output** to SDR.
@@ -103,11 +106,15 @@ sharer's computer. No relay server, no public IPv4 address, no port forwarding t
    [If something is wrong](#if-something-is-wrong).
 5. While you watch, a small round button sits on the picture (top right; drag it anywhere and it stays there next time).
    Click it, or press `Ctrl + Alt + O` in the player, for the **overlay**: what arrives (resolution, frame rate, bitrate,
-   ping, loss), the **Delay** (**Apply** connects again with it: the picture stops for a few seconds), the **Decoder** and
-   **Mute** (both at once), **Full Screen** and **Disconnect**. While you control the sharer, its **Display** row picks which
+   ping, loss), the **Delay** (**Apply** connects again with it: the picture stops for a few seconds), the **Bitrate limit**
+   (asks the sharer for less, see below), the **Decoder** and **Mute** (all three at once), **Full Screen** and **Disconnect**. While you control the sharer, its **Display** row picks which
    of the sharer's displays it shares (both need 0.3.9). The button and the overlay only show on the player's window: they
    get out of the way when another window comes in front. The player window has no controls or shortcuts of its own:
    `Ctrl + Alt + Enter` switches full screen, `Esc` leaves it, and closing the window stops watching.
+6. The picture stutters because your connection cannot take the sharer's bitrate? Pick a lower **Bitrate limit** on the
+   **Watch** page or in the overlay (both sides need 0.3.10). The sharer's bitrate stays the most it can be, and one encode
+   serves everyone: whoever asked for the least sets it for all viewers, and the sharer sees who asked. It is kept for
+   that sharer.
 
 The delay is there on purpose: this is a broadcast that rides out a bumpy connection, not a remote desktop. For remote
 control, use the **Fast** preset (see below).
@@ -122,6 +129,8 @@ control, use the **Fast** preset (see below).
 3. Settings can be changed while you share: they apply at once and viewers stay connected. The encoder restarts for about
    a second; with **Keyframe on request** a new bitrate does not even do that. A bitrate higher than a viewer started with
    makes that viewer connect again once (about ten seconds).
+   Viewers may ask for a lower bitrate (0.3.10): the stream then runs at the lowest one asked for, and the bitrate tile
+   says who asked. **Share → Picture → Viewers may lower it** switches that off.
 4. In a voice chat with the group? On Windows, pick it under **Sound → Leave out** (for example `Discord.exe`) so
    your friends do not hear themselves come back through the stream. Needs Windows 10 21H1 or newer; one app at a time.
 5. You do not have to go live at all: see the next section.
@@ -233,7 +242,7 @@ The panel on the Watch page says what happened. The usual ones:
 | Nobody at … answered your request | The sharer was not at their computer to click Allow within 50 seconds. |
 | … is full | The sharer's **Viewers at once** is reached. |
 | The signaling server cannot be reached | Your internet is down, or the signaling server is. People already watching keep watching. |
-| Picture stutters, then recovers every few seconds | Raise the delay (China: try a custom 4000-5000 ms), or ask for a lower bitrate. |
+| Picture stutters, then recovers every few seconds | Raise the delay (China: try a custom 4000-5000 ms; **Test** next to the computer measures what the line needs), or lower the **Bitrate limit** on **Watch** (both sides 0.3.10), or ask for a lower bitrate. |
 | Colours look grey and flat on an HDR display | HDR is off in the system (Windows: `Win + Alt + B`). |
 | mpv says it cannot open `srt://` | Your mpv has no libsrt: use the zhongfly / shinchiro build (get-tools.cmd does) or Homebrew's. |
 

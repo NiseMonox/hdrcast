@@ -191,7 +191,7 @@ mod progress_on_stderr {
         }
         .normalized();
         assert!(r.validate().is_empty());
-        assert_eq!(r.overhead_percent(), 50);
+        assert_eq!(r.overhead_to_ask(), 50);
         let url =
             srt_url::build(&r.to_srt_options(40123, "a77MWmBi3_603E3kH2abfOI5O-dIU5dn")).unwrap();
         assert!(

@@ -2,8 +2,9 @@ import { html, useState } from '../vendor/preact-htm.js';
 import { invoke } from '../api.js';
 import { t } from '../i18n.js';
 import { Icon } from '../icons.js';
-import { useStore, editSettings, flushSettings, openSheet, toast, setState, state } from '../store.js';
-import { Avatar, Empty, NumberField, Row, Section, Segmented, Select, Switch, formatDuration } from '../components.js';
+import { useStore, editSettings, flushSettings, openSheet, closeSheet, toast, setState, state } from '../store.js';
+import { Avatar, Empty, NumberField, Row, Section, Segmented, Select, Sheet, Switch, formatDuration } from '../components.js';
+import { bitrateChoices, bitrateNote, ceilingOf, mbpsText } from '../bitrate.js';
 
 export function isWatching(status) {
   return !!status?.watch?.active;
@@ -27,6 +28,18 @@ function wantControl(want) {
   invoke('watch_control', { want }).catch((e) => toast(String(e), { kind: 'warn' }));
 }
 
+/** The resend headroom the viewer asks for when it is not set: by the delay, as the app does. */
+function autoOverhead(latencyMs) {
+  return latencyMs >= 3000 ? 50 : 25;
+}
+
+/** Seconds behind live: the delay, the player's buffer and about 0.8 s of capturing, encoding, decoding and showing
+ * (measured against a clock on the screen: 1.19 s for 90 ms and 0.3 s with the host's Balanced quality, 0.84 s with
+ * Speed; docs/network.md §3). */
+function behindLive(latencyMs, bufferSeconds) {
+  return (latencyMs / 1000 + bufferSeconds + 0.8).toFixed(1);
+}
+
 function liveFor(sinceMs, onDemand) {
   const minutes = Math.max(0, Math.floor((Date.now() - sinceMs) / 60000));
   const prefix = onDemand ? 'watch.online' : 'watch.live';
@@ -44,6 +57,8 @@ export function WatchPage() {
   const set = (patch) => editSettings('receiver', patch);
   const [custom, setCustom] = useState(false);
   const presetValue = !custom && presets.some((p) => p.latencyMs === receiver.latencyMs) ? receiver.latencyMs : -1;
+  const probe = status.probe || { run: null, results: {} };
+  const overheads = [0, 25, 50, 100].concat([25, 50, 100].includes(receiver.overheadPercent) || !receiver.overheadPercent ? [] : [receiver.overheadPercent]);
 
   const refresh = () => invoke('live_refresh').catch(() => {});
 
@@ -85,6 +100,7 @@ export function WatchPage() {
                   </div>
                 </div>
                 <div class="pactions">
+                  ${!receiver.controlMode && html`<${ProbeButton} host=${h} probe=${probe} blocked=${watching || full} />`}
                   ${mine
                     ? html`<span class="badge green">${t('watch.watchingNow')}</span>`
                     : receiver.controlMode && h.lowLatency
@@ -105,12 +121,27 @@ export function WatchPage() {
           options=${[{ value: false, label: t('watch.modeWatch') }, { value: true, label: t('watch.modeControl') }]} />
       <//>
       ${!receiver.controlMode && html`<${Row} name=${t('watch.latency')} hint=${t('watch.latencyHint')} disabled=${watching}>
-        <${Segmented} value=${presetValue} onChange=${(v) => { setCustom(v < 0); if (v > 0) set({ latencyMs: v }); }}
+        <${Segmented} value=${presetValue} onChange=${(v) => {
+            setCustom(v < 0);
+            const preset = presets.find((p) => p.latencyMs === v);
+            if (preset) set({ latencyMs: preset.latencyMs, bufferSeconds: preset.bufferSeconds });
+          }}
           options=${presets.map((p) => ({ value: p.latencyMs, label: t('preset.' + p.name, null, p.name) })).concat([{ value: -1, label: t('watch.custom') }])} />
       <//>`}
       ${!receiver.controlMode && presetValue === -1 && html`<${Row} name=${t('watch.latencyCustom')} disabled=${watching}>
         <${NumberField} value=${receiver.latencyMs} min=${20} max=${30000} onChange=${(v) => set({ latencyMs: v })} />
         <span class="unit">ms</span>
+      <//>`}
+      ${!receiver.controlMode && html`<${Row} name=${t('watch.buffer')} hint=${t('watch.bufferHint')} disabled=${watching}>
+        <${NumberField} value=${receiver.bufferSeconds} min=${0.1} max=${30} step=${0.1} onChange=${(v) => set({ bufferSeconds: v })} />
+        <span class="unit">${t('unit.s')}</span>
+      <//>`}
+      ${!receiver.controlMode && html`<${Row} name=${t('watch.overhead')} hint=${t('watch.overheadHint')} disabled=${watching}>
+        <${Segmented} value=${receiver.overheadPercent || 0} onChange=${(v) => set({ overheadPercent: v })}
+          options=${overheads.map((n) => ({ value: n, label: n ? n + ' %' : t('watch.overheadAuto', { n: autoOverhead(receiver.latencyMs) }) }))} />
+      <//>`}
+      ${!receiver.controlMode && html`<${Row} name=${t('watch.behind')} hint=${t('watch.behindHint')}>
+        <span class="value-text">${t('watch.behindValue', { s: behindLive(receiver.latencyMs, receiver.bufferSeconds) })}</span>
       <//>`}
     <//>
 
@@ -167,6 +198,32 @@ function ControlLine({ watch }) {
   return html`<div class="control-line">
     <span class="what"><${Icon} name="cursor" /> ${t('control.state.' + c, { host: watch.hostName })}</span>
     ${button}
+  </div>`;
+}
+
+/** The most this viewer asks the host's stream to carry (docs/design.md §8.13), and what the host answered. Kept for
+ *  this host: every later join asks for it too. A host before 0.3.10 takes no such requests. */
+function BitrateLine({ watch }) {
+  const b = watch.bitrate;
+  if (!b || watch.session?.state !== 'connected') return null;
+  if (!b.can) return html`<div class="control-line"><span class="what"><${Icon} name="gauge" /> ${t('watch.brOld')}</span></div>`;
+  const ceiling = ceilingOf(b);
+  const wanted = b.link?.wantedKbps || 0;
+  const choose = (kbps) => {
+    if (kbps === wanted) return;
+    // shown at once (the next status says the same)
+    const w = state.status.watch;
+    setState({ status: { ...state.status, watch: { ...w, bitrate: { ...w.bitrate, link: { ...w.bitrate.link, wantedKbps: kbps, waiting: true } } } } });
+    invoke('watch_set_bitrate', { kbps }).catch((e) => toast(String(e), { kind: 'warn' }));
+  };
+  return html`<div class="control-line">
+    <span class="what" title=${t('watch.brHint')}><${Icon} name="gauge" /> ${bitrateNote(b)}</span>
+    <span class="unit">${t('watch.bitrateLimit')}</span>
+    <${Select} value=${wanted} onChange=${choose}
+      options=${bitrateChoices(ceiling, wanted).map((kbps) => ({
+        value: kbps,
+        label: kbps ? `${mbpsText(kbps)} Mbps` : t('watch.brHost', { mbps: ceiling ? mbpsText(ceiling) : '—' }),
+      }))} />
   </div>`;
 }
 
@@ -239,7 +296,118 @@ function NowPlaying({ watch }) {
         <div class="s">${player?.hdr ? t('watch.hdrActive') : (player?.output || ' ')}</div></div>
     </div>`}
     ${!refused && html`<${ControlLine} watch=${watch} />`}
+    ${!refused && html`<${BitrateLine} watch=${watch} />`}
     ${!refused && html`<${GuardLine} guard=${player?.guard} />`}
     ${!refused && player?.source && html`<div class="hero-sub" style="margin-top:-6px">${player.source}</div>`}
   </div>`;
+}
+
+// ------------------------------------------------------------------------------------------------ connection test
+
+/** The test's button on a host's row: what it found, or how far it is. Blocked: watching, or the host is full (the
+ * test takes a viewer's place); a result can still be looked at. */
+function ProbeButton({ host, probe, blocked }) {
+  const run = probe.run;
+  const mine = run && run.hostId === host.hostId;
+  const result = probe.results?.[host.hostId];
+  const label = mine && run.active
+    ? (run.secondsLeft != null ? t('probe.btnLeft', { s: Math.ceil(run.secondsLeft) }) : t('probe.btnRunning'))
+    : result ? t('probe.btnResult', { ms: result.latencyMs }) : t('probe.btn');
+  return html`<button class="btn plain" title=${t('probe.btnHint')} disabled=${(run?.active && !mine) || (blocked && !result && !mine)}
+    onClick=${() => openSheet('probe', { hostId: host.hostId, hostName: host.name })}>
+    <${Icon} name="gauge" />${label}</button>`;
+}
+
+function fmt(n, digits) {
+  return n == null ? '—' : Number(n).toFixed(digits);
+}
+
+export function ProbeSheet({ hostId, hostName }) {
+  const s = useStore();
+  const probe = s.status.probe || { run: null, results: {} };
+  const run = probe.run && probe.run.hostId === hostId ? probe.run : null;
+  const result = probe.results?.[hostId];
+  const watching = isWatching(s.status);
+  const elsewhere = probe.run?.active && probe.run.hostId !== hostId;
+  const { receiver } = s.settings;
+  const name = result?.hostName || run?.hostName || hostName;
+  const start = async () => {
+    await flushSettings();
+    try {
+      const r = await invoke('probe_start', { hostId });
+      if (!r.ok) toast(r.problems.join('\n'), { kind: 'warn' });
+    } catch (e) {
+      toast(String(e), { kind: 'warn' });
+    }
+  };
+  const stop = () => invoke('probe_stop').catch(() => {});
+  const apply = () => {
+    const overheadPercent = result.overheadPercent <= autoOverhead(result.latencyMs) ? 0 : result.overheadPercent;
+    editSettings('receiver', { latencyMs: result.latencyMs, bufferSeconds: result.bufferSeconds, overheadPercent });
+    toast(t('probe.applied', { ms: result.latencyMs, s: result.bufferSeconds }), { kind: 'ok' });
+    closeSheet();
+  };
+
+  let body;
+  if (run?.active) {
+    const phase = run.phase === 'joining' && run.approval ? 'approval' : run.phase;
+    body = html`
+      <p class="stext">${t('probe.phase.' + phase, { host: name, s: Math.ceil(run.secondsLeft || 0) })}</p>
+      <div class="progress"><div class="bar" style=${`width:${Math.round(run.progress * 100)}%`}></div></div>
+      ${run.phase === 'joining' && run.status && html`<p class="stext small">${run.status}</p>`}
+      ${run.now && html`<p class="stext small">${t('probe.nowLine', { rtt: fmt(run.now.rttMs, 1), loss: fmt(run.now.lossPercent, 2), late: fmt(run.now.latestMs, 0) })}</p>`}
+      <div class="sheet-actions">
+        <button class="btn" onClick=${closeSheet}>${t('probe.hide')}</button>
+        <button class="btn primary" onClick=${stop}><${Icon} name="stop" />${t('probe.stop')}</button>
+      </div>`;
+  } else if (result && !(run?.phase === 'failed' && run.error)) {
+    body = html`<${ProbeResult} result=${result} receiver=${receiver} />
+      <div class="sheet-actions">
+        <button class="btn" disabled=${watching || elsewhere} onClick=${start}>${t('probe.again')}</button>
+        <span class="spacer"></span>
+        <button class="btn" onClick=${closeSheet}>${t('common.close')}</button>
+        <button class="btn primary" disabled=${watching} onClick=${apply}>${t('probe.apply')}</button>
+      </div>`;
+  } else {
+    body = html`
+      ${run?.phase === 'failed' && run.error
+        ? html`<p class="stext">${t('probe.failed', { error: run.error })}</p>`
+        : html`<p class="stext left">${t('probe.intro', { host: name })}</p>
+          <p class="stext left small">${t('probe.tips', { host: name })}</p>`}
+      ${watching && html`<p class="stext small">${t('probe.notWhileWatching')}</p>`}
+      ${elsewhere && html`<p class="stext small">${t('probe.busy', { host: probe.run.hostName })}</p>`}
+      <div class="sheet-actions">
+        <button class="btn" onClick=${closeSheet}>${t('common.cancel')}</button>
+        <button class="btn primary" disabled=${watching || elsewhere} onClick=${start}><${Icon} name="gauge" />${t('probe.start')}</button>
+      </div>`;
+  }
+  return html`<${Sheet} wide onClose=${closeSheet}>
+    <div class="sicon"><${Icon} name="gauge" /></div>
+    <h2>${t('probe.title', { host: name })}</h2>
+    ${body}
+  <//>`;
+}
+
+function ProbeResult({ result: r, receiver }) {
+  const covers = t('probe.coversValue', { first: fmt(r.firstTryMs, 0), resend: fmt(r.resendMs, 0) })
+    + (r.rounds > 1 ? t('probe.coversMore', { n: r.rounds - 1, extra: fmt(r.extraRoundMs, 0) }) : '');
+  return html`
+    <p class="stext">${t('probe.verdict.' + r.verdict)}</p>
+    <div class="probe-figs">
+      <div class="fig"><div class="k">${t('watch.latency')}</div><div class="v">${r.latencyMs}<small>ms</small></div></div>
+      <div class="fig"><div class="k">${t('watch.buffer')}</div><div class="v">${r.bufferSeconds}<small>${t('unit.s')}</small></div></div>
+      <div class="fig"><div class="k">${t('watch.overhead')}</div><div class="v">${r.overheadPercent}<small>%</small></div></div>
+      <div class="fig"><div class="k">${t('watch.behind')}</div><div class="v">${behindLive(r.latencyMs, r.bufferSeconds)}<small>${t('unit.s')}</small></div></div>
+    </div>
+    <p class="stext small">${t('probe.now', { ms: receiver.latencyMs, s: receiver.bufferSeconds, behind: behindLive(receiver.latencyMs, receiver.bufferSeconds) })}
+      ${' · '}${t('probe.by.' + r.decidedBy)}</p>
+    <div class="kv probe-kv">
+      <span class="k">${t('probe.rtt')}</span><span class="v">${t('probe.rttValue', { rtt: fmt(r.rttMs, 1), v: fmt(r.rttVarMs, 1) })}</span>
+      <span class="k">${t('probe.loss')}</span><span class="v">${t('probe.lossValue', { p: fmt(r.lossPercent, 2), rec: r.recovered, un: r.unrecovered })}</span>
+      <span class="k">${t('probe.latest')}</span><span class="v">${t('probe.latestValue', { ms: fmt(r.latestMs, 0), first: fmt(r.firstTryMs, 0), rec: fmt(r.recoveredMaxMs, 0) })}</span>
+      <span class="k">${t('probe.covers')}</span><span class="v">${covers}</span>
+      <span class="k">${t('probe.stream')}</span><span class="v">${t('probe.streamValue', { mbps: fmt(r.mbps, 1), n: r.packets, s: fmt(r.seconds, 0) })}</span>
+      ${r.path && html`<span class="k">${t('probe.path')}</span><span class="v">${r.path}</span>`}
+    </div>
+    ${r.notes.length > 0 && html`<ul class="problems">${r.notes.map((n) => html`<li>${t('probe.note.' + n.kind, { n: n.n })}</li>`)}</ul>`}`;
 }

@@ -140,6 +140,10 @@ pub struct LiveRecord {
     /// may join with "ll" and gets the picture in side datagrams instead of through SRT. Written only when true,
     /// last; absent means no (hosts older than 0.3.7, or one whose encoder cannot do it).
     pub low_latency: bool,
+    /// "br": the host takes requests for a lower bitrate on the side channel and answers them (docs/design.md §8.13),
+    /// whether or not its user lets them count right now (the answers say). Written only when true, last; absent
+    /// means no, and then nothing of the kind may be sent to it (hosts older than 0.3.10).
+    pub bitrate_requests: bool,
 }
 
 impl Default for LiveRecord {
@@ -160,6 +164,7 @@ impl Default for LiveRecord {
             on_demand: false,
             keyframes: false,
             low_latency: false,
+            bitrate_requests: false,
         }
     }
 }
@@ -197,6 +202,9 @@ impl LiveRecord {
         if self.low_latency {
             p.insert("ll".to_string(), Value::from(true));
         }
+        if self.bitrate_requests {
+            p.insert("br".to_string(), Value::from(true));
+        }
         p
     }
 
@@ -218,6 +226,7 @@ impl LiveRecord {
             on_demand: field(p, "od").and_then(json::as_bool).unwrap_or(false),
             keyframes: field(p, "kf").and_then(json::as_bool).unwrap_or(false),
             low_latency: field(p, "ll").and_then(json::as_bool).unwrap_or(false),
+            bitrate_requests: field(p, "br").and_then(json::as_bool).unwrap_or(false),
         };
         (r.host_id == expected_host).then_some(r)
     }
@@ -279,6 +288,10 @@ pub struct JoinRequest {
     /// "ll": control mode (docs/design.md §11): the viewer wants the low-latency stream in side datagrams instead of
     /// SRT. Only sent to a host whose live record says "ll". Written only when true, last; absent means no.
     pub low_latency: bool,
+    /// "br": the most this viewer wants the stream to carry, kbit/s (0: the host's setting), which also says that it
+    /// asks for a lower bitrate on the side channel and understands the answers (docs/design.md §8.13). Only sent to
+    /// a host whose live record says "br". Written only when `Some`, last; absent means `None`.
+    pub bitrate_kbps: Option<u32>,
 }
 
 impl JoinRequest {
@@ -304,6 +317,9 @@ impl JoinRequest {
         if self.low_latency {
             p.insert("ll".to_string(), Value::from(true));
         }
+        if let Some(kbps) = self.bitrate_kbps {
+            p.insert("br".to_string(), Value::from(kbps));
+        }
         p
     }
 
@@ -322,6 +338,7 @@ impl JoinRequest {
             device: DeviceProof::read(p, true),
             keyframes: field(p, "kf").and_then(json::as_bool).unwrap_or(false),
             low_latency: field(p, "ll").and_then(json::as_bool).unwrap_or(false),
+            bitrate_kbps: integer(p, "br").and_then(|kbps| u32::try_from(kbps).ok()),
         };
         if !keys::is_valid_id(&j.session_id) || !keys::is_valid_id(&j.viewer_id) {
             return None;
@@ -442,7 +459,7 @@ mod tests {
         let open = LiveRecord { open_ipv4: Some(false), ..live };
         assert!(Value::Object(open.to_payload()).to_string().ends_with(r#","viewers":1,"open4":false}"#));
 
-        let join = JoinRequest { session_id: "S".into(), viewer_id: "V".into(), name: "n".into(), time_ms: 3, candidates: vec![], latency_ms: 3500, overhead_percent: 50, remote_control: false, device: None, keyframes: false, low_latency: false };
+        let join = JoinRequest { session_id: "S".into(), viewer_id: "V".into(), name: "n".into(), time_ms: 3, candidates: vec![], latency_ms: 3500, overhead_percent: 50, remote_control: false, device: None, keyframes: false, low_latency: false, bitrate_kbps: None };
         assert_eq!(Value::Object(join.to_payload()).to_string(), r#"{"v":1,"t":3,"sid":"S","viewer":"V","name":"n","cands":[],"latency":3500,"overhead":50}"#);
 
         let answer = JoinAnswer { session_id: "S".into(), time_ms: 4, ok: false, reason: JoinAnswer::REASON_FULL.into(), candidates: vec![], device: None };
@@ -568,6 +585,42 @@ mod tests {
         assert_eq!(text, format!(r#"{}{}"#, &plain[..plain.len() - 1], r#","ll":true}"#));
         assert_eq!(JoinRequest::from_payload(&asking.to_payload()), Some(asking));
         assert!(!JoinRequest::from_payload(&join.to_payload()).unwrap().low_latency);
+    }
+
+    #[test]
+    fn the_bitrate_fields_come_after_everything_only_when_set() {
+        let host = keys::new_id();
+        let live = LiveRecord { host_id: host.clone(), name: "n".into(), mbps: 40, max_viewers: 4, keyframes: true, low_latency: true, ..LiveRecord::default() };
+        let plain = Value::Object(live.to_payload()).to_string();
+        assert!(plain.ends_with(r#","kf":true,"ll":true}"#), "{plain}");
+        assert!(!plain.contains(r#""br""#));
+        assert!(!LiveRecord::from_payload(&live.to_payload(), &host).unwrap().bitrate_requests);
+        let taking = LiveRecord { bitrate_requests: true, ..live.clone() };
+        let text = Value::Object(taking.to_payload()).to_string();
+        assert_eq!(text, format!(r#"{}{}"#, &plain[..plain.len() - 1], r#","br":true}"#));
+        assert_eq!(LiveRecord::from_payload(&taking.to_payload(), &host).unwrap(), taking);
+        for value in ["false", "1", "\"no\"", "null"] {
+            let odd = object(&format!(r#"{{"host":"{host}","br":{value}}}"#));
+            assert!(!LiveRecord::from_payload(&odd, &host).unwrap().bitrate_requests, "{value}");
+        }
+
+        // the join: the most the viewer wants, 0 included (it speaks the requests, and asks for nothing yet)
+        let (sid, viewer) = (keys::new_id(), keys::new_id());
+        let join = JoinRequest { session_id: sid.clone(), viewer_id: viewer.clone(), name: "n".into(), latency_ms: 300, overhead_percent: 25, keyframes: true, low_latency: true, ..JoinRequest::default() };
+        let plain = Value::Object(join.to_payload()).to_string();
+        assert!(plain.ends_with(r#","kf":true,"ll":true}"#), "{plain}");
+        assert_eq!(JoinRequest::from_payload(&join.to_payload()).unwrap().bitrate_kbps, None);
+        for kbps in [0, 8000] {
+            let asking = JoinRequest { bitrate_kbps: Some(kbps), ..join.clone() };
+            let text = Value::Object(asking.to_payload()).to_string();
+            assert_eq!(text, format!(r#"{},"br":{kbps}}}"#, &plain[..plain.len() - 1]));
+            assert_eq!(JoinRequest::from_payload(&asking.to_payload()), Some(asking));
+        }
+        // what is not a rate reads as none: the viewer is taken for one that does not speak the requests
+        for (value, read) in [("-1", None), ("\"5000\"", Some(5000)), ("true", None), ("4294967296", None), ("null", None)] {
+            let odd = object(&format!(r#"{{"sid":"{sid}","viewer":"{viewer}","br":{value}}}"#));
+            assert_eq!(JoinRequest::from_payload(&odd).unwrap().bitrate_kbps, read, "{value}");
+        }
     }
 
     #[test]

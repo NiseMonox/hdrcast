@@ -6,7 +6,8 @@
 //! device: allowed means it is taken at once, "ask" means the user can ask for it from the page.
 //!
 //! A host that takes keyframe requests ("kf") is asked for a fresh keyframe when part of the stream is lost
-//! (docs/design.md §8.12).
+//! (docs/design.md §8.12). A host that takes bitrate requests ("br") is asked for at most the bitrate this viewer
+//! chose for it (docs/design.md §8.13), in every join and again whenever the choice changes while watching.
 //!
 //! While watching, the panel over the player (`overlay.rs`) changes the decoder and the sound at once and the delay
 //! by joining again (the delay is agreed on when joining); while this viewer controls the host, it can have the host
@@ -23,6 +24,7 @@ use std::time::Duration;
 use hdrcast_core::common::srt_buffer_sizing;
 use hdrcast_control::keys;
 use hdrcast_core::group::keys::GroupKeys;
+use hdrcast_media::bitrate;
 use hdrcast_media::keyframe;
 use hdrcast_media::low_latency;
 use hdrcast_media::receiver::mpv_command;
@@ -30,6 +32,7 @@ use hdrcast_media::receiver::settings::{HwDecMode, ReceiverFrontend, ReceiverSet
 use hdrcast_p2p::{LinkAddresses, SideUse, SimulatedLoss, ViewerSession, ViewerSessionOptions, ViewerSessionState};
 use serde_json::{json, Value};
 
+use crate::bitrate_viewer::BitrateLink;
 use crate::commands;
 use crate::control_viewer::ViewerControlLink;
 use crate::keyframe_viewer::KeyframeLink;
@@ -48,6 +51,8 @@ struct Session {
     runner: MpvRunner,
     control: Option<Arc<ViewerControlLink>>,
     keyframes: Arc<KeyframeLink>,
+    /// What this viewer asks the host's stream to carry at most (§8.13).
+    bitrate: Arc<BitrateLink>,
     /// Control mode was asked for: the stream of a session that joined in it comes through here.
     low_latency: Option<Arc<LowLatencyLink>>,
     /// The player runs for control mode (its stdin fed by `low_latency`) rather than for SRT.
@@ -82,6 +87,8 @@ pub fn start(app: &Arc<AppState>, host_id: &str) -> Result<(), Vec<String>> {
     if is_active(app) {
         return Err(vec!["Already watching.".to_string()]);
     }
+    // a connection test would join the host a second time
+    crate::probe::stop(app);
     let (group, settings) = {
         let inner = app.inner.lock().unwrap();
         (inner.group.current().clone(), inner.receiver.clone())
@@ -101,6 +108,11 @@ pub fn start(app: &Arc<AppState>, host_id: &str) -> Result<(), Vec<String>> {
     }
     let keys = group.keys().map_err(|_| vec!["There is no group yet.".to_string()])?;
     let host_name = crate::live::name_of(app, host_id).unwrap_or_default();
+    // what to ask this host for at most: as chosen for it, at every join (the choice may change while watching)
+    let wanted = settings.bitrate_limit(host_id);
+    let (limit_app, limit_host) = (Arc::downgrade(app), host_id.to_string());
+    let request_bitrate: Arc<dyn Fn() -> u32 + Send + Sync> =
+        Arc::new(move || limit_app.upgrade().map_or(wanted, |app| app.inner.lock().unwrap().receiver.bitrate_limit(&limit_host)));
 
     let addresses = std::env::var(SIMULATE_LOSS_ENV).ok().and_then(|spec| {
         let loss = SimulatedLoss::parse(&spec, Some(app.logger()));
@@ -116,13 +128,15 @@ pub fn start(app: &Arc<AppState>, host_id: &str) -> Result<(), Vec<String>> {
             group,
             host_id: host_id.to_string(),
             latency_ms: settings.latency_ms,
-            overhead_percent: settings.overhead_percent() as i32,
+            overhead_percent: settings.overhead_to_ask() as i32,
             // this viewer speaks the side channel: the host's rules say what remote control it gets
             request_control: true,
             // and asks for keyframes when it loses part of the stream (only hosts that take requests)
             request_keyframes: true,
             // control mode, from a host that offers it (the others are watched as always)
             request_low_latency: settings.control_mode,
+            // and at most the bitrate chosen for this host, from one that takes such requests
+            request_bitrate: Some(request_bitrate),
             addresses,
             device: Some(app.device.clone()),
             map_router_port: state::router_mapping_wanted(),
@@ -146,6 +160,12 @@ pub fn start(app: &Arc<AppState>, host_id: &str) -> Result<(), Vec<String>> {
             Arc::new(move |payload| sender.upgrade().is_some_and(|s| s.viewer.send_side_for(SideUse::Keyframes, payload))),
             app.logger(),
         );
+        let sender = weak.clone();
+        let bitrate = BitrateLink::start(
+            wanted,
+            Arc::new(move |payload| sender.upgrade().is_some_and(|s| s.viewer.send_side_for(SideUse::Bitrate, payload))),
+            app.logger(),
+        );
         let low_latency = settings.control_mode.then(|| {
             let sender = weak.clone();
             LowLatencyLink::start(
@@ -159,6 +179,7 @@ pub fn start(app: &Arc<AppState>, host_id: &str) -> Result<(), Vec<String>> {
             runner,
             control,
             keyframes,
+            bitrate,
             low_latency,
             player_low_latency: AtomicBool::new(false),
             keys,
@@ -171,9 +192,10 @@ pub fn start(app: &Arc<AppState>, host_id: &str) -> Result<(), Vec<String>> {
     });
 
     {
-        // the side channel carries remote control, keyframe answers and control mode's stream: they tell themselves
-        // apart by their first byte
+        // the side channel carries remote control, keyframe answers, control mode's stream and bitrate answers: they
+        // tell themselves apart by their first byte
         let (control, keyframes, fast) = (session.control.clone(), session.keyframes.clone(), session.low_latency.clone());
+        let lower = session.bitrate.clone();
         session.viewer.set_side_handler(Arc::new(move |payload| {
             if low_latency::is_low_latency_datagram(payload) {
                 if let Some(fast) = &fast {
@@ -181,6 +203,8 @@ pub fn start(app: &Arc<AppState>, host_id: &str) -> Result<(), Vec<String>> {
                 }
             } else if keyframe::is_keyframe_datagram(payload) {
                 keyframes.on_datagram(payload);
+            } else if bitrate::is_bitrate_datagram(payload) {
+                lower.on_datagram(payload);
             } else if let Some(control) = &control {
                 control.on_datagram(payload);
             }
@@ -232,6 +256,7 @@ pub fn start(app: &Arc<AppState>, host_id: &str) -> Result<(), Vec<String>> {
             control.stop();
         }
         session.keyframes.stop();
+        session.bitrate.stop();
         if let Some(fast) = &session.low_latency {
             fast.stop();
         }
@@ -243,7 +268,7 @@ pub fn start(app: &Arc<AppState>, host_id: &str) -> Result<(), Vec<String>> {
     Ok(())
 }
 
-fn receiver_ffmpeg(settings: &ReceiverSettings) -> Option<std::path::PathBuf> {
+pub(crate) fn receiver_ffmpeg(settings: &ReceiverSettings) -> Option<std::path::PathBuf> {
     use hdrcast_core::common::tool_locator;
     tool_locator::resolve(Some(&settings.ffmpeg_path), &tool_locator::exe_name(tool_locator::FFMPEG))
 }
@@ -255,6 +280,10 @@ impl Session {
         match self.viewer.sid().filter(|_| connected && self.viewer.host_takes_keyframes()) {
             Some(sid) => self.keyframes.session(&sid, self.keys.keyframe_key(&sid)),
             None => self.keyframes.session_ended(),
+        }
+        match self.viewer.sid().filter(|_| connected && self.viewer.host_takes_bitrate()) {
+            Some(sid) => self.bitrate.session(&sid, self.keys.bitrate_key(&sid)),
+            None => self.bitrate.session_ended(),
         }
         if let Some(control) = &self.control {
             match self.viewer.sid().filter(|_| connected) {
@@ -361,6 +390,7 @@ fn end(app: &AppState) -> bool {
         control.stop();
     }
     session.keyframes.stop();
+    session.bitrate.stop();
     if let Some(fast) = &session.low_latency {
         fast.stop();
     }
@@ -373,11 +403,14 @@ fn end(app: &AppState) -> bool {
     true
 }
 
-/// Joins the same host again with the delay as it is set now: the delay is agreed on when joining, so a new one
-/// takes a new session. The panel over the player stays open meanwhile.
+/// Joins the same host again with the delay as it is set now: the delay and the resend headroom are agreed on
+/// when joining, and the player takes its buffer when it starts, so new ones take a new session. The panel over the
+/// player stays open meanwhile.
 pub fn rejoin(app: &Arc<AppState>) -> Result<(), Vec<String>> {
     let Some(session) = current(app) else { return Ok(()) };
-    if session.settings.latency_ms == app.inner.lock().unwrap().receiver.latency_ms {
+    let now = app.inner.lock().unwrap().receiver.clone();
+    let then = &session.settings;
+    if (then.latency_ms, then.overhead_to_ask(), then.buffer_seconds) == (now.latency_ms, now.overhead_to_ask(), now.buffer_seconds) {
         return Ok(());
     }
     let host_id = session.host_id.clone();
@@ -451,6 +484,19 @@ pub fn want_control(app: &AppState, want: bool) -> Result<(), String> {
     let session = current(app).ok_or("Not watching.")?;
     session.control.as_ref().ok_or("This host does not offer remote control.")?.want(want);
     Ok(())
+}
+
+/// The host being watched, by its peer id.
+pub fn host_id(app: &AppState) -> Option<String> {
+    current(app).map(|s| s.host_id.clone())
+}
+
+/// Asks the host being watched for at most `kbps` (0: its own setting), at once (§8.13). The caller saves the choice
+/// for this host, which every later join carries.
+pub fn set_bitrate_limit(app: &AppState, kbps: u32) {
+    if let Some(session) = current(app) {
+        session.bitrate.want(kbps);
+    }
 }
 
 /// Has the host share its display `id` (the panel over the player, while this viewer controls the host).
@@ -530,6 +576,12 @@ pub fn status(app: &AppState) -> Value {
         "ll": session.low_latency.as_ref().filter(|_| viewer.low_latency()).map(|fast| fast.status()),
         // agreed on when joining: a new one takes joining again
         "latencyMs": session.settings.latency_ms,
+        // the most this viewer asks the stream to carry (§8.13); "can": the host takes such requests
+        "bitrate": {
+            "can": viewer.state() == ViewerSessionState::Connected && viewer.host_takes_bitrate(),
+            "hostMbps": viewer.host_mbps(),
+            "link": session.bitrate.status(),
+        },
         "overlay": overlay::is_expanded(app),
         "muted": app.watch.muted.load(Ordering::SeqCst),
         "session": {

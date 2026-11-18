@@ -2,6 +2,8 @@
 
 mod access;
 mod autostart;
+mod bitrate_host;
+mod bitrate_viewer;
 mod clipboard;
 mod commands;
 mod control_host;
@@ -19,6 +21,7 @@ mod mpv_ipc;
 mod mpv_runner;
 mod net_report;
 mod overlay;
+mod probe;
 mod sender_runner;
 mod share;
 mod state;
@@ -208,6 +211,9 @@ fn run_app(startup_invite: Option<String>, background: bool, instance: instance:
             commands::watch_set_latency,
             commands::watch_set_mute,
             commands::watch_set_display,
+            commands::watch_set_bitrate,
+            commands::probe_start,
+            commands::probe_stop,
             commands::overlay_init,
             commands::overlay_toggle,
             commands::overlay_expand,

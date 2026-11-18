@@ -85,6 +85,8 @@ struct Gate {
     status: MpvStatusModel,
     recent: VecDeque<String>,
     guard: Option<GuardStats>,
+    /// mpv's cache pause around the guard's freezes.
+    hold: PauseHold,
 }
 
 /// Hears what the player's own bindings send (hdrcast_control::keys::player_bindings): the panel's key
@@ -125,6 +127,7 @@ impl MpvRunner {
             status: MpvStatusModel::new(),
             recent: VecDeque::new(),
             guard: None,
+            hold: PauseHold::default(),
         };
         Self {
             shared: Arc::new(Shared {
@@ -300,6 +303,8 @@ impl Shared {
             g.catching_up = false;
             g.recent.clear();
             g.guard = None;
+            // a new mpv starts with its cache pause on (its command line)
+            g.hold = PauseHold::default();
             (g.generation, plan, g.attempt)
         };
         let text = if attempt == 1 { "Starting mpv…".to_string() } else { format!("Reconnecting (attempt {attempt})…") };
@@ -449,11 +454,18 @@ impl Shared {
                     if let Some(line) = journal.note(&events, &stats) {
                         me.emit(&line);
                     }
-                    {
+                    let pause = {
                         let mut g = me.gate.lock().unwrap();
                         if g.generation == gen {
                             g.guard = Some(stats);
+                            Self::hold_step(&mut g, &events)
+                        } else {
+                            None
                         }
+                    };
+                    // before the pictures go on: mpv gets to a freeze a buffer's length after the guard
+                    if let Some(step) = pause {
+                        me.set_cache_pause(step);
                     }
                     if let Err(e) = dst.write_all(&out) {
                         if me.current(gen) {
@@ -533,6 +545,7 @@ impl Shared {
     fn on_ipc_message(&self, gen: u64, msg: &MpvIpcMessage) {
         let mut note = None;
         let mut speed = None;
+        let mut pause = None;
         let mut loaded = false;
         let mut player_message = None;
         {
@@ -547,6 +560,7 @@ impl Shared {
                             let name = msg.name.as_deref().unwrap_or("");
                             if name == observed::DEMUXER_CACHE_DURATION {
                                 speed = Self::catch_up(&mut g);
+                                pause = Self::hold_step(&mut g, &[]);
                             }
                             if name == observed::PAUSED_FOR_CACHE && g.state == PlayerState::Playing {
                                 g.text = if g.status.paused_for_cache { "Playing (buffering…)" } else { "Playing" }.to_string();
@@ -579,6 +593,9 @@ impl Shared {
             }
             self.emit(&line);
         }
+        if let Some(step) = pause {
+            self.set_cache_pause(step);
+        }
         if let Some(line) = note {
             self.emit(&line);
         }
@@ -607,8 +624,8 @@ impl Shared {
         }
     }
 
-    /// Live catch-up: play at 1.05x while the demuxer cache exceeds buffer + 1.5 s, back to 1x at the target.
-    /// Returns the speed to set and the log line for it.
+    /// Live catch-up: play at 1.05x once the demuxer cache is well over the buffer ([`catch_up_above`]), back to 1x
+    /// at the buffer. Returns the speed to set and the log line for it.
     fn catch_up(g: &mut Gate) -> Option<(f64, String)> {
         let settings = g.settings.as_ref()?;
         if !settings.auto_catch_up || g.status.paused_for_cache {
@@ -619,7 +636,7 @@ impl Shared {
         }
         let cache = g.status.cache_seconds?;
         let target = settings.buffer_seconds;
-        if !g.catching_up && cache > target + 1.5 {
+        if !g.catching_up && cache > catch_up_above(target) {
             g.catching_up = true;
             Some((1.05, format!("[ipc] cache {cache:.1} s > target: catching up at 1.05x")))
         } else if g.catching_up && cache <= target {
@@ -629,6 +646,115 @@ impl Shared {
             None
         }
     }
+
+    /// Moves mpv's cache pause with the guard's `events` and the cache ([`PauseHold`]): what to set in the current
+    /// mpv, when that changes and the mpv can be reached.
+    fn hold_step(g: &mut Gate, events: &[GuardEvent]) -> Option<CachePauseStep> {
+        let now = Instant::now();
+        let buffer = player_buffer(g.settings.as_ref());
+        let cache = g.status.cache_seconds.unwrap_or(0.0);
+        for &event in events {
+            g.hold.event(event, now, cache, buffer);
+        }
+        let on = g.hold.wanted(now, cache, buffer);
+        if on != g.hold.off {
+            return None;
+        }
+        let ipc = g.ipc.clone().filter(|ipc| ipc.is_connected())?;
+        g.hold.off = !on;
+        let first = !on && !std::mem::replace(&mut g.hold.told, true);
+        Some(CachePauseStep { ipc, on, first })
+    }
+
+    fn set_cache_pause(&self, step: CachePauseStep) {
+        step.ipc.set_property("cache-pause", step.on);
+        if step.first {
+            self.emit("[ipc] while the guard holds the picture mpv does not stop to buffer: the sound plays on, the next keyframe comes in step with it");
+        }
+    }
+}
+
+/// A change of mpv's cache pause ([`PauseHold`]) for the mpv behind `ipc`.
+struct CachePauseStep {
+    ipc: MpvIpcClient,
+    on: bool,
+    /// The first time it goes off for this mpv: worth a line in the log.
+    first: bool,
+}
+
+/// After mpv has played up to where a freeze ended, the cache pause stays off this much longer (s).
+const PAUSE_HOLD_MARGIN: f64 = 0.5;
+
+/// After mpv has played past a freeze, the cache pause comes back after this long even if the cache has not refilled:
+/// a stream that does not refill it is stalling, which mpv should buffer for.
+const PAUSE_HOLD_LIMIT: Duration = Duration::from_secs(10);
+
+/// mpv's cache pause around the guard's freezes (docs/design.md §3.2). While the guard holds the picture, mpv's
+/// decoder gets pictures it skips without showing anything, so it goes on through the buffered video up to the
+/// newest data. mpv takes that for an empty cache: it stops the sound to buffer for as long as the freeze lasts, then
+/// plays the frozen stretch late, the picture behind the sound by the length of the freeze and the whole stream later
+/// by as much (measured 2026-11-16 with a 1.5 s buffer: a 3.5 s freeze gave 3.2 s of silence, a still picture for
+/// 6.8 s and 3.3 s more delay for good). With the cache pause off the sound plays on, the decoder
+/// waits at the newest data, and mpv shows the keyframe that ends the freeze when the sound gets to it. The pause
+/// comes back once mpv has played past the freeze (as far behind the stream as it was when the freeze began, from
+/// when the guard saw its end) and the cache holds half the buffer again (or [`PAUSE_HOLD_LIMIT`] later): a real stall
+/// is still buffered for.
+#[derive(Debug, Default)]
+struct PauseHold {
+    /// The guard is holding the picture.
+    frozen: bool,
+    /// The cache pause is off in the current mpv.
+    off: bool,
+    /// How far behind the stream mpv plays (s): its cache when the freeze began, at least the buffer.
+    behind: f64,
+    /// Not before then does the pause come back: mpv has played past the end of the last freeze.
+    until: Option<Instant>,
+    /// The log has said what this is about (once per mpv).
+    told: bool,
+}
+
+impl PauseHold {
+    /// The guard froze or recovered at `now`, with `cache` seconds in mpv's cache and a buffer of `buffer` s.
+    fn event(&mut self, event: GuardEvent, now: Instant, cache: f64, buffer: f64) {
+        match event {
+            GuardEvent::Froze => {
+                if !self.frozen && !self.off {
+                    self.behind = 0.0;
+                }
+                self.behind = self.behind.max(cache).max(buffer);
+                self.frozen = true;
+                self.until = None;
+            }
+            GuardEvent::Recovered { .. } if self.frozen => {
+                self.frozen = false;
+                let wait = (self.behind + PAUSE_HOLD_MARGIN).min(60.0);
+                self.until = Some(now + Duration::from_secs_f64(wait));
+            }
+            GuardEvent::Recovered { .. } => {}
+        }
+    }
+
+    /// Whether mpv's cache pause should be on at `now`.
+    fn wanted(&self, now: Instant, cache: f64, buffer: f64) -> bool {
+        match (self.frozen, self.off, self.until) {
+            (true, _, _) => false,
+            (false, true, Some(until)) => now >= until && (cache >= buffer / 2.0 || now >= until + PAUSE_HOLD_LIMIT),
+            _ => true,
+        }
+    }
+}
+
+/// The player's buffer (s) as the mpv command line has it.
+fn player_buffer(settings: Option<&ReceiverSettings>) -> f64 {
+    settings.map(|s| s.buffer_seconds).filter(|&b| b > 0.0).unwrap_or(1.5)
+}
+
+/// The cache (seconds) above which the player catches up to a buffer of `target`: about 1.5 s over it for the usual
+/// buffers, as before; less for a short one, but at least 0.2 s. mpv starts with a quarter second or more over the
+/// buffer (what came while it probed the stream and opened the decoder), which a short buffer would otherwise keep
+/// for good (docs/design.md §5.1).
+pub fn catch_up_above(target: f64) -> f64 {
+    target + (target - 0.1).clamp(0.2, 1.5)
 }
 
 /// Puts `--name=value` in the plan's mpv arguments, in place of the one there or before the input (the last one).
@@ -720,5 +846,63 @@ mod tests {
         set_option(&mut plan, "mute", "yes");
         set_option(&mut plan, "mute", "no");
         assert_eq!(plan.mpv_args, ["--vo=gpu-next", "--hwdec=no", "--title=HdrCast", "--mute=no", "-"]);
+    }
+
+    #[test]
+    fn a_short_buffer_is_caught_up_to_sooner() {
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        assert!(near(catch_up_above(1.5), 2.9), "the usual buffer about as before");
+        assert!(near(catch_up_above(3.0), 4.5));
+        assert!(near(catch_up_above(0.5), 0.9));
+        // measured: a 0.3 s buffer started with 0.53-0.58 s (and now and then 0.8-1.2 s) in the cache
+        assert!(near(catch_up_above(0.3), 0.5));
+        assert!(near(catch_up_above(0.1), 0.3));
+    }
+
+    fn recovered() -> GuardEvent {
+        GuardEvent::Recovered { skipped: 210, ticks: 315_000 }
+    }
+
+    #[test]
+    fn the_cache_pause_is_off_while_the_picture_is_held_and_back_once_mpv_has_played_past_the_freeze() {
+        let t0 = Instant::now();
+        let at = |s: f64| t0 + Duration::from_secs_f64(s);
+        let mut hold = PauseHold::default();
+        assert!(hold.wanted(at(0.0), 1.6, 1.5), "on while nothing is held");
+        hold.event(GuardEvent::Froze, at(1.0), 1.6, 1.5);
+        assert!(!hold.wanted(at(1.0), 1.6, 1.5));
+        hold.off = true; // set in mpv
+        // the decoder runs through the hidden pictures to the newest data: the cache is empty, the pause stays off
+        assert!(!hold.wanted(at(3.0), 0.0, 1.5));
+        hold.event(recovered(), at(4.5), 0.0, 1.5);
+        // mpv plays 1.6 s behind the guard: it is past the freeze 2.1 s from now (with the margin)
+        assert!(!hold.wanted(at(5.5), 1.0, 1.5), "not before mpv has played past the freeze");
+        assert!(!hold.wanted(at(6.7), 0.5, 1.5), "nor before the cache holds half the buffer again");
+        assert!(hold.wanted(at(6.7), 0.8, 1.5));
+        assert!(!hold.wanted(at(16.0), 0.5, 1.5), "the cache refills within seconds of the freeze...");
+        assert!(hold.wanted(at(16.7), 0.5, 1.5), "...a stream that does not is stalling");
+        hold.off = false;
+        assert!(hold.wanted(at(7.0), 0.0, 1.5), "a stall after that is buffered for again");
+    }
+
+    #[test]
+    fn another_freeze_before_the_pause_is_back_keeps_it_off_until_mpv_is_past_that_one_too() {
+        let t0 = Instant::now();
+        let at = |s: f64| t0 + Duration::from_secs_f64(s);
+        let mut hold = PauseHold::default();
+        // mpv was 3 s behind (pauses before this build): it is past a freeze 3.5 s after the guard
+        hold.event(GuardEvent::Froze, at(0.0), 3.0, 1.5);
+        hold.off = true;
+        hold.event(recovered(), at(1.0), 3.0, 1.5);
+        hold.event(GuardEvent::Froze, at(2.0), 0.0, 1.5);
+        assert!(!hold.wanted(at(5.0), 3.0, 1.5), "held again");
+        hold.event(recovered(), at(3.0), 0.0, 1.5);
+        assert!(!hold.wanted(at(6.0), 3.0, 1.5), "still as far behind as before");
+        assert!(hold.wanted(at(6.6), 3.0, 1.5));
+        // a recovery without a freeze (another mpv's) changes nothing
+        let mut fresh = PauseHold::default();
+        fresh.event(recovered(), at(0.0), 0.0, 1.5);
+        assert!(fresh.wanted(at(0.0), 0.0, 1.5));
+        assert_eq!(player_buffer(None), 1.5);
     }
 }

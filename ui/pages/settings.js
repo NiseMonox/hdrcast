@@ -164,10 +164,6 @@ export function SettingsPage() {
         <${Select} value=${receiver.hwDec} onChange=${(v) => setR({ hwDec: v })}
           options=${s.init.hwDecModes.map((m) => ({ value: m.id, label: m.name }))} />
       <//>
-      <${Row} name=${t('settings.buffer')} hint=${t('settings.bufferHint')} disabled=${watching}>
-        <${NumberField} value=${receiver.bufferSeconds} min=${0.2} max=${30} step=${0.1} onChange=${(v) => setR({ bufferSeconds: v })} />
-        <span class="unit">${t('unit.s')}</span>
-      <//>
       <${Row} name=${t('settings.expectedBitrate')} hint=${t('settings.expectedBitrateHint')} disabled=${watching}>
         <${NumberField} value=${receiver.expectedBitrateMbps} min=${1} max=${1000} onChange=${(v) => setR({ expectedBitrateMbps: v })} />
         <span class="unit">Mbps</span>

@@ -16,11 +16,16 @@
 //! link capacity in packets/s, receive rate in bytes/s; a light ACK has the first field only), NAK (3: lost
 //! sequence numbers, a range as `first | 0x80000000, last`) and DROPREQ (7: first and last sequence number the
 //! sender dropped).
+//!
+//! Where the packets come in from the network ([`SrtMonitor::receiving`], the viewer's end), the monitor also
+//! measures how late each one arrived against its own timestamp ([`Lateness`], docs/design.md §5.1): the delay
+//! SRT would have needed to hand it over in time. The connection test picks the viewer's delay from that.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use crate::udp_channel::mono_clock;
 use crate::util::lock;
 
 const HEADER_BYTES: usize = 16;
@@ -43,6 +48,12 @@ const LASTING_AT_LEAST: Duration = Duration::from_millis(60);
 const LASTING_CHECK_EVERY: Duration = Duration::from_millis(10);
 /// Gaps remembered (a long outage is one gap).
 const MAX_HOLES: usize = 4096;
+/// Lateness is counted in 1 ms bins up to this many (the last bin takes everything later).
+const LATE_BINS: usize = 10_000;
+/// A connection's first packet stands in for its quickest one until that is known: packets up to this many ms
+/// quicker than the first still land in their own bin.
+const RAW_BEFORE: usize = 2_000;
+const RAW_BINS: usize = RAW_BEFORE + LATE_BINS;
 
 /// Counts since the monitor started. Which side's figures mean what: the host's monitor sees everything its SRT
 /// sender sends; the viewer's sees everything that reaches its SRT receiver, so only it can tell what never did.
@@ -123,6 +134,40 @@ impl SrtStats {
     }
 }
 
+/// How late the data packets of a stream arrived, from [`SrtMonitor::lateness`] (docs/design.md §5.1).
+///
+/// A packet's lateness is its arrival time minus its SRT timestamp (the moment the sender took it in; a resend
+/// carries the original's), less the same difference for the quickest packet of its connection. SRT hands a packet
+/// over at its timestamp plus the latency, counted from about the quickest arrival: a packet later than the
+/// latency is dropped at the receiver. So this is the latency each packet needed, with everything that held it up
+/// on the way: the sender's pacing of a big keyframe, queues and jitter on the path, and for a packet lost on the
+/// way the rounds of asking for it again. Each sequence number counts once, by its first copy to arrive; packets
+/// that never arrived are in [`SrtCounts::unrecovered`].
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Lateness {
+    /// Packets measured.
+    pub packets: u64,
+    /// The median, 99th, 99.9th and 99.99th percentile and the latest one, in ms (1 ms steps).
+    pub p50_ms: f64,
+    pub p99_ms: f64,
+    pub p999_ms: f64,
+    pub p9999_ms: f64,
+    pub max_ms: f64,
+    /// Packets that came on their first send: the 99.9th percentile and the latest (the sender's pacing and the
+    /// path's jitter, without resends).
+    pub first_try_p999_ms: f64,
+    pub first_try_max_ms: f64,
+    /// Packets that came only on a resend (or out of order): how many, the median and the latest.
+    pub recovered: u64,
+    pub recovered_p50_ms: f64,
+    pub recovered_max_ms: f64,
+    /// The longest time no data came from the host (an outage), ms.
+    pub longest_gap_ms: f64,
+    /// Runs of first sends found missing (a packet came after a gap), and the longest run, in packets.
+    pub loss_runs: u64,
+    pub longest_run: u32,
+}
+
 /// Watches one SRT connection through a forwarder; see the module documentation. Thread-safe: the two directions
 /// are fed from different threads.
 pub struct SrtMonitor {
@@ -153,6 +198,172 @@ struct Inner {
     lasting: Option<Duration>,
     /// A connection started and its first data has not been seen yet.
     awaiting_data: bool,
+    /// How late packets arrived ([`SrtMonitor::receiving`] only).
+    late: Option<Box<LateBook>>,
+}
+
+/// The bookkeeping behind [`Lateness`].
+struct LateBook {
+    /// The connection that runs now: 1 ms bins of (arrival − timestamp) against its first packet's value (bin
+    /// [`RAW_BEFORE`]) until the quickest one is known; packets that came on their first send, and the others.
+    raw_first_try: Vec<u32>,
+    raw_recovered: Vec<u32>,
+    /// (arrival − timestamp) of the connection's first packet, µs.
+    first: Option<i64>,
+    /// The newest timestamp, unwrapped (SRT's are 32-bit µs: they wrap after 71.6 minutes).
+    newest_ts: Option<i64>,
+    /// Connections before this one, each against its own quickest packet.
+    past_first_try: Vec<u32>,
+    past_recovered: Vec<u32>,
+    last_arrival_us: Option<i64>,
+    longest_gap_us: i64,
+    loss_runs: u64,
+    longest_run: u32,
+}
+
+impl LateBook {
+    fn new() -> LateBook {
+        LateBook {
+            raw_first_try: vec![0; RAW_BINS],
+            raw_recovered: vec![0; RAW_BINS],
+            first: None,
+            newest_ts: None,
+            past_first_try: vec![0; LATE_BINS],
+            past_recovered: vec![0; LATE_BINS],
+            last_arrival_us: None,
+            longest_gap_us: 0,
+            loss_runs: 0,
+            longest_run: 0,
+        }
+    }
+
+    /// The timestamp `ts` on the connection's unwrapped scale; a resend's (older) does not move the newest.
+    fn unwrap(&mut self, ts: u32) -> i64 {
+        let Some(newest) = self.newest_ts else {
+            self.newest_ts = Some(i64::from(ts));
+            return i64::from(ts);
+        };
+        let value = newest + i64::from(ts.wrapping_sub(newest as u32) as i32);
+        if value > newest {
+            self.newest_ts = Some(value);
+        }
+        value
+    }
+
+    /// A data packet arrived at `at_us`. `first_copy`: the first one of its sequence number; `first_try`: and it is
+    /// the first send (the newest sequence number so far), not a resend.
+    fn arrived(&mut self, ts: u32, at_us: i64, first_copy: bool, first_try: bool) {
+        if let Some(last) = self.last_arrival_us {
+            self.longest_gap_us = self.longest_gap_us.max(at_us - last);
+        }
+        self.last_arrival_us = Some(at_us.max(self.last_arrival_us.unwrap_or(at_us)));
+        let ts = self.unwrap(ts);
+        if !first_copy {
+            return;
+        }
+        let d = at_us - ts;
+        let first = *self.first.get_or_insert(d);
+        let bin = ((d - first).div_euclid(1000) + RAW_BEFORE as i64).clamp(0, RAW_BINS as i64 - 1) as usize;
+        if first_try {
+            self.raw_first_try[bin] += 1;
+        } else {
+            self.raw_recovered[bin] += 1;
+        }
+    }
+
+    fn missing_run(&mut self, packets: u32) {
+        self.loss_runs += 1;
+        self.longest_run = self.longest_run.max(packets);
+    }
+
+    /// The bin of the connection's quickest packet (one that came on its first try, unless none did).
+    fn base(&self) -> Option<usize> {
+        let quickest = |bins: &[u32]| bins.iter().position(|&n| n > 0);
+        match (quickest(&self.raw_first_try), quickest(&self.raw_recovered)) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// `past` plus the running connection's `raw`, counted from `base`.
+    fn add_raw(past: &mut [u32], raw: &[u32], base: usize) {
+        for (i, &n) in raw.iter().enumerate().skip(base).filter(|(_, &n)| n > 0) {
+            past[(i - base).min(LATE_BINS - 1)] += n;
+        }
+    }
+
+    /// A new connection: the one before goes into `past`, against its own quickest packet.
+    fn new_connection(&mut self) {
+        if let Some(base) = self.base() {
+            Self::add_raw(&mut self.past_first_try, &self.raw_first_try, base);
+            Self::add_raw(&mut self.past_recovered, &self.raw_recovered, base);
+        }
+        self.raw_first_try.fill(0);
+        self.raw_recovered.fill(0);
+        self.first = None;
+        self.newest_ts = None;
+        self.last_arrival_us = None;
+    }
+
+    fn summary(&self) -> Lateness {
+        let (mut first_try, mut recovered) = (self.past_first_try.clone(), self.past_recovered.clone());
+        if let Some(base) = self.base() {
+            Self::add_raw(&mut first_try, &self.raw_first_try, base);
+            Self::add_raw(&mut recovered, &self.raw_recovered, base);
+        }
+        let all: Vec<u32> = first_try.iter().zip(&recovered).map(|(a, b)| a + b).collect();
+        let first = Bins::of(&first_try);
+        let again = Bins::of(&recovered);
+        let both = Bins::of(&all);
+        Lateness {
+            packets: both.count,
+            p50_ms: both.quantile(0.5),
+            p99_ms: both.quantile(0.99),
+            p999_ms: both.quantile(0.999),
+            p9999_ms: both.quantile(0.9999),
+            max_ms: both.max(),
+            first_try_p999_ms: first.quantile(0.999),
+            first_try_max_ms: first.max(),
+            recovered: again.count,
+            recovered_p50_ms: again.quantile(0.5),
+            recovered_max_ms: again.max(),
+            longest_gap_ms: self.longest_gap_us as f64 / 1000.0,
+            loss_runs: self.loss_runs,
+            longest_run: self.longest_run,
+        }
+    }
+}
+
+/// A histogram of lateness in 1 ms bins, for its percentiles.
+struct Bins<'a> {
+    bins: &'a [u32],
+    count: u64,
+}
+
+impl<'a> Bins<'a> {
+    fn of(bins: &'a [u32]) -> Bins<'a> {
+        Bins { bins, count: bins.iter().map(|&n| u64::from(n)).sum() }
+    }
+
+    /// The bin (ms) where the fraction `q` of the packets is reached; 0 for none.
+    fn quantile(&self, q: f64) -> f64 {
+        if self.count == 0 {
+            return 0.0;
+        }
+        let wanted = ((self.count as f64 * q).ceil() as u64).clamp(1, self.count);
+        let mut seen = 0u64;
+        for (i, &n) in self.bins.iter().enumerate() {
+            seen += u64::from(n);
+            if seen >= wanted {
+                return i as f64;
+            }
+        }
+        (LATE_BINS - 1) as f64
+    }
+
+    fn max(&self) -> f64 {
+        self.bins.iter().rposition(|&n| n > 0).map_or(0.0, |i| i as f64)
+    }
 }
 
 /// Sequence numbers `first..=last` were missing when the packet after them came, at `since`.
@@ -190,19 +401,34 @@ impl SrtMonitor {
                 last_check: None,
                 lasting: None,
                 awaiting_data: false,
+                late: None,
             }),
         }
+    }
+
+    /// A monitor where the data comes in from the network (the viewer's end): it also measures how late each
+    /// packet arrived ([`lateness`](Self::lateness)).
+    pub fn receiving() -> SrtMonitor {
+        let monitor = SrtMonitor::new();
+        lock(&monitor.inner).late = Some(Box::new(LateBook::new()));
+        monitor
     }
 
     /// A datagram the SRT sender sent (data, or its control packets). True for the first data packet of a
     /// connection: the receiver's stream starts here.
     pub fn from_sender(&self, datagram: &[u8]) -> bool {
+        self.from_sender_at(datagram, mono_clock::now_us())
+    }
+
+    /// [`from_sender`](Self::from_sender) for a datagram that arrived at `at_us` ([`mono_clock`] time).
+    pub fn from_sender_at(&self, datagram: &[u8], at_us: i64) -> bool {
         let Some((word0, _)) = header(datagram) else { return false };
         let mut inner = lock(&self.inner);
         let mut first_data = false;
         if word0 & CONTROL == 0 {
             first_data = std::mem::take(&mut inner.awaiting_data) || inner.top.is_none();
-            inner.on_data(word0 & SEQ_MASK, datagram.len().saturating_sub(HEADER_BYTES));
+            let ts = word(datagram, 2).unwrap_or(0);
+            inner.on_data(word0 & SEQ_MASK, datagram.len().saturating_sub(HEADER_BYTES), ts, at_us);
             inner.check_lasting(Instant::now());
         } else {
             match control_type(word0) {
@@ -269,23 +495,43 @@ impl SrtMonitor {
             connections: inner.connections,
         }
     }
+
+    /// How late the packets arrived, over every connection so far; `None` for a monitor that is not
+    /// [`receiving`](Self::receiving).
+    pub fn lateness(&self) -> Option<Lateness> {
+        lock(&self.inner).late.as_ref().map(|book| book.summary())
+    }
+
+    /// Measures lateness afresh from here on (the counts go on): the connection test starts once the connection
+    /// has settled, since SRT assumes a round trip of 100 ms until it has measured one and asks for lost packets
+    /// slowly until then.
+    pub fn restart_lateness(&self) {
+        if let Some(book) = lock(&self.inner).late.as_mut() {
+            **book = LateBook::new();
+        }
+    }
 }
 
 impl Inner {
-    fn on_data(&mut self, seq: u32, payload: usize) {
+    fn on_data(&mut self, seq: u32, payload: usize, ts: u32, at_us: i64) {
         let fresh = match self.top {
             None => true,
             Some(top) => after(seq, top),
         };
+        let first_copy = fresh || !self.seen.get(seq);
         if fresh {
             if let Some(top) = self.top {
                 let next = top.wrapping_add(1) & SEQ_MASK;
-                if next != seq && (seq.wrapping_sub(next) & SEQ_MASK) < WINDOW {
+                let missing = seq.wrapping_sub(next) & SEQ_MASK;
+                if next != seq && missing < WINDOW {
                     if self.holes.len() >= MAX_HOLES {
                         self.holes.pop_front();
                     }
                     let last = seq.wrapping_sub(1) & SEQ_MASK;
                     self.holes.push_back(Hole { first: next, last, since: Instant::now(), reported: false });
+                    if let Some(book) = self.late.as_mut() {
+                        book.missing_run(missing);
+                    }
                 }
             }
             self.advance_to(seq);
@@ -294,6 +540,9 @@ impl Inner {
         } else {
             // behind the front: sent again, whether or not the sender set the flag (old versions do not)
             self.counts.resent += 1;
+        }
+        if let Some(book) = self.late.as_mut() {
+            book.arrived(ts, at_us, first_copy, fresh);
         }
         self.seen.set(seq);
     }
@@ -329,6 +578,10 @@ impl Inner {
         self.holes.clear();
         self.lasting = None;
         self.awaiting_data = true;
+        if let Some(book) = self.late.as_mut() {
+            // a new connection, a new start for the timestamps
+            book.new_connection();
+        }
     }
 
     /// Drops the gaps that filled up (or that the receiver went past), and notes the first one open for too long.
@@ -641,6 +894,102 @@ mod tests {
         std::thread::sleep(Duration::from_millis(130));
         stream(&m, [11]);
         assert!(m.take_lasting_loss().is_some_and(|d| d >= Duration::from_millis(216)));
+    }
+
+    /// A data packet with SRT timestamp `ts` (µs).
+    fn data_at(seq: u32, ts: u32, again: bool) -> Vec<u8> {
+        let mut d = data(seq, again);
+        d[8..12].copy_from_slice(&ts.to_be_bytes());
+        d
+    }
+
+    #[test]
+    fn only_a_receiving_monitor_measures_lateness() {
+        assert_eq!(SrtMonitor::new().lateness(), None);
+        let m = SrtMonitor::receiving();
+        assert_eq!(m.lateness(), Some(Lateness::default()));
+    }
+
+    #[test]
+    fn a_resend_is_as_late_as_its_original_timestamp_says() {
+        let m = SrtMonitor::receiving();
+        // sent every millisecond, 5 ms on the way; 50 is lost and comes again 120 ms after it was first sent
+        for seq in 1..=100u32 {
+            if seq != 50 {
+                m.from_sender_at(&data_at(seq, seq * 1000, false), i64::from(seq * 1000) + 5_000);
+            }
+        }
+        m.from_sender_at(&data_at(50, 50_000, true), 50_000 + 5_000 + 120_000);
+        // and a copy of one that had arrived already: not measured twice
+        m.from_sender_at(&data_at(60, 60_000, true), 60_000 + 5_000 + 300_000);
+        let l = m.lateness().unwrap();
+        assert_eq!(l.packets, 100);
+        assert_eq!((l.p50_ms, l.p99_ms, l.max_ms), (0.0, 0.0, 120.0));
+        assert_eq!((l.loss_runs, l.longest_run), (1, 1));
+        assert_eq!(l.p9999_ms, 120.0, "the latest of 100 packets is the 99.99th percentile");
+        assert_eq!((l.first_try_max_ms, l.recovered, l.recovered_max_ms), (0.0, 1, 120.0), "the resend is told apart");
+    }
+
+    #[test]
+    fn the_quickest_packet_is_the_reference_even_when_it_came_later() {
+        let m = SrtMonitor::receiving();
+        // the first packet waited 30 ms (a keyframe in the sender's queue), the rest went straight through
+        m.from_sender_at(&data_at(1, 0, false), 30_000);
+        for seq in 2..=10u32 {
+            let ts = 40_000 + seq * 1000;
+            m.from_sender_at(&data_at(seq, ts, false), i64::from(ts));
+        }
+        let l = m.lateness().unwrap();
+        assert_eq!((l.packets, l.p50_ms, l.max_ms), (10, 0.0, 30.0));
+        assert!((l.longest_gap_ms - 12.0).abs() < 1e-9, "30 ms -> 42 ms: {}", l.longest_gap_ms);
+    }
+
+    #[test]
+    fn timestamps_wrap_and_a_new_connection_gets_its_own_reference() {
+        let m = SrtMonitor::receiving();
+        // 32-bit microseconds wrap after 71.6 minutes
+        let start = u32::MAX - 5_000;
+        for i in 0..10u32 {
+            let ts = start.wrapping_add(i * 1000);
+            m.from_sender_at(&data_at(i + 1, ts, false), 1_000_000 + i64::from(i) * 1000);
+        }
+        assert_eq!(m.lateness().unwrap().max_ms, 0.0, "the wrap is not a jump");
+        // a new connection: timestamps from 0 again, a different offset to this clock, the same steady path
+        m.from_receiver(&control(TYPE_HANDSHAKE, &[0; 12]));
+        for i in 0..10u32 {
+            m.from_sender_at(&data_at(5000 + i, i * 1000, false), 9_000_000 + i64::from(i) * 1000);
+        }
+        let l = m.lateness().unwrap();
+        assert_eq!((l.packets, l.max_ms), (20, 0.0));
+    }
+
+    #[test]
+    fn a_restart_forgets_the_lateness_so_far_but_not_the_counts() {
+        let m = SrtMonitor::receiving();
+        m.from_sender_at(&data_at(0, 0, false), 0);
+        m.from_sender_at(&data_at(1, 1_000, false), 500_000);
+        assert_eq!(m.lateness().unwrap().max_ms, 499.0);
+        m.restart_lateness();
+        for seq in 2..10u32 {
+            m.from_sender_at(&data_at(seq, seq * 1_000, false), 600_000 + i64::from(seq) * 1_000);
+        }
+        let l = m.lateness().unwrap();
+        assert_eq!((l.packets, l.max_ms), (8, 0.0), "{l:?}");
+        assert_eq!(m.snapshot().total.sent, 10);
+    }
+
+    #[test]
+    fn outages_and_runs_of_missing_packets() {
+        let m = SrtMonitor::receiving();
+        let mut at = 0i64;
+        for seq in (1..=10u32).chain(14..=20).chain(22..=30) {
+            // nothing for 250 ms before 14 (13..=11 never came), 2 ms between the others
+            at += if seq == 14 { 250_000 } else { 2_000 };
+            m.from_sender_at(&data_at(seq, seq * 2000, false), at);
+        }
+        let l = m.lateness().unwrap();
+        assert_eq!((l.loss_runs, l.longest_run), (2, 3));
+        assert!((l.longest_gap_ms - 250.0).abs() < 1e-9, "{}", l.longest_gap_ms);
     }
 
     #[test]

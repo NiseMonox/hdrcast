@@ -15,6 +15,10 @@
 //!
 //! A viewer who controls this computer may pick which of its displays is shared (§9.2): that is done as if this
 //! computer's user had picked it on the Share page.
+//!
+//! A viewer whose path cannot carry the bitrate set here may ask for less (§8.13): each stream runs at the lowest
+//! rate its viewers asked for, while the settings let them (`bitrate_host.rs`). The settings stay the most it
+//! carries.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -28,6 +32,7 @@ use hdrcast_core::common::firewall::row as firewall_row;
 use hdrcast_core::group::device;
 use hdrcast_core::group::keys::GroupKeys;
 use hdrcast_core::messages::JoinAnswer;
+use hdrcast_media::bitrate::{self, Stream};
 use hdrcast_media::keyframe;
 use hdrcast_media::low_latency;
 use hdrcast_media::sender::encoder_profiles;
@@ -38,6 +43,7 @@ use serde_json::{json, Value};
 use tauri::Emitter;
 
 use crate::access::{AccessSettings, Connect, Control};
+use crate::bitrate_host::BitrateHub;
 use crate::commands;
 use crate::control_host::{ControlHub, HostDisplay};
 use crate::keyframe_host::KeyframeHub;
@@ -138,6 +144,8 @@ struct Session {
     ts: SwitchableStream,
     hub: Arc<ControlHub>,
     keyframes: Arc<KeyframeHub>,
+    /// What viewers asked for, and what each stream runs at because of it (§8.13).
+    bitrate: Arc<BitrateHub>,
     runner: SenderRunner,
     keys: GroupKeys,
     /// Broadcasting: the encoder runs regardless of viewers, and asking is skipped (only blocked devices stay out).
@@ -159,6 +167,9 @@ struct Session {
     net_reports: Mutex<HashMap<String, NetReport>>,
     /// The settings changed while streaming in a way only a restart applies: when to do it.
     restart_due: Mutex<Option<Instant>>,
+    /// Held while a change of the settings or of what viewers asked for goes to a running encoder, so that two
+    /// changes at once reach it in the order they were worked out.
+    applying: Mutex<()>,
     /// Control mode's own capture engine and sender (§11).
     low_latency: LowLatencyHost,
     /// Since when its engine has been running with nobody in control mode.
@@ -186,8 +197,9 @@ pub fn is_streaming(app: &AppState) -> bool {
     current(app).is_some_and(|s| matches!(s.runner.state(), RunnerState::Starting | RunnerState::Streaming | RunnerState::Stopping))
 }
 
-/// Builds the session plan from the settings and the chosen display, or says what is missing.
-fn build_plan(app: &AppState, inner: &Inner) -> Result<SendPlan, Vec<String>> {
+/// Builds the session plan from the settings and the chosen display, or says what is missing. `limit_kbps`: the
+/// lowest bitrate a viewer asked for (§8.13); the setting stays the most the stream carries.
+fn build_plan(app: &AppState, inner: &Inner, limit_kbps: Option<u32>) -> Result<SendPlan, Vec<String>> {
     let sender = &inner.sender;
     let mut problems = sender.validate_for(app.platform);
     if !inner.group.current().is_configured() {
@@ -218,6 +230,10 @@ fn build_plan(app: &AppState, inner: &Inner) -> Result<SendPlan, Vec<String>> {
     let mut capture_argv = vec!["capture".to_string()];
     capture_argv.extend(capture.to_argv());
 
+    let mut encoder = sender.to_encoder_settings(hdr, output.max_luminance.round().max(0.0) as u32);
+    if let Some(limit) = limit_kbps {
+        encoder.bitrate_kbps = encoder.bitrate_kbps.min(limit);
+    }
     // The encoder's MPEG-TS goes to stdout (the plan's default), into the fan-out that serves every viewer.
     let plan = FfmpegPlan {
         video_pipe_name: video_pipe.clone(),
@@ -226,7 +242,7 @@ fn build_plan(app: &AppState, inner: &Inner) -> Result<SendPlan, Vec<String>> {
         width,
         height,
         fps: sender.fps.max(1) as u32,
-        encoder: sender.to_encoder_settings(hdr, output.max_luminance.round().max(0.0) as u32),
+        encoder,
         audio: if sender.audio { sender.audio_codec } else { AudioCodec::None },
         audio_bitrate_kbps: sender.audio_bitrate_kbps.max(0) as u32,
         ..FfmpegPlan::default()
@@ -245,7 +261,8 @@ fn build_plan(app: &AppState, inner: &Inner) -> Result<SendPlan, Vec<String>> {
 
 /// Control mode's engine (§11.2): the shared picture (display, size, HDR, cursor, sound) at control mode's own
 /// frame rate and bitrate, encoded by NVENC inside the engine the way Vibepollo encodes (`--low-latency`).
-fn build_low_latency_plan(inner: &Inner) -> Result<LowLatencyPlan, Vec<String>> {
+/// `limit_kbps`: the lowest bitrate a viewer in control mode asked for (§8.13).
+fn build_low_latency_plan(inner: &Inner, limit_kbps: Option<u32>) -> Result<LowLatencyPlan, Vec<String>> {
     let sender = &inner.sender;
     let output = state::selected_output(sender, &inner.outputs).ok_or_else(|| vec!["No display selected.".to_string()])?;
     let (width, height) = sender.resolve_size(output.width, output.height);
@@ -255,7 +272,7 @@ fn build_low_latency_plan(inner: &Inner) -> Result<LowLatencyPlan, Vec<String>> 
     let (video_pipe, audio_pipe) = (format!("hdrcast-ll-video-{pid}"), format!("hdrcast-ll-audio-{pid}"));
     let mut capture = sender.to_capture_args(output, width, height, capture_format, &video_pipe, &audio_pipe, pid);
     capture.fps = sender.control_fps.clamp(10, 240) as u32;
-    let kbps = sender.control_bitrate_mbps.clamp(1, 500) as u32 * 1000;
+    let kbps = (sender.control_bitrate_mbps.clamp(1, 500) as u32 * 1000).min(limit_kbps.unwrap_or(u32::MAX));
     capture.encode = Some(EncodeArgs::low_latency(EngineEncoder::Nvenc, kbps, capture.fps));
     let mut capture_argv = vec!["capture".to_string()];
     capture_argv.extend(capture.to_argv());
@@ -295,6 +312,12 @@ fn gop_of(app: &AppState) -> Duration {
     Duration::from_secs_f64(app.inner.lock().unwrap().sender.gop_seconds.max(0.1))
 }
 
+/// Whether viewers' requests for a lower bitrate count, and the two streams' settings in kbit/s (§8.13).
+fn bitrate_policy(inner: &Inner) -> (bool, u32, u32) {
+    let sender = &inner.sender;
+    (sender.bitrate_requests, sender.bitrate_mbps.clamp(1, 500) as u32 * 1000, sender.control_bitrate_mbps.clamp(1, 500) as u32 * 1000)
+}
+
 // ---- the host session ------------------------------------------------------------------------------------------
 
 /// Announces this computer to the group (not live yet). The error is the list of things to fix first.
@@ -302,10 +325,10 @@ fn start_hosting(app: &Arc<AppState>) -> Result<Arc<Session>, Vec<String>> {
     if let Some(session) = current(app) {
         return Ok(session);
     }
-    let (group, bitrate_bps, max_viewers, ffmpeg) = {
+    let (group, bitrate_bps, max_viewers, ffmpeg, (taken, watch_kbps, control_kbps)) = {
         let inner = app.inner.lock().unwrap();
         let ffmpeg = state::ffmpeg_path(&inner.sender).map(|p| p.into_os_string()).unwrap_or_else(|| "ffmpeg".into());
-        (inner.group.current().clone(), inner.sender.bitrate_bps(), inner.sender.max_viewers.max(1) as u32, ffmpeg)
+        (inner.group.current().clone(), inner.sender.bitrate_bps(), inner.sender.max_viewers.max(1) as u32, ffmpeg, bitrate_policy(&inner))
     };
     let keys = group.keys().map_err(|_| vec!["There is no group yet.".to_string()])?;
     let weak_app: Weak<AppState> = Arc::downgrade(app);
@@ -345,6 +368,7 @@ fn start_hosting(app: &Arc<AppState>) -> Result<Arc<Session>, Vec<String>> {
                     let inner = app.inner.lock().unwrap();
                     offers_control_mode(&inner, Some(&session.low_latency))
                 })),
+                bitrate_requests: true,
                 ..P2pHostOptions::default()
             },
             Box::new(ts.clone()),
@@ -365,6 +389,22 @@ fn start_hosting(app: &Arc<AppState>) -> Result<Arc<Session>, Vec<String>> {
             Arc::new(move |sid| group_keys.keyframe_key(sid)),
             app.logger(),
         );
+        let (sender, group_keys, moved_app, moved_session) = (me.clone(), keys.clone(), weak_app.clone(), me.clone());
+        let bitrate = BitrateHub::new(
+            taken,
+            watch_kbps,
+            control_kbps,
+            Arc::new(move |sid, payload| sender.upgrade().is_some_and(|s| s.host.send_side_for(sid, SideUse::Bitrate, payload))),
+            Arc::new(move |sid| group_keys.bitrate_key(sid)),
+            Arc::new(move |stream| {
+                let (Some(app), Some(session)) = (moved_app.upgrade(), moved_session.upgrade()) else { return };
+                match stream {
+                    Stream::Watch => apply_while_streaming(&app, &session),
+                    Stream::Control => apply_to_control_mode(&app, &session),
+                }
+            }),
+            app.logger(),
+        );
         let sender = me.clone();
         let low_latency = LowLatencyHost::new(
             app.job.clone(),
@@ -376,6 +416,7 @@ fn start_hosting(app: &Arc<AppState>) -> Result<Arc<Session>, Vec<String>> {
             ts,
             hub,
             keyframes,
+            bitrate,
             runner,
             keys,
             live: AtomicBool::new(false),
@@ -390,18 +431,22 @@ fn start_hosting(app: &Arc<AppState>) -> Result<Arc<Session>, Vec<String>> {
             control_asks: Mutex::new(HashSet::new()),
             net_reports: Mutex::new(HashMap::new()),
             restart_due: Mutex::new(None),
+            applying: Mutex::new(()),
             low_latency,
             low_latency_idle_since: Mutex::new(None),
         }
     });
-    // the side channel carries remote control, keyframe requests and control mode's requests: they tell themselves
-    // apart by their first byte
+    // the side channel carries remote control, keyframe requests, control mode's requests and requests for a lower
+    // bitrate: they tell themselves apart by their first byte
     let (hub, keyframes, fast) = (session.hub.clone(), session.keyframes.clone(), session.low_latency.clone());
+    let lower = session.bitrate.clone();
     session.host.set_side_handler(Arc::new(move |sid, payload| {
         if low_latency::is_low_latency_datagram(payload) {
             fast.on_datagram(sid, payload);
         } else if keyframe::is_keyframe_datagram(payload) {
             keyframes.on_datagram(sid, payload);
+        } else if bitrate::is_bitrate_datagram(payload) {
+            lower.on_datagram(sid, payload);
         } else {
             hub.on_datagram(sid, payload);
         }
@@ -489,11 +534,14 @@ pub fn group_changed(app: &Arc<AppState>) {
 /// The sender settings changed: what the live record says and what new viewers get follows them.
 pub fn settings_changed(app: &AppState) {
     let Some(session) = current(app) else { return };
-    let (bitrate, max, ffmpeg) = {
+    let (bitrate, max, ffmpeg, (taken, watch_kbps, control_kbps)) = {
         let inner = app.inner.lock().unwrap();
-        (inner.sender.bitrate_bps(), inner.sender.max_viewers.max(1) as u32, state::ffmpeg_path(&inner.sender))
+        (inner.sender.bitrate_bps(), inner.sender.max_viewers.max(1) as u32, state::ffmpeg_path(&inner.sender), bitrate_policy(&inner))
     };
+    // the setting is the most the stream carries, and sizes the viewers' connections; what viewers asked for may
+    // bring the encoder below it
     session.host.set_stream(bitrate, max);
+    session.bitrate.set_policy(taken, watch_kbps, control_kbps);
     if let Some(ffmpeg) = ffmpeg {
         session.host.set_ffmpeg_path(ffmpeg.into_os_string());
     }
@@ -554,9 +602,11 @@ fn share_display_for(app: &AppState, viewer: &str, device_name: &str) {
 /// break; anything else of its picture starts it again (its viewers ask for a keyframe and go on). Switched off,
 /// whoever is in control mode is disconnected (they may connect again to watch).
 fn apply_to_control_mode(app: &AppState, session: &Arc<Session>) {
+    let _in_order = session.applying.lock().unwrap();
+    let limit = session.bitrate.limit(Stream::Control);
     let (offered, wanted, display) = {
         let inner = app.inner.lock().unwrap();
-        (offers_control_mode(&inner, Some(&session.low_latency)), build_low_latency_plan(&inner), shared_display(&inner))
+        (offers_control_mode(&inner, Some(&session.low_latency)), build_low_latency_plan(&inner, limit), shared_display(&inner))
     };
     if !offered {
         for viewer in session.host.viewers().into_iter().filter(|v| v.low_latency) {
@@ -630,10 +680,12 @@ fn apply_while_streaming(app: &AppState, session: &Session) {
     if !matches!(session.runner.state(), RunnerState::Starting | RunnerState::Streaming) {
         return; // the next start takes the settings as they are
     }
+    let _in_order = session.applying.lock().unwrap();
     let Some(running) = session.runner.plan() else { return };
+    let limit = session.bitrate.limit(Stream::Watch);
     let wanted = {
         let inner = app.inner.lock().unwrap();
-        build_plan(app, &inner)
+        build_plan(app, &inner, limit)
     };
     let Ok(wanted) = wanted else { return }; // settings that cannot stream: the running stream goes on as it is
     let mut due = session.restart_due.lock().unwrap();
@@ -754,6 +806,11 @@ fn admit_in_background(app: &Arc<AppState>, session: &Arc<Session>, ticket: Join
     let (app, worker) = (app.clone(), session.clone());
     let spawned = thread::Builder::new().name("share-admit".into()).spawn(move || {
         let session = worker;
+        // what the viewer asked for counts before its stream starts, so that it starts at that rate (§8.13)
+        if let Some(kbps) = ticket.bitrate_kbps {
+            let stream = if ticket.low_latency { Stream::Control } else { Stream::Watch };
+            session.bitrate.add(&ticket.sid, &who.name, stream, kbps);
+        }
         // control mode has a stream of its own (§11); everybody else gets the buffered one
         let ready = if ticket.low_latency { ensure_low_latency(&app, &session) } else { ensure_streaming(&app, &session) };
         let outcome = ready.and_then(|()| session.host.admit(&ticket.sid));
@@ -770,8 +827,10 @@ fn admit_in_background(app: &Arc<AppState>, session: &Arc<Session>, ticket: Join
                 }
                 session.admitted.lock().unwrap().insert(ticket.sid.clone(), admitted);
                 session.recent_ok.lock().unwrap().insert(who.id.clone(), Instant::now());
+                session.bitrate.admitted(&ticket.sid);
             }
             Err(why) => {
+                session.bitrate.remove(&ticket.sid);
                 app.log(&format!("[app] could not let {} in: {why}", who.name));
                 // a no from inside admit() has been answered already; refusing again only finds nothing waiting
                 session.host.refuse(&ticket.sid, JoinAnswer::REASON_BUSY);
@@ -817,12 +876,13 @@ fn ensure_streaming(app: &Arc<AppState>, session: &Session) -> Result<(), String
 fn ensure_low_latency(app: &Arc<AppState>, session: &Session) -> Result<(), String> {
     let _one_at_a_time = session.starting.lock().unwrap();
     if !matches!(session.low_latency.state(), RunnerState::Starting | RunnerState::Streaming) {
+        let limit = session.bitrate.limit(Stream::Control);
         let (plan, display) = {
             let inner = app.inner.lock().unwrap();
             if !offers_control_mode(&inner, Some(&session.low_latency)) {
                 return Err("control mode is not offered on this computer".to_string());
             }
-            (build_low_latency_plan(&inner), shared_display(&inner))
+            (build_low_latency_plan(&inner, limit), shared_display(&inner))
         };
         let plan = plan.map_err(|problems| problems.join(" "))?;
         // the pointer of whoever controls is confined to the display this engine captures, as with the buffered stream
@@ -847,9 +907,10 @@ fn ensure_low_latency(app: &Arc<AppState>, session: &Session) -> Result<(), Stri
 
 /// Starts capture and encoder from the current settings.
 fn start_runner(app: &AppState, session: &Session) -> Result<(), Vec<String>> {
+    let limit = session.bitrate.limit(Stream::Watch);
     let (plan, display, bitrate, max) = {
         let inner = app.inner.lock().unwrap();
-        let plan = build_plan(app, &inner)?;
+        let plan = build_plan(app, &inner, limit)?;
         (plan, shared_display(&inner), inner.sender.bitrate_bps(), inner.sender.max_viewers.max(1) as u32)
     };
     *session.problem.lock().unwrap() = None;
@@ -1034,6 +1095,7 @@ pub fn housekeeping(app: &Arc<AppState>) {
     let sids: Vec<String> = viewers.iter().map(|v| v.sid.clone()).collect();
     session.hub.keep_only(&sids);
     session.keyframes.keep_only(&sids);
+    session.bitrate.keep_only(&sids);
     control_mode_housekeeping(app, &session, &viewers);
     // from here on, the buffered stream: viewers in control mode have a stream of their own
     let viewers: Vec<_> = viewers.into_iter().filter(|v| !v.low_latency).collect();
@@ -1195,6 +1257,8 @@ pub fn status(app: &AppState) -> Value {
                 // control mode (§11): its own stream, and what the viewer reports of it
                 "mode": if v.low_latency { "control" } else { "watch" },
                 "ll": session.low_latency.viewer_status(&v.sid),
+                // the most it asked the stream to carry (§8.13): 0 nothing, null a viewer that cannot ask
+                "bitrateAskKbps": session.bitrate.asked(&v.sid),
             })
         })
         .collect();
@@ -1255,6 +1319,7 @@ pub fn status(app: &AppState) -> Value {
             "offered": offers_control_mode(&app.inner.lock().unwrap(), Some(&session.low_latency)),
             "engine": session.low_latency.status(),
         },
+        "bitrate": session.bitrate.status(),
     })
 }
 

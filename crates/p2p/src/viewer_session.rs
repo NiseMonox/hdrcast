@@ -21,7 +21,7 @@ use crate::p2p_diagnostics;
 use crate::p2p_host::{resolve_ipv4, SideUse};
 use crate::peer_session::{LinkState, PUNCH_DEADLINE_US};
 use crate::signaling_client::{SignalingClient, SignalingError};
-use crate::srt_monitor::SrtStats;
+use crate::srt_monitor::{Lateness, SrtStats};
 use crate::upnp::{PortMappingOptions, RouterPortMapping};
 use crate::util::{lock, Callbacks, LogFn, Worker};
 use crate::viewer_link::{LastingLossHandler, ViewerLink, ViewerSideHandler};
@@ -53,6 +53,10 @@ pub struct ViewerSessionOptions {
     /// low-latency stream on the side channel instead of SRT. A host that does not offer it is joined as before;
     /// [`ViewerSession::low_latency`] says which it was.
     pub request_low_latency: bool,
+    /// The most this viewer wants the stream to carry, kbit/s (0: the host's setting), asked at every join: the join
+    /// carries it as "br" to a host whose live record says "br", and the side channel may then carry requests for a
+    /// lower bitrate (docs/design.md §8.13). `None` = never.
+    pub request_bitrate: Option<Arc<dyn Fn() -> u32 + Send + Sync>>,
     /// This computer's device key: every join is signed with it, so a host can recognise this computer and
     /// agree on a remote-control key with it (docs/design.md §8.10). `None` = unsigned joins, as before 0.3.1.
     pub device: Option<Arc<DeviceKey>>,
@@ -77,6 +81,7 @@ impl Default for ViewerSessionOptions {
             request_control: false,
             request_keyframes: false,
             request_low_latency: false,
+            request_bitrate: None,
             device: None,
             answer_wait_ms: 60_000,
         }
@@ -124,6 +129,8 @@ struct State {
     /// From the host's live record as of the latest join.
     host_device_key: Option<String>,
     host_on_demand: bool,
+    /// The bitrate the host's live record gave (its setting), Mbps.
+    host_mbps: i32,
     /// The remote-control key agreed with the host's device, and the session it belongs to.
     control: Option<(String, [u8; 32])>,
 }
@@ -136,6 +143,8 @@ struct Inner {
     started: AtomicBool,
     host_offers_control: AtomicBool,
     host_takes_keyframes: AtomicBool,
+    /// The latest join carried "br": the host takes requests for a lower bitrate.
+    host_takes_bitrate: AtomicBool,
     /// The latest join asked for control mode (the host offered it).
     low_latency: AtomicBool,
     keys: OnceLock<GroupKeys>,
@@ -163,12 +172,14 @@ impl ViewerSession {
                     ipv4_only_failure: false,
                     host_device_key: None,
                     host_on_demand: false,
+                    host_mbps: 0,
                     control: None,
                 }),
                 cancel: CancelToken::new(),
                 started: AtomicBool::new(false),
                 host_offers_control: AtomicBool::new(false),
                 host_takes_keyframes: AtomicBool::new(false),
+                host_takes_bitrate: AtomicBool::new(false),
                 low_latency: AtomicBool::new(false),
                 keys: OnceLock::new(),
                 signal: OnceLock::new(),
@@ -212,6 +223,19 @@ impl ViewerSession {
     /// session has a link.
     pub fn srt_stats(&self) -> Option<SrtStats> {
         self.inner.link.get().map(ViewerLink::srt_stats)
+    }
+
+    /// How late the SRT packets of the current session arrived (docs/design.md §5.1); `None` before the session
+    /// has a link.
+    pub fn srt_lateness(&self) -> Option<Lateness> {
+        self.inner.link.get().map(ViewerLink::srt_lateness)
+    }
+
+    /// Measures the lateness afresh from here on (the connection test, once the connection has settled).
+    pub fn restart_srt_lateness(&self) {
+        if let Some(link) = self.inner.link.get() {
+            link.restart_srt_lateness();
+        }
     }
 
     pub fn ever_connected(&self) -> bool {
@@ -260,6 +284,12 @@ impl ViewerSession {
         self.inner.host_takes_keyframes.load(Ordering::Acquire)
     }
 
+    /// The latest join carried "br" to a host whose live record said "br": requests for a lower bitrate may go to it
+    /// on the side channel (docs/design.md §8.13).
+    pub fn host_takes_bitrate(&self) -> bool {
+        self.inner.host_takes_bitrate.load(Ordering::Acquire)
+    }
+
     /// The current session is in control mode: its stream comes on the side channel, not through SRT (docs/design.md
     /// §11). False when control mode was not asked for, or the host did not offer it when this session joined.
     pub fn low_latency(&self) -> bool {
@@ -282,6 +312,11 @@ impl ViewerSession {
         lock(&self.inner.state).host_on_demand
     }
 
+    /// The bitrate the host's live record gave as of the latest join (its setting, Mbps; 0 = not known yet).
+    pub fn host_mbps(&self) -> i32 {
+        lock(&self.inner.state).host_mbps
+    }
+
     /// Who gets what the host sends on the side channel, on a network thread (docs/design.md §8.9). May be set
     /// before or after [`start`](Self::start); replaces the previous handler.
     pub fn set_side_handler(&self, handler: ViewerSideHandler) {
@@ -301,6 +336,7 @@ impl ViewerSession {
             SideUse::RemoteControl => self.host_offers_control(),
             SideUse::Keyframes => self.host_takes_keyframes(),
             SideUse::LowLatency => self.low_latency(),
+            SideUse::Bitrate => self.host_takes_bitrate(),
         };
         announced && self.inner.link.get().is_some_and(|link| link.send_side(payload))
     }
@@ -482,6 +518,7 @@ impl Inner {
         let Some(entry) = signal.get_live(ct)?.into_iter().find(|entry| entry.record.host_id == self.o.host_id) else {
             self.host_offers_control.store(false, Ordering::Release);
             self.host_takes_keyframes.store(false, Ordering::Release);
+            self.host_takes_bitrate.store(false, Ordering::Release);
             self.low_latency.store(false, Ordering::Release);
             return Ok(Attempt::Retry("Not live right now".to_string()));
         };
@@ -491,12 +528,15 @@ impl Inner {
             state.host_name = record.name.clone();
             state.host_device_key = record.device_key.clone();
             state.host_on_demand = record.on_demand;
+            state.host_mbps = record.mbps;
             state.control = None;
         }
         self.host_offers_control.store(record.remote_control == Some(true), Ordering::Release);
         self.host_takes_keyframes.store(record.keyframes, Ordering::Release);
         let low_latency = self.o.request_low_latency && record.low_latency;
         self.low_latency.store(low_latency, Ordering::Release);
+        let bitrate_kbps = self.o.request_bitrate.as_ref().filter(|_| record.bitrate_requests).map(|wanted| wanted());
+        self.host_takes_bitrate.store(bitrate_kbps.is_some(), Ordering::Release);
         if record.max_viewers > 0 && record.viewers >= record.max_viewers {
             return Ok(Attempt::Retry(format!("{} is full ({} viewers)", record.name, record.max_viewers)));
         }
@@ -519,6 +559,7 @@ impl Inner {
             device: None,
             keyframes: self.o.request_keyframes,
             low_latency,
+            bitrate_kbps,
         };
         let exchange = self.o.device.as_ref().map(|device| {
             let exchange = Exchange::new();

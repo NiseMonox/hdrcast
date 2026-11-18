@@ -18,7 +18,8 @@ export function listen(event, handler) {
 
 const mac = q.has('mac');
 const now = () => Date.now();
-const LATENCY_PRESETS = [{ name: 'Fast', latencyMs: 300 }, { name: 'Japan', latencyMs: 1500 }, { name: 'Australia', latencyMs: 2000 }, { name: 'China', latencyMs: 3500 }];
+const LATENCY_PRESETS = [{ name: 'Fast', latencyMs: 300, bufferSeconds: 0.5 }, { name: 'Japan', latencyMs: 1500, bufferSeconds: 1.5 },
+  { name: 'Australia', latencyMs: 2000, bufferSeconds: 1.5 }, { name: 'China', latencyMs: 3500, bufferSeconds: 1.5 }];
 const HWDEC_MODES = [{ id: 0, name: 'auto-safe' }, { id: 1, name: mac ? 'videotoolbox' : 'd3d11va' }, { id: 2, name: mac ? 'videotoolbox-copy' : 'd3d11va-copy' }, { id: 3, name: 'no (software)' }];
 const DEVICE = '7KQ2-M9XD-4TPA';
 
@@ -28,11 +29,13 @@ const db = {
     outputIndex: 0, outputDeviceName: '\\\\.\\DISPLAY1', outputFriendlyName: 'AW3225QF', fps: 60, scale: 0, hdrMode: 0, cursor: true,
     sdrWhite: 80, encoder: 0, quality: 1, bitrateMbps: 40, gopSeconds: 1, bufferSeconds: 0.25, bFrames: true, lookahead: true, keyframeOnRequest: false,
     audio: true, audioDevice: 'default', audioCodec: 1, audioBitrateKbps: 192, audioExcludeApp: '', maxViewers: 4, uploadMbps: 0, endWhenViewersLeave: true,
+    bitrateRequests: true,
     controlMode: true, controlBitrateMbps: 30, controlFps: 60, ffmpegPath: '', settingsVersion: 1,
   },
   receiver: {
     latencyMs: 1500, expectedBitrateMbps: 100, displayMode: 0, toneMapping: 'bt.2390', hwDec: 1, bufferSeconds: 1.5,
     fullscreen: false, fullscreenScreen: 0, frontend: 0, mpvPath: '', ffmpegPath: '', autoCatchUp: true, targetPeakNits: 0, lastHost: '', controlMode: q.has('control'),
+    overheadPercent: 0, bitrateLimits: {},
   },
   access: {
     rev: 0,
@@ -53,6 +56,8 @@ const db = {
     : { applicable: true, allowed: false, canFix: true, text: 'Only replies get in: friends whose routers change ports cannot connect.' },
   share: { state: 'idle', live: false, detail: 'Stopped', startedMs: 0 },
   watch: { active: false, hostId: '', hostName: '', startedMs: 0, want: null },
+  // the connection test: the one that runs (or ran last), and what each host's last one found
+  probe: { run: null, results: {} },
   viewers: [],
   knocks: [],
   endedUnwatched: 0,
@@ -115,6 +120,56 @@ function endIfEveryoneLeft() {
   }
 }
 
+// the connection test takes 2 s to join, 3 s to settle and (here) 8 s to measure
+const PROBE_JOIN = 2, PROBE_SETTLE = 3, PROBE_MEASURE = 8;
+
+function probeResult(r) {
+  const far = r.hostId === 'h1';
+  return {
+    hostId: r.hostId, hostName: r.hostName, atMs: now(),
+    latencyMs: far ? 160 : 70, bufferSeconds: far ? 0.8 : 0.3, overheadPercent: 25,
+    verdict: far ? 'fair' : 'good', decidedBy: 'resends', rounds: far ? 2 : 1,
+    firstTryMs: far ? 31 : 12, resendMs: far ? 76.4 : 35.2, extraRoundMs: far ? 32 : 20, latestMs: far ? 96 : 15,
+    lossPercent: far ? 1.12 : 0, packets: far ? 74210 : 61880, unrecovered: 0, recovered: far ? 831 : 0, recoveredMaxMs: far ? 96 : 0,
+    seconds: PROBE_MEASURE, mbps: far ? 39.1 : 32.6, rttMs: far ? 38.2 : 0.8, rttVarMs: far ? 2.1 : 0.2,
+    path: far ? '198.51.100.13:62909, ping 38 ms' : 'IPv6 [2400:aaaa::9]:50113, ping 1 ms', capacityMbps: 410, reconnects: 0,
+    notes: far ? [] : [{ kind: 'fewPackets', n: 812 }].filter(() => q.has('few')),
+  };
+}
+
+function probeView() {
+  const r = db.probe.run;
+  if (!r) return { run: null, results: db.probe.results };
+  if (r.active) {
+    const t = (now() - r.startedMs) / 1000;
+    if (r.stopped) Object.assign(r, { active: false, phase: 'stopped' });
+    else if (t >= PROBE_JOIN + PROBE_SETTLE + PROBE_MEASURE) {
+      Object.assign(r, { active: false, phase: 'done' });
+      db.probe.results = { ...db.probe.results, [r.hostId]: probeResult(r) };
+      emit('log', { lines: [`[probe] ${r.hostName}: … -> delay ${db.probe.results[r.hostId].latencyMs} ms`] });
+    } else {
+      r.phase = t < PROBE_JOIN ? 'joining' : t < PROBE_JOIN + PROBE_SETTLE ? 'settling' : 'measuring';
+      const m = Math.max(0, t - PROBE_JOIN - PROBE_SETTLE);
+      r.secondsLeft = r.phase === 'measuring' ? PROBE_MEASURE - m : null;
+      r.progress = r.phase === 'joining' ? 0 : r.phase === 'settling' ? 0.05 : 0.1 + 0.9 * m / PROBE_MEASURE;
+      r.now = r.phase === 'measuring' ? { rttMs: 38 + Math.sin(now() / 700), lossPercent: 1.1, mbps: 39, latestMs: Math.min(96, m * 14) } : null;
+    }
+  }
+  return { run: { ...r }, results: db.probe.results };
+}
+
+/** What each stream runs at: the lowest a viewer of it asked for, never above the setting (docs/design.md §8.13). */
+function bitrateView() {
+  const stream = (control, mbps) => {
+    const ceilingKbps = mbps * 1000;
+    const asks = db.viewers.filter((v) => (v.mode === 'control') === control && v.bitrateAskKbps > 0);
+    const lowest = Math.min(ceilingKbps, ...asks.map((v) => v.bitrateAskKbps));
+    const kbps = db.sender.bitrateRequests ? lowest : ceilingKbps;
+    return { kbps, ceilingKbps, by: kbps < ceilingKbps ? asks.filter((v) => v.bitrateAskKbps === kbps).map((v) => v.name) : [] };
+  };
+  return { taken: db.sender.bitrateRequests, watch: stream(false, db.sender.bitrateMbps), control: stream(true, db.sender.controlBitrateMbps) };
+}
+
 function status() {
   endIfEveryoneLeft();
   const s = db.share;
@@ -148,7 +203,7 @@ function status() {
     share: {
       mode: mode(), state: s.state, detail: s.detail, attempt: 1, uptimeSec: up,
       capture: streaming ? { fps: db.sender.fps - 0.02 + wobble * 0.02, duplicated: Math.floor(up * 12), dropped: 0, gpuMs: 0.61 + wobble * 0.05, audioUnderrun: 0 } : null,
-      encode: streaming ? { fps: db.sender.fps, frame: Math.floor(up * db.sender.fps), bitrateKbps: db.sender.bitrateMbps * 1000 * (0.97 + wobble * 0.03), speed: 1.0, dropFrames: 0 } : null,
+      encode: streaming ? { fps: db.sender.fps, frame: Math.floor(up * db.sender.fps), bitrateKbps: bitrateView().watch.kbps * (0.97 + wobble * 0.03), speed: 1.0, dropFrames: 0 } : null,
       video: streaming ? {
         hdr: sentHdr, width: p.width, height: p.height, hdrUnavailable: p.hdr && !sentHdr,
         format: (sentHdr ? 'p010 / HDR10 ' : 'nv12 / SDR ') + p.width + 'x' + p.height,
@@ -164,6 +219,7 @@ function status() {
       endsInSec: s.aloneSinceMs ? Math.ceil((2000 - (now() - s.aloneSinceMs)) / 1000) : null,
       endedUnwatched: db.endedUnwatched,
       controlMode: { offered: !mac && db.sender.controlMode, engine: { state: 'idle', detail: '', fps: null, unavailable: false } },
+      bitrate: bitrateView(),
     },
     plan: p,
     watch: {
@@ -191,8 +247,24 @@ function status() {
       } : null,
       control,
       displays,
+      // Leo runs a version that takes no bitrate requests; the others answer a moment after a choice
+      bitrate: (() => {
+        const can = connected && host?.hostId !== 'h2';
+        const wantedKbps = db.receiver.bitrateLimits[w.hostId] || 0;
+        const ceilingKbps = (host?.mbps || 0) * 1000;
+        const answered = can && now() - (w.bitrateAt || 0) > 600;
+        return {
+          can, hostMbps: host?.mbps || 0,
+          link: {
+            wantedKbps, waiting: can && !answered,
+            kbps: answered ? Math.min(ceilingKbps, wantedKbps || ceilingKbps) : null, ceilingKbps: answered ? ceilingKbps : null,
+            askedKbps: answered ? wantedKbps : null, taken: answered ? true : null,
+          },
+        };
+      })(),
     },
     live: { hosts, error: null, loaded: true },
+    probe: probeView(),
     group: db.group,
     firewall: db.firewall,
     accessRev: db.access.rev,
@@ -204,13 +276,13 @@ function status() {
 function scheduleViewers() {
   const people = [
     { sid: 's1', name: 'Hana', deviceCode: 'B7WP-3N6S-KCE1', verified: true, ipv6: false, path: '198.51.100.13:62909', rttMs: 74, latencyMs: 3500, overheadPercent: 50, control: 'none',
-      net: { lossPercent: 3.4, lostForGood: 12, mbps: 43.6, rttMs: 76 } },
+      bitrateAskKbps: 8000, net: { lossPercent: 3.4, lostForGood: 12, mbps: 43.6, rttMs: 76 } },
     { sid: 's2', name: 'Leo', deviceCode: '', verified: false, ipv6: false, path: '198.51.100.3:20834', rttMs: 81, latencyMs: 3500, overheadPercent: 50, control: 'requested',
-      net: { lossPercent: 0.4, lostForGood: 0, mbps: 43.6, rttMs: 83 } },
+      bitrateAskKbps: null, net: { lossPercent: 0.4, lostForGood: 0, mbps: 43.6, rttMs: 83 } },
     { sid: 's3', name: 'Mika', deviceCode: 'P0VD-2KQN-71XA', verified: true, ipv6: true, path: '[2400:aaaa::7]:50112', rttMs: 12, latencyMs: 1500, overheadPercent: 25, control: 'none',
-      net: { lossPercent: 0, lostForGood: 0, mbps: 43.6, rttMs: 12 } },
+      bitrateAskKbps: 0, net: { lossPercent: 0, lostForGood: 0, mbps: 43.6, rttMs: 12 } },
     { sid: 's4', name: 'NiseMac', deviceCode: 'Q4ZD-81HM-X0RT', verified: true, ipv6: true, path: '[2400:aaaa::9]:50113', rttMs: 2, latencyMs: 1500, overheadPercent: 25, control: 'granted',
-      mode: 'control', net: null, ll: { rttMs: 1.9, shown: 5400, lost: 1, restored: 23, keyframeRequests: 1, mbps: 14.2, reportAgeSec: 0.2 } },
+      mode: 'control', bitrateAskKbps: 0, net: null, ll: { rttMs: 1.9, shown: 5400, lost: 1, restored: 23, keyframeRequests: 1, mbps: 14.2, reportAgeSec: 0.2 } },
   ];
   people.forEach((p, i) => setTimeout(() => {
     if (db.share.state === 'streaming' || db.share.state === 'starting') {
@@ -313,12 +385,22 @@ const api = {
   },
   live_refresh: () => null,
   watch_start({ hostId }) {
+    if (db.probe.run?.active) db.probe.run.stopped = true;
     const h = hosts.find((x) => x.hostId === hostId);
     db.watch = { active: true, hostId, hostName: h.name, startedMs: now(), want: null, wantAt: 0, latencyMs: db.receiver.latencyMs, overlay: false };
     emit('log', { lines: [`[app] watching ${h.name} (latency ${db.receiver.latencyMs} ms)`] });
     return { ok: true };
   },
   watch_stop() { db.watch = { active: false, hostId: '', hostName: '', startedMs: 0, want: null }; },
+  probe_start({ hostId }) {
+    if (db.watch.active) return { ok: false, problems: ['Stop watching first: the test joins the host itself.'] };
+    if (db.probe.run?.active) return { ok: false, problems: ['A connection test is running already.'] };
+    const h = hosts.find((x) => x.hostId === hostId);
+    db.probe.run = { hostId, hostName: h.name, startedMs: now(), active: true, phase: 'joining', approval: false, status: `Connecting to ${h.name}`, progress: 0, secondsLeft: null, now: null, error: '' };
+    emit('log', { lines: [`[probe] testing the connection to ${h.name}`] });
+    return { ok: true };
+  },
+  probe_stop() { if (db.probe.run) db.probe.run.stopped = true; },
   watch_control({ want }) { db.watch.want = want; db.watch.wantAt = (now() - db.watch.startedMs) / 1000; },
   watch_fullscreen: () => null,
   watch_set_hwdec({ hwDec }) {
@@ -336,6 +418,15 @@ const api = {
     return { ok: true };
   },
   watch_set_mute({ muted }) { db.watch = { ...db.watch, muted }; },
+  watch_set_bitrate({ kbps }) {
+    const bitrateLimits = { ...db.receiver.bitrateLimits };
+    if (kbps > 0) bitrateLimits[db.watch.hostId] = kbps;
+    else delete bitrateLimits[db.watch.hostId];
+    db.receiver = { ...db.receiver, bitrateLimits };
+    db.watch = { ...db.watch, bitrateAt: now() };
+    emit('receiver', db.receiver);
+    return db.receiver;
+  },
   watch_set_display({ id }) {
     db.watch = { ...db.watch, displayPending: id };
     // the host's capture starts again on that display
@@ -390,3 +481,4 @@ setTimeout(() => emit('log', { lines: ['[app] settings: C:\\Users\\me\\AppData\\
 if (q.has('live')) setTimeout(() => api.share_start(), 200);
 if (q.has('watching')) setTimeout(() => api.watch_start({ hostId: 'h3' }), 200);
 if (q.has('knock')) setTimeout(knock, 1500);
+if (q.has('probe')) setTimeout(() => api.probe_start({ hostId: 'h1' }), 200);

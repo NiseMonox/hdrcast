@@ -5,7 +5,7 @@ import { Icon, Caption } from './icons.js';
 import { useStore, boot, go, openSheet, closeSheet, toast, dismissToast, setState, state } from './store.js';
 import { Avatar, Sheet } from './components.js';
 import { SharePage, ShareActionBar, AddDeviceSheet, isSharing, answerKnock, copyInvite } from './pages/share.js';
-import { WatchPage, isWatching } from './pages/watch.js';
+import { WatchPage, isWatching, ProbeSheet } from './pages/watch.js';
 import { SettingsPage, ActivityPage, pasteInvite, routeInvite } from './pages/settings.js';
 
 function App() {
@@ -138,6 +138,7 @@ function Sheets({ sheet }) {
   if (name === 'problems') return html`<${ProblemsSheet} ...${props} />`;
   if (name === 'firewall') return html`<${FirewallSheet} ...${props} />`;
   if (name === 'add-device') return html`<${AddDeviceSheet} ...${props} />`;
+  if (name === 'probe') return html`<${ProbeSheet} ...${props} />`;
   return null;
 }
 

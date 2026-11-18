@@ -3,6 +3,7 @@
 //! The file is the one the C# receiver wrote with DataContractJsonSerializer: camelCase names, enums as
 //! numbers, a missing field = its default, unknown fields ignored.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -80,12 +81,13 @@ int_enum! {
     }
 }
 
-/// A named SRT latency: where the viewer is relative to the host.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// A named SRT latency, where the viewer is relative to the host, and the player's buffer that goes with it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LatencyPreset {
     pub name: &'static str,
     pub latency_ms: i32,
+    pub buffer_seconds: f64,
 }
 
 impl fmt::Display for LatencyPreset {
@@ -123,6 +125,13 @@ pub struct ReceiverSettings {
     /// Control mode (docs/design.md §11): connect for remote control with the low-latency stream instead of the
     /// buffered one. The choice on the Watch page, kept for next time.
     pub control_mode: bool,
+    /// The resend headroom (SRT's oheadbw, 5..100 %) this viewer asks the host for; 0 = by the delay
+    /// ([`overhead_to_ask`](Self::overhead_to_ask)).
+    pub overhead_percent: i32,
+    /// The most this viewer asks each host's stream to carry, kbit/s, by the host's peer id (docs/design.md §8.13).
+    /// A host not listed is asked for nothing: its stream runs at its own setting.
+    #[serde(deserialize_with = "null_as_default")]
+    pub bitrate_limits: BTreeMap<String, u32>,
 }
 
 impl Default for ReceiverSettings {
@@ -143,6 +152,8 @@ impl Default for ReceiverSettings {
             target_peak_nits: 0,
             last_host: String::new(),
             control_mode: false,
+            overhead_percent: 0,
+            bitrate_limits: BTreeMap::new(),
         }
     }
 }
@@ -150,27 +161,39 @@ impl Default for ReceiverSettings {
 impl ReceiverSettings {
     pub const FILE_NAME: &'static str = "receiver.json";
     pub const DEFAULT_TONE_MAPPING: &'static str = "bt.2390";
+    /// [`bitrate_limits`](Self::bitrate_limits) keeps this many hosts at most.
+    pub const MAX_BITRATE_LIMITS: usize = 64;
 
-    /// "Fast" is for watching while controlling the host's PC (remote control); the regions are sized for the
-    /// retransmissions their distance from the host needs (design.md §5).
+    /// "Fast" is for a host close by, and with it a short player buffer; the regions are sized for the
+    /// retransmissions their distance from the host needs (design.md §5). The connection test finds the figures
+    /// for one host (§5.1).
     pub const LATENCY_PRESETS: [LatencyPreset; 4] = [
         LatencyPreset {
             name: "Fast",
             latency_ms: 300,
+            buffer_seconds: 0.5,
         },
         LatencyPreset {
             name: "Japan",
             latency_ms: 1500,
+            buffer_seconds: 1.5,
         },
         LatencyPreset {
             name: "Australia",
             latency_ms: 2000,
+            buffer_seconds: 1.5,
         },
         LatencyPreset {
             name: "China",
             latency_ms: 3500,
+            buffer_seconds: 1.5,
         },
     ];
+
+    /// The preset with this delay, if one has it.
+    pub fn preset_of(latency_ms: i32) -> Option<&'static LatencyPreset> {
+        Self::LATENCY_PRESETS.iter().find(|p| p.latency_ms == latency_ms)
+    }
 
     pub const TONE_MAPPING_ALGORITHMS: [&'static str; 10] = [
         "bt.2390",
@@ -204,6 +227,7 @@ impl ReceiverSettings {
             self.buffer_seconds = 1.5;
         }
         self.buffer_seconds = self.buffer_seconds.min(30.0);
+        self.overhead_percent = if self.overhead_percent <= 0 { 0 } else { self.overhead_percent.clamp(5, 100) };
         self.fullscreen_screen = self.fullscreen_screen.max(0);
         // mpv accepts "auto" or 10..10000; anything in between makes it exit with
         // "Invalid value for option target-peak", so treat a too-small number as auto.
@@ -211,7 +235,33 @@ impl ReceiverSettings {
             self.target_peak_nits = 0;
         }
         self.target_peak_nits = self.target_peak_nits.min(10000);
+        let limits = std::mem::take(&mut self.bitrate_limits);
+        self.bitrate_limits = limits
+            .into_iter()
+            .map(|(host, kbps)| (host.trim().to_string(), kbps))
+            .filter(|(host, kbps)| !host.is_empty() && *kbps > 0)
+            .map(|(host, kbps)| (host, kbps.clamp(crate::bitrate::FLOOR_KBPS, 500_000)))
+            .take(Self::MAX_BITRATE_LIMITS)
+            .collect();
         self
+    }
+
+    /// The most this viewer asks `host`'s stream to carry, kbit/s (0: nothing, the host's setting).
+    pub fn bitrate_limit(&self, host: &str) -> u32 {
+        self.bitrate_limits.get(host).copied().unwrap_or(0)
+    }
+
+    /// Asks `host` for at most `kbps` from now on (0: nothing).
+    pub fn set_bitrate_limit(&mut self, host: &str, kbps: u32) {
+        if kbps == 0 {
+            self.bitrate_limits.remove(host);
+        } else {
+            self.bitrate_limits.insert(host.to_string(), kbps.clamp(crate::bitrate::FLOOR_KBPS, 500_000));
+            while self.bitrate_limits.len() > Self::MAX_BITRATE_LIMITS {
+                let Some(other) = self.bitrate_limits.keys().find(|k| *k != host).cloned() else { break };
+                self.bitrate_limits.remove(&other);
+            }
+        }
     }
 
     /// [`normalize`](Self::normalize), consuming: `ReceiverSettings { .. }.normalized()`.
@@ -235,12 +285,13 @@ impl ReceiverSettings {
         problems
     }
 
-    /// oheadbw this viewer asks the host for: the cross-border (China) preset gets more retransmission headroom.
-    pub fn overhead_percent(&self) -> u32 {
-        if self.latency_ms >= 3000 {
-            50
-        } else {
-            25
+    /// oheadbw this viewer asks the host for: as set, or by the delay, where the cross-border (China) preset gets
+    /// more retransmission headroom.
+    pub fn overhead_to_ask(&self) -> u32 {
+        match self.overhead_percent {
+            1.. => self.overhead_percent.clamp(5, 100) as u32,
+            _ if self.latency_ms >= 3000 => 50,
+            _ => 25,
         }
     }
 

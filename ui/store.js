@@ -91,10 +91,11 @@ export async function boot() {
       invoke('access_get').then((access) => { if (!accessTimer) setState({ access }); }).catch(() => {});
     }
   });
-  // the panel over the player changed the delay or the decoder: keep them, so the next save does not undo them
+  // the panel over the player changed the delay, the decoder or the bitrate asked for: keep them, so the next save
+  // does not undo them
   listen('receiver', (receiver) => {
-    const { latencyMs, hwDec } = receiver;
-    setState({ settings: { ...state.settings, receiver: { ...state.settings.receiver, latencyMs, hwDec } } });
+    const { latencyMs, hwDec, bufferSeconds, overheadPercent, bitrateLimits } = receiver;
+    setState({ settings: { ...state.settings, receiver: { ...state.settings.receiver, latencyMs, hwDec, bufferSeconds, overheadPercent, bitrateLimits } } });
   });
   // a viewer who controls this computer had another display shared: the Share page shows it, and keeps it
   listen('sender', (sender) => {

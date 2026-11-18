@@ -489,6 +489,8 @@ fn sender_settings_files_are_read_normalised_and_used_like_the_csharp_did() {
         assert_eq!(ours.as_object_mut().unwrap().shift_remove("keyframeOnRequest"), Some(json!(false)), "{file}");
         // and the switch that ends a broadcast once everyone has left (§8.10): on without the field
         assert_eq!(ours.as_object_mut().unwrap().shift_remove("endWhenViewersLeave"), Some(json!(true)), "{file}");
+        // and 0.3.10's switch that lets viewers ask for a lower bitrate (§8.13): on without the field
+        assert_eq!(ours.as_object_mut().unwrap().shift_remove("bitrateRequests"), Some(json!(true)), "{file}");
         // and 0.3.7's control mode (§11): offered, at its own bitrate and frame rate
         for (key, value) in [("controlMode", json!(true)), ("controlBitrateMbps", json!(30)), ("controlFps", json!(60))] {
             assert_eq!(ours.as_object_mut().unwrap().shift_remove(key), Some(value), "{file}");
@@ -630,7 +632,7 @@ fn receiver_settings_files_are_read_and_normalised_like_the_csharp_did() {
             "{file}"
         );
         assert_eq!(
-            i64::from(raw.overhead_percent()),
+            i64::from(raw.overhead_to_ask()),
             int_of(&out["overheadBeforeNormalize"]),
             "{file}"
         );
@@ -639,6 +641,10 @@ fn receiver_settings_files_are_read_and_normalised_like_the_csharp_did() {
         let mut ours = serde_json::to_value(&s).unwrap();
         // 0.3.7's choice of control mode (docs/design.md §11): no C# file has it, so it is watching as always
         assert_eq!(ours.as_object_mut().unwrap().shift_remove("controlMode"), Some(Value::from(false)), "{file}");
+        // 0.3.10's resend headroom: no C# file has it, so it is chosen by the delay as always (0)
+        assert_eq!(ours.as_object_mut().unwrap().shift_remove("overheadPercent"), Some(Value::from(0)), "{file}");
+        // and 0.3.10's bitrate limits (§8.13): none
+        assert_eq!(ours.as_object_mut().unwrap().shift_remove("bitrateLimits"), Some(serde_json::json!({})), "{file}");
         let mut theirs: Value = serde_json::from_str(str_of(&out["normalized"])).unwrap();
         if s.frontend == ReceiverFrontend::MpvDirect {
             // 2 is "mpv direct" since 0.3.2; the C# had no such number and fell back to its 0
@@ -655,7 +661,7 @@ fn receiver_settings_files_are_read_and_normalised_like_the_csharp_did() {
         );
         assert_eq!(s.validate(), strings_of(&out["validate"]), "{file}");
         assert_eq!(
-            i64::from(s.overhead_percent()),
+            i64::from(s.overhead_to_ask()),
             int_of(&out["overheadPercent"]),
             "{file}"
         );
@@ -704,21 +710,28 @@ fn mpv_plan(input: &Value) -> Result<MpvLaunchPlan, String> {
 /// Since 0.3.3 mpv shows no on-screen controller (a live stream has nothing to seek in), no OSD bar and no Windows
 /// media overlay: the three options follow `--force-window=yes`. Its own keys, mouse actions, config files, window
 /// dragging and drag and drop are off as well: those four options come before `--keep-open=no`. The rest of the line
-/// is the C#'s.
+/// is the C#'s, except that since 0.3.10 the pipe's mpv gets `--mc=1` after `--demuxer-lavf-format=mpegts`: it brings
+/// the picture back to the sound in seconds after the guard's long freezes (docs/design.md §3.2).
 const WITHOUT_CONTROLLER: &str = " --force-window=yes --osc=no --osd-bar=no --media-controls=no ";
 const PLAYER_ONLY: &str = " --config=no --input-default-bindings=no --window-dragging=no --drag-and-drop=no --keep-open=no ";
+const FASTER_SYNC: &str = " --demuxer-lavf-format=mpegts --mc=1 ";
 
 fn without_controller(mut args: Vec<String>) -> Vec<String> {
     let at = args.iter().position(|a| a == "--force-window=yes").expect("the C# passed --force-window=yes") + 1;
     args.splice(at..at, ["--osc=no", "--osd-bar=no", "--media-controls=no"].map(String::from));
     let at = args.iter().position(|a| a == "--keep-open=no").expect("the C# passed --keep-open=no");
     args.splice(at..at, ["--config=no", "--input-default-bindings=no", "--window-dragging=no", "--drag-and-drop=no"].map(String::from));
+    if let Some(at) = args.iter().position(|a| a == "--demuxer-lavf-format=mpegts") {
+        args.insert(at + 1, "--mc=1".to_string());
+    }
     args
 }
 
-/// The C#'s command line as 0.3.3 builds it (see [`without_controller`]).
+/// The C#'s command line as 0.3.10 builds it (see [`without_controller`]).
 fn as_now(line: &str) -> String {
-    line.replace(" --force-window=yes ", WITHOUT_CONTROLLER).replace(" --keep-open=no ", PLAYER_ONLY)
+    line.replace(" --force-window=yes ", WITHOUT_CONTROLLER)
+        .replace(" --keep-open=no ", PLAYER_ONLY)
+        .replace(" --demuxer-lavf-format=mpegts ", FASTER_SYNC)
 }
 
 #[test]

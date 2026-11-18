@@ -74,6 +74,9 @@ pub struct P2pHostOptions {
     /// Whether this host offers control mode, the low-latency stream for remote control ("ll" in the live record,
     /// docs/design.md §11). Asked at every heartbeat and for every join that asks for it. `None` = never.
     pub offer_low_latency: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// This host takes requests for a lower bitrate on the side channel ("br" in the live record, docs/design.md
+    /// §8.13). Whether they count is the app's to say in its answers.
+    pub bitrate_requests: bool,
 }
 
 /// What a side datagram is for. Each use has its own flag in the live record and the join, and nothing goes to
@@ -86,6 +89,8 @@ pub enum SideUse {
     Keyframes,
     /// Control mode's stream, its requests and answers ("ll").
     LowLatency,
+    /// Requests for a lower bitrate and their answers ("br").
+    Bitrate,
 }
 
 /// Something that happened to one viewer's stream, for whoever drives the encoder (docs/design.md §8.12).
@@ -118,6 +123,9 @@ pub struct JoinTicket {
     pub wants_keyframes: bool,
     /// The join said "ll": control mode, the low-latency stream instead of SRT (docs/design.md §11).
     pub low_latency: bool,
+    /// The join's "br": the most the viewer wants the stream to carry, kbit/s (0: the host's setting); `None` for a
+    /// viewer that does not ask for a lower bitrate (docs/design.md §8.13).
+    pub bitrate_kbps: Option<u32>,
     pub latency_ms: i32,
     pub overhead_percent: i32,
 }
@@ -144,6 +152,7 @@ impl Default for P2pHostOptions {
             on_demand: None,
             offer_keyframes: None,
             offer_low_latency: None,
+            bitrate_requests: false,
         }
     }
 }
@@ -171,6 +180,8 @@ pub struct ViewerInfo {
     pub wants_keyframes: bool,
     /// The viewer is in control mode: no SRT, the host's side datagrams are its stream (docs/design.md §11).
     pub low_latency: bool,
+    /// The viewer's join said "br": it asks for a lower bitrate and understands the answers (docs/design.md §8.13).
+    pub bitrate_requests: bool,
     pub viewer_id: String,
     /// The viewer's device key, when its join was signed (docs/design.md §8.10).
     pub device_key: Option<String>,
@@ -477,6 +488,7 @@ impl P2pHost {
             SideUse::RemoteControl => info.wants_control,
             SideUse::Keyframes => info.wants_keyframes,
             SideUse::LowLatency => info.low_latency,
+            SideUse::Bitrate => info.bitrate_requests,
         };
         announced && !viewer.ended.load(Ordering::Acquire)
     }
@@ -959,6 +971,7 @@ impl Inner {
                 wants_control: join.remote_control,
                 wants_keyframes: join.keyframes,
                 low_latency: join.low_latency,
+                bitrate_requests: join.bitrate_kbps.is_some(),
                 viewer_id: join.viewer_id.clone(),
                 device_key: device.as_ref().map(|d| d.key.clone()),
                 srt: None,
@@ -1242,6 +1255,7 @@ impl Inner {
             on_demand: self.on_demand(),
             keyframes: self.o.offer_keyframes.as_ref().is_some_and(|offers| offers()),
             low_latency: self.offers_low_latency(),
+            bitrate_requests: self.o.bitrate_requests,
         };
         let keys = self.keys.get().expect("sealed only while running");
         SignedEnvelope::seal(keys, messages::KIND_LIVE, &g.group_id, &g.peer_id, &record.to_payload())
@@ -1354,6 +1368,7 @@ fn ticket_of(pending: &PendingJoin) -> JoinTicket {
         wants_control: join.remote_control,
         wants_keyframes: join.keyframes,
         low_latency: join.low_latency,
+        bitrate_kbps: join.bitrate_kbps,
         latency_ms: join.latency_ms,
         overhead_percent: join.overhead_percent,
     }

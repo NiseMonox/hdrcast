@@ -70,7 +70,10 @@ pub fn app_init(app: State<'_, Arc<AppState>>) -> Value {
 }
 
 fn latency_presets() -> Value {
-    ReceiverSettings::LATENCY_PRESETS.iter().map(|p| json!({ "name": p.name, "latencyMs": p.latency_ms })).collect()
+    ReceiverSettings::LATENCY_PRESETS
+        .iter()
+        .map(|p| json!({ "name": p.name, "latencyMs": p.latency_ms, "bufferSeconds": p.buffer_seconds }))
+        .collect()
 }
 
 fn hw_dec_modes(platform: tool_locator::Platform) -> Value {
@@ -95,8 +98,10 @@ pub struct AllSettings {
 pub fn settings_save(app: Shared<'_>, handle: AppHandle, settings: AllSettings) -> CmdResult {
     let ui = settings.ui.normalized();
     let mut sender = settings.sender.normalized();
-    let receiver = settings.receiver.normalized();
+    let mut receiver = settings.receiver.normalized();
     let mut inner = app.inner.lock().unwrap();
+    // what each host is asked for at most changes only while watching it (watch_set_bitrate): a page's copy may lag
+    receiver.bitrate_limits = inner.receiver.bitrate_limits.clone();
     state::adopt_output(&mut sender, &inner.outputs);
     let theme_changed = ui.theme != inner.ui.theme;
     let sender_changed = sender != inner.sender;
@@ -590,6 +595,18 @@ pub fn watch_stop(app: Shared<'_>) {
     crate::watch::stop(&app);
 }
 
+/// The connection test (docs/design.md §5.1): joins `host_id` without a player and measures the path.
+#[tauri::command(async)]
+pub fn probe_start(app: Shared<'_>, host_id: String) -> Value {
+    refresh_firewall(&app);
+    outcome(crate::probe::start(app.inner(), &host_id).map_err(|e| vec![e]))
+}
+
+#[tauri::command(async)]
+pub fn probe_stop(app: Shared<'_>) {
+    crate::probe::stop(&app);
+}
+
 #[tauri::command(async)]
 pub fn watch_fullscreen(app: Shared<'_>) {
     crate::watch::toggle_fullscreen(&app);
@@ -607,9 +624,25 @@ pub fn watch_set_hwdec(app: Shared<'_>, handle: AppHandle, hw_dec: i64) -> CmdRe
 /// The delay, from the panel over the player: saved, and taken by joining the host again.
 #[tauri::command(async)]
 pub fn watch_set_latency(app: Shared<'_>, handle: AppHandle, latency_ms: i32) -> Value {
-    edit_receiver(&app, &handle, |r| r.latency_ms = latency_ms);
+    // a preset's delay comes with its buffer
+    edit_receiver(&app, &handle, |r| {
+        r.latency_ms = latency_ms;
+        if let Some(preset) = ReceiverSettings::preset_of(latency_ms) {
+            r.buffer_seconds = preset.buffer_seconds;
+        }
+    });
     refresh_firewall(&app);
     outcome(crate::watch::rejoin(app.inner()))
+}
+
+/// The most the stream of the host being watched should carry, kbit/s (0: the host's own setting), from the Watch
+/// page or the panel over the player: saved for that host, and asked for at once (docs/design.md §8.13).
+#[tauri::command(async)]
+pub fn watch_set_bitrate(app: Shared<'_>, handle: AppHandle, kbps: u32) -> CmdResult {
+    let host = crate::watch::host_id(&app).ok_or("Not watching.")?;
+    let receiver = edit_receiver(&app, &handle, |r| r.set_bitrate_limit(&host, kbps));
+    crate::watch::set_bitrate_limit(&app, receiver.bitrate_limit(&host));
+    Ok(json!(receiver))
 }
 
 // ---- the panel over the player ------------------------------------------------------------------------------------

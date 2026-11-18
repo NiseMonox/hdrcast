@@ -1,8 +1,8 @@
 // The panel over the player (docs/design.md §3.3). Folded, it is a small round button on the picture; opened, it
-// shows what the stream is doing and the three things a viewer can change while watching: the decoder and the sound
-// at once, the delay by joining the host again (the delay is agreed on when joining). Resolution, frame rate and
-// bitrate are the host's to set; which of its displays it shares, the viewer who controls it may pick. Disconnect
-// stops watching. It is a small window of its own: the backend keeps it on the player's window and sizes it (to the
+// shows what the stream is doing and what a viewer can change while watching: the decoder and the sound at once, the
+// delay by joining the host again (the delay is agreed on when joining), and the most the host's stream may carry
+// (a host of 0.3.10 or later lowers it for everyone watching, docs/design.md §8.13). Resolution and frame rate are the
+// host's to set; which of its displays it shares, the viewer who controls it may pick. Disconnect stops watching. It is a small window of its own: the backend keeps it on the player's window and sizes it (to the
 // button, or to the height this page measures), and both can be dragged.
 
 import { html, render, useEffect, useRef, useState } from './vendor/preact-htm.js';
@@ -10,6 +10,7 @@ import { invoke, listen, win } from './api.js';
 import { setLanguage, t } from './i18n.js';
 import { Icon } from './icons.js';
 import { NumberField, formatDuration } from './components.js';
+import { bitrateChoices, bitrateNote, ceilingOf, mbpsText } from './bitrate.js';
 
 const view = {
   init: null,          // the lists from overlay_init: latencyPresets, hwDecModes
@@ -164,6 +165,7 @@ function Watching({ w }) {
           ? html`<div class="ov-guard">${t('watch.guardFrozen')}</div>`
           : player?.guard?.losses > 0 && html`<div class="ov-guard">${t('watch.guardSummary', { losses: player.guard.losses, held: player.guard.heldBack, freezes: player.guard.freezes })}</div>`}
         <${Delay} w=${w} />`}
+    <${Bitrate} w=${w} />
     <${Displays} w=${w} />
     <${Decoder} />
     <div class="ov-foot">
@@ -240,6 +242,36 @@ function Delay({ w }) {
         ${busy ? t('overlay.rejoining') : t('overlay.apply')}</button>
     </div>
     ${(problem || value !== inUse) && html`<div class=${'ov-note' + (problem ? ' warn' : '')}>${problem || t('overlay.delayNote')}</div>`}
+  </div>`;
+}
+
+/** The most the host's stream may carry: asked of the host at once, kept for it (§8.13). Only a host that takes such
+ *  requests is asked; the host's answer says what its stream runs at. */
+function Bitrate({ w }) {
+  const [problem, setProblem] = useState(null);
+  const b = w.bitrate;
+  if (!b?.can) return null;
+  const ceiling = ceilingOf(b);
+  const wanted = b.link?.wantedKbps || 0;
+  const choose = async (kbps) => {
+    if (kbps === wanted) return;
+    setProblem(null);
+    // shown at once (the next status says the same)
+    update({ status: { ...view.status, watch: { ...w, bitrate: { ...b, link: { ...b.link, wantedKbps: kbps, waiting: true } } } } });
+    try {
+      await invoke('watch_set_bitrate', { kbps });
+    } catch (e) {
+      setProblem(String(e));
+    }
+  };
+  const now = b.link?.kbps != null && !b.link.waiting ? t('overlay.now', { v: mbpsText(b.link.kbps) + ' Mbps' }) : '';
+  return html`<div class="ov-section">
+    <div class="ov-label"><span>${t('watch.bitrateLimit')}</span><span class="spacer"></span><span class="ov-now">${now}</span></div>
+    <div class="ov-chips four">
+      ${bitrateChoices(ceiling, wanted).map((kbps) => html`<button class=${'ov-chip' + (kbps === wanted ? ' on' : '')} onClick=${() => choose(kbps)}>
+        ${kbps ? mbpsText(kbps) : t('watch.brHostShort')}<small>${kbps ? 'Mbps' : ceiling ? mbpsText(ceiling) + ' Mbps' : '—'}</small></button>`)}
+    </div>
+    <div class=${'ov-note' + (problem ? ' warn' : '')}>${problem || bitrateNote(b)}</div>
   </div>`;
 }
 

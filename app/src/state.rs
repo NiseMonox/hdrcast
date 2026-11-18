@@ -111,6 +111,8 @@ pub struct AppState {
     pub share: crate::share::Share,
     pub watch: crate::watch::Watch,
     pub live: crate::live::Live,
+    /// The connection test (docs/design.md §5.1).
+    pub probe: crate::probe::Probe,
     /// The panel over the player while watching.
     pub overlay: crate::overlay::Overlay,
 }
@@ -153,6 +155,7 @@ impl AppState {
             share: Default::default(),
             watch: Default::default(),
             live: Default::default(),
+            probe: Default::default(),
             overlay: Default::default(),
         }
     }

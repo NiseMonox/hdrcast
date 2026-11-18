@@ -83,6 +83,9 @@ pub struct SenderSettings {
     pub upload_mbps: i32,
     /// A broadcast ends by itself a little after everyone who watched it has left (docs/design.md §8.10).
     pub end_when_viewers_leave: bool,
+    /// Viewers may ask for a lower bitrate than this computer's setting (docs/design.md §8.13): each stream runs at
+    /// the lowest rate one of its viewers asked for. Off: the settings, whatever they ask.
+    pub bitrate_requests: bool,
 
     // ---- control mode (docs/design.md §11) ----
     /// Offer control mode: a viewer may ask for the low-latency stream for remote control instead of the buffered
@@ -164,6 +167,7 @@ impl SenderSettings {
             max_viewers: 4,
             upload_mbps: 0,
             end_when_viewers_leave: true,
+            bitrate_requests: true,
 
             control_mode: true,
             control_bitrate_mbps: Self::DEFAULT_CONTROL_BITRATE_MBPS,

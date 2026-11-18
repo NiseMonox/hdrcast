@@ -125,14 +125,33 @@ upload needed ≈ bitrate × viewers × 1.25   (SRT overhead oheadbw=25 %; ×1.5
 
 1. `No room to store incoming packet` in the viewer's player log (**Activity → Player**) → the receive buffer is too
    small: raise **Settings → Highest bitrate to expect** (it sizes rcvbuf / ffs), see [network.md](network.md) §4.
-2. Packet loss on the way: the viewer stops, adds 500-1000 ms under **Watch → Delay → Custom** and connects again (the
-   sharer uses this value for the connection to that viewer); if that does not help, lower the bitrate. When the sharer's
-   upload falls short, every viewer stutters at once: check "upload ≈ … Mbps" above the **Watching** list on the sharer's
-   **Share** page.
+2. Packet loss on the way: the viewer stops, adds 500-1000 ms under **Watch → Connection → Delay → Custom** and connects
+   again (the sharer uses this value for the connection to that viewer); if that does not help, lower the bitrate (from
+   0.3.10 the viewer can do that too: see the next question). When
+   the sharer's upload falls short, every viewer stutters at once: check "upload ≈ … Mbps" above the **Watching** list
+   on the sharer's **Share** page.
 3. On the sharer's **Share** page the **Encoder** speed stays below 1.0×, or **Dropped frames** keeps climbing → the
    encoder cannot keep up: lower the resolution or the frame rate, or set **More options → Encoder preset** to **Speed**.
    (**Dropped frames** counts the frames the encoder dropped as well as those the capture could not hand over because
    ffmpeg was not reading, which is usually the same problem.)
+
+## Can a viewer lower the bitrate?
+
+From 0.3.10 yes, when the sharer runs 0.3.10 or later too. While watching, the viewer picks a **Bitrate limit** on the
+**Watch** page (or in the overlay over the player): the sharer's encoder then runs at that bitrate at most. The line
+next to it says what the sharer answered.
+
+- The sharer's **Share → Bitrate** stays the ceiling: a viewer can ask for less, never for more.
+- One encode serves everyone, so with several viewers the stream runs at the lowest bitrate any of them asked for, for
+  all of them. The sharer's **Share** page shows who asked: under the bitrate tile ("8 Mbps, as Bob asked") and after
+  that viewer in the **Watching** list.
+- The choice is kept for that sharer: every later connection asks for it again. **Host’s setting** takes it back. When
+  the viewer leaves, the stream goes back to what the others asked for.
+- The sharer can switch it off: **Share → Picture → Viewers may lower it**. The stream then runs at the sharer's
+  bitrate, and the viewer's page says so.
+- With **Keyframe on request** on (NVIDIA), the encoder takes a new bitrate without a break; otherwise ffmpeg starts
+  again and every viewer's picture pauses for about a second.
+- With an older sharer the **Watch** page says its HdrCast is too old to do it: ask them to lower **Share → Bitrate**.
 
 ## The picture freezes for a moment (it used to break up into coloured blocks)
 
@@ -147,15 +166,20 @@ the next keyframe instead (at most one keyframe interval, 1 s by default; the so
 - How lossy the path is: **loss … %** under the bitrate on the **Watch** page, and on the sharer's **Share** page next to
   each viewer **… % lost on the way** / **… too late to resend**. Both logs get a `[net]` line every 30 s while packets
   are lost: `…% lost on the way, n never recovered in time` (viewer) is what actually breaks pictures.
-- Frequent freezes: the viewer stops and adds 500-1000 ms under **Watch → Delay → Custom** (or picks **China**, 3.5 s);
-  if "never recovered" stays high, the sharer lowers the bitrate. Lots of "too late to resend" on the sharer's side
-  means its upload or its bitrate is the problem.
+- Frequent freezes: the viewer stops and adds 500-1000 ms under **Watch → Connection → Delay → Custom** (or picks
+  **China**, 3.5 s); if "never recovered" stays high, the sharer lowers the bitrate. Lots of "too late to resend" on the
+  sharer's side means its upload or its bitrate is the problem.
 - Since 0.3.2 the sharer's encoder also keeps its bitrate steadier (a 0.25 s rate buffer instead of 2 s) and SRT is told
   the stream's real rate, so fewer packets are lost in the first place: both sides should update.
 - Shorter freezes (0.3.3): with an NVIDIA GPU the sharer turns on **Share → More options → Keyframe on request**. HdrCast
   then drives NVENC itself, and a viewer on 0.3.3 that loses part of the stream gets a fresh keyframe at once instead of
   at the next scheduled one: the picture usually holds for a few tenths of a second rather than up to a second (both logs
   get `[keyframe]` lines). Without NVENC, or when that does not work on the sharer's PC, ffmpeg encodes as before.
+- Picture and sound out of step after a freeze (fixed in 0.3.10): before 0.3.10, a freeze longer than the player
+  buffer made mpv stop the sound to buffer. Afterwards picture and sound were apart by up to the length of the freeze,
+  for a minute or more, and the whole stream stayed that much later. Since 0.3.10 the sound plays on through a freeze
+  and the picture comes back in step with it. After a freeze of 5 s or more the picture can be up to the buffer's length
+  early for a moment, then it plays slowly for about 2.5 s until it is in step. Only the viewer needs 0.3.10.
 
 ## Where does the sound come from? Do I need a virtual audio device?
 
@@ -220,8 +244,9 @@ the last viewer. The same switch takes it away again.
 ## Is the "ping 38 ms" the delay?
 
 No. That is the round trip of the punched path (a network ping). The delay of the picture ≈ the viewer's SRT delay + the
-player buffer (1.5 s, **Settings → Player buffer**) + encoding and decoding (about 0.5 s): measured at 3.6 s with the
-Japan preset (2026-09-24, one PC over loopback, [network.md](network.md) §3), about 5.6 s with the China preset. The SRT
+player buffer (1.5 s with the presets, **Watch → Connection → Player buffer**) + capturing, encoding and decoding (about
+0.8 s); the **Behind live** row there adds it up. Measured on one PC: 3.6 s with the Japan preset, 1.2 s with 90 ms and a
+0.3 s buffer ([network.md](network.md) §3); about 5.8 s with the China preset. The SRT
 delay is the time window for retransmissions: it decides how much packet loss the stream rides out, **not the picture
 quality**, which only depends on the bitrate and the encoder preset. On a good line a long delay and a short one look the
 same; one is just a few seconds later.
@@ -234,7 +259,14 @@ picture is 14.5 ms behind at 1080p and 21 ms in 4K HDR, plus the network's one-w
 should be good: a lost picture freezes the screen until a keyframe comes, so a lossy line freezes often (see the README's
 Control mode section).
 
-For watching, HdrCast is built like a broadcast. Pick **Fast** (300 ms) under **Watch → Delay**, or a **Custom** delay of about
-4 × RTT (Japan about 200 ms, Australia about 700 ms), and lower **Settings → Player buffer** (mpv's `cache-pause-wait`) to
-0.5 s: the whole delay comes down to about 1.5 s, but the picture stalls whenever the line hiccups. Going below 3 × RTT
-is not recommended.
+For watching, HdrCast is built like a broadcast, but the delay can come down a long way. Click **Test** next to the
+computer under **Watch**, then **Use These Settings**: the test measures for about half a minute how late the stream's
+packets come and how many go missing, and sets the shortest delay that still gets nearly all of them through, with a
+player buffer to match (0.3 s on a good line; [network.md](network.md) §3, item 8). By hand: under **Watch → Connection**,
+a **Custom** delay of about 4 × RTT (Japan about 200 ms, Australia about 700 ms; not below 3 × RTT) and a smaller
+**Player buffer**; **Behind live** shows the sum. A delay too short for the line makes the picture stall whenever it
+hiccups.
+
+Even then watching stays far from Control mode. Measured on one PC with 90 ms and a 0.3 s buffer, the picture was 1.2 s
+behind, or 0.84 s with the sharer's **Encoder preset** on **Speed** (no lookahead): SRT has to leave time for a resend,
+the player keeps a few pictures and 0.2 s of sound, and the encoder looks ahead.

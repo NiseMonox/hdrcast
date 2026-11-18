@@ -6,11 +6,14 @@
 //! * decoded as it arrived, the stream shows pictures the encoder never made (the smearing a viewer sees);
 //! * through the guard, every picture that is decoded is one the encoder made, bit for bit.
 //!
+//! A second run loses the first send and the first resend of some packets: libsrt's resends keep the original's
+//! timestamp, and the viewer's monitor measures how late those packets came (docs/design.md §5.1).
+//!
 //! Needs ffmpeg with libx265 and libsrt (HDRCAST_TOOLS or PATH); without it the test prints a note and passes.
 
 mod common;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr};
@@ -247,4 +250,144 @@ fn damaged_pictures_never_reach_the_decoder_and_both_ends_see_the_loss() {
     assert!(shown.len() * 3 >= raw.len(), "the guard kept back too much: {} of {}", shown.len(), raw.len());
 
     let _ = std::fs::remove_dir_all(reference.parent().unwrap());
+}
+
+/// Loses the first send of one in `every` SRT data packets and the first resend of each of those, and notes the
+/// timestamp of every copy of them that came: such a packet gets through on its second resend, after SRT's
+/// periodic loss report asked for it again.
+struct TwiceLost {
+    every: u64,
+    state: Mutex<Twice>,
+}
+
+#[derive(Default)]
+struct Twice {
+    rng: u64,
+    top: Option<u32>,
+    /// The packets held back: the timestamps of their copies, in the order they came.
+    copies: HashMap<u32, Vec<u32>>,
+}
+
+impl PacketFilter for TwiceLost {
+    fn on_outbound(&self, _: SocketAddr) {}
+
+    fn allow_inbound(&self, _: SocketAddr) -> bool {
+        true
+    }
+
+    fn allow_datagram(&self, _: SocketAddr, datagram: &[u8]) -> bool {
+        if datagram.len() < 1000 || datagram[0] & 0x80 != 0 {
+            return true;
+        }
+        let seq = u32::from_be_bytes(datagram[..4].try_into().unwrap());
+        let timestamp = u32::from_be_bytes(datagram[8..12].try_into().unwrap());
+        let mut s = self.state.lock().unwrap();
+        if let Some(copies) = s.copies.get_mut(&seq) {
+            copies.push(timestamp);
+            return copies.len() > 2; // the first send and the first resend do not get through
+        }
+        let first_send = s.top.is_none_or(|top| {
+            let ahead = seq.wrapping_sub(top) & 0x7FFF_FFFF;
+            ahead != 0 && ahead < 1 << 30
+        });
+        if first_send {
+            s.top = Some(seq);
+            s.rng ^= s.rng << 13;
+            s.rng ^= s.rng >> 7;
+            s.rng ^= s.rng << 17;
+            if s.rng % self.every == 0 {
+                s.copies.insert(seq, vec![timestamp]);
+                return false;
+            }
+        }
+        true
+    }
+}
+
+#[test]
+fn a_resend_keeps_its_timestamp_and_the_viewer_measures_how_late_it_came() {
+    const TEST: &str = "a_resend_keeps_its_timestamp_and_the_viewer_measures_how_late_it_came";
+    const LATENCY: u32 = 1000;
+    let Some((ffmpeg, _)) = common::media_tools() else {
+        common::skip(TEST, "needs ffmpeg with libx265 and libsrt (set HDRCAST_TOOLS to its directory)");
+        return;
+    };
+    let keys = random_keys();
+    let mut encoder = KillOnDrop(encoder(&ffmpeg, 6).spawn().expect("the encoder starts"));
+    let fan = TsFanOut::new(Box::new(encoder.0.stdout.take().unwrap()));
+    let host = HostLink::new(&keys, &common::loopback_v4()).unwrap();
+    fan.start().unwrap();
+
+    let sid = keys::new_id();
+    let child_port = RemuxChild::free_loopback_udp_port().unwrap();
+    // SRT told of far more than the 3 Mbps the encoder makes: its pacing never holds a packet back, so what is late
+    // is late because of the resends (the other test shows the pacing: a bursty encoder against a tight rate)
+    let mut child = RemuxChild::new(&ffmpeg, &RemuxChild::build_listener_url(child_port, keys.srt_passphrase(), LATENCY, 25, 30_000_000).unwrap(), None);
+    child.start().expect("the remux child starts");
+    fan.add_sink(&sid, Box::new(child.input().unwrap()), TsFanOut::queue_bytes_for(3_000_000)).unwrap();
+
+    let filter = std::sync::Arc::new(TwiceLost { every: 100, state: Mutex::new(Twice { rng: 0x2545_F491_4F6C_DD1D, ..Twice::default() }) });
+    let viewer = ViewerLink::new(
+        &keys,
+        &LinkAddresses { ipv6: None, ipv4_bind: Some(Ipv4Addr::LOCALHOST), ipv4_advertise: None, filter_v6: None, filter_v4: Some(filter.clone()) },
+        0,
+    )
+    .unwrap();
+    host.add_session(&sid, &viewer.candidates(), child_port, None).unwrap();
+    viewer.start_session(&sid, &host.candidates()).unwrap();
+    assert!(wait_for(|| viewer.state() == LinkState::Connected, 5000), "{}", viewer.reason());
+
+    let url = srt_url::build(&SrtUrlOptions {
+        topology: SrtTopology::Caller,
+        role: SrtRole::Read,
+        host: "127.0.0.1".to_string(),
+        port: viewer.local_port(),
+        passphrase: Some(keys.srt_passphrase().to_string()),
+        latency_ms: LATENCY,
+        bitrate_bps: 10_000_000,
+        ..SrtUrlOptions::default()
+    })
+    .unwrap();
+    let mut receiver = KillOnDrop(
+        Command::new(&ffmpeg)
+            .args(mpv_command::ffmpeg_pipe_args(&url))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the receiving ffmpeg starts"),
+    );
+    let _ = encoder.0.wait();
+    thread::sleep(Duration::from_millis(1500));
+    let stats = viewer.srt_stats();
+    let late = viewer.srt_lateness();
+    let _ = receiver.0.kill();
+    let _ = receiver.0.wait();
+    viewer.dispose();
+    child.dispose();
+    fan.dispose();
+    host.dispose();
+
+    let copies = filter.state.lock().unwrap().copies.clone();
+    let through: Vec<&Vec<u32>> = copies.values().filter(|c| c.len() >= 3).collect();
+    println!("{TEST}: {} packets held back, {} came on a later resend; {late:?}; {stats:?}", copies.len(), through.len());
+    assert!(through.len() >= 5, "too few packets came back to show anything: {copies:?}");
+    for c in &through {
+        assert!(c.iter().all(|&ts| ts == c[0]), "a resend carries the first send's timestamp: {c:?}");
+    }
+    // what never came back is the stream's last moments: the remux child stops sending at the end of its input
+    assert!(stats.total.unrecovered as usize <= copies.len() - through.len(), "{stats:?}");
+    assert!(late.packets + 10 >= stats.total.sent && late.packets <= stats.total.sent + stats.total.resent, "{late:?} {stats:?}");
+    // the sender's own timing still shows (on Windows libsrt sends in steps of about 16 ms), but most packets come
+    // far sooner than the ones that needed two resends
+    assert!(late.p50_ms <= 30.0, "most packets come at once: {late:?}");
+    assert!(late.max_ms >= 10.0 && late.max_ms >= 2.0 * late.p50_ms, "a packet that took two resends is late by a loss report or more: {late:?}");
+    assert!(late.loss_runs >= through.len() as u64 / 2, "{late:?}");
+    // told apart: what came on its first send is late by the sender's timing, a packet that took two resends by at
+    // least one periodic loss report (in live mode libsrt sends one every (RTT + 4 RTTVar) / 2 and 20 ms at the
+    // least; the loss shows a packet or two after the gap, so a little less is measured). Until the first RTT is
+    // measured libsrt takes it as 100 ms, so a loss in the first moments waits far longer.
+    assert!(late.recovered >= through.len() as u64, "every packet that came on a resend counts as recovered: {late:?}");
+    assert!(late.recovered_p50_ms >= 15.0, "{late:?}");
+    assert!(late.first_try_max_ms < late.recovered_max_ms, "{late:?}");
 }

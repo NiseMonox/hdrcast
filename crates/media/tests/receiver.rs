@@ -246,11 +246,14 @@ mod mpv_command_line {
         // stdin is not a terminal and not a seekable file: mpv is told both
         assert_eq!(flag(&plan.mpv_args, "demuxer-lavf-format"), "mpegts");
         assert_eq!(flag(&plan.mpv_args, "input-terminal"), "no");
+        // the guard's freezes of 5 s and more: mpv brings the picture back to the sound in seconds, not minutes
+        assert_eq!(flag(&plan.mpv_args, "mc"), "1");
         let direct = build(&settings(DisplayMode::Auto), 1, "mpv");
         assert!(!direct.uses_ffmpeg_pipe());
         assert!(
             !has(&direct.mpv_args, "demuxer-lavf-format")
                 && !has(&direct.mpv_args, "input-terminal")
+                && !has(&direct.mpv_args, "mc")
         );
         assert_eq!(direct.ffmpeg_command_line(), None);
         assert_eq!(direct.to_command_line(), direct.mpv_command_line());
@@ -271,7 +274,7 @@ mod mpv_command_line {
         // stdin is not a terminal
         assert_eq!(flag(a, "input-terminal"), "no");
         // none of the buffering
-        for gone in ["cache-secs", "cache-pause-initial", "cache-pause-wait", "demuxer-readahead-secs", "demuxer-max-bytes", "video-sync", "demuxer-lavf-probesize"] {
+        for gone in ["cache-secs", "cache-pause-initial", "cache-pause-wait", "demuxer-readahead-secs", "demuxer-max-bytes", "video-sync", "demuxer-lavf-probesize", "mc"] {
             assert!(!has(a, gone), "{gone}");
         }
         for (name, value) in [
@@ -436,6 +439,7 @@ mod mpv_command_line {
             "--demuxer-lavf-probesize=5000000",
             "--demuxer-lavf-analyzeduration=2",
             "--demuxer-lavf-format=mpegts",
+            "--mc=1",
             r"--input-ipc-server=\\.\pipe\hdrcast-mpv-7",
             "--config=no",
             "--input-default-bindings=no",
@@ -1012,7 +1016,7 @@ mod receiver_settings {
     fn defaults_are_the_japan_preset() {
         let s = ReceiverSettings::default();
         assert_eq!(s.latency_ms, 1500);
-        assert_eq!(s.overhead_percent(), 25);
+        assert_eq!(s.overhead_to_ask(), 25);
         assert!(s.validate().is_empty());
         assert_eq!(s.clone().normalized(), s);
         assert_eq!(s.hw_dec, HwDecMode::D3d11va); // = the platform's hardware decoder
@@ -1068,7 +1072,50 @@ mod receiver_settings {
         s.normalize();
         assert_eq!(s.latency_ms, 3500);
         assert_eq!(s.expected_bitrate_mbps, 80);
-        assert_eq!(s.overhead_percent(), 50);
+        assert_eq!(s.overhead_to_ask(), 50);
+    }
+
+    #[test]
+    fn the_resend_headroom_is_by_the_delay_unless_it_is_set() {
+        let s = ReceiverSettings { latency_ms: 300, overhead_percent: 100, ..ReceiverSettings::default() }.normalized();
+        assert_eq!(s.overhead_to_ask(), 100);
+        let s = ReceiverSettings { latency_ms: 3500, overhead_percent: 0, ..ReceiverSettings::default() }.normalized();
+        assert_eq!(s.overhead_to_ask(), 50);
+        // out of SRT's range: into it; below zero: by the delay
+        assert_eq!(ReceiverSettings { overhead_percent: 2, ..ReceiverSettings::default() }.normalized().overhead_percent, 5);
+        assert_eq!(ReceiverSettings { overhead_percent: 500, ..ReceiverSettings::default() }.normalized().overhead_percent, 100);
+        assert_eq!(ReceiverSettings { overhead_percent: -1, ..ReceiverSettings::default() }.normalized().overhead_percent, 0);
+        // a file from before 0.3.10 has none
+        let s: ReceiverSettings = serde_json::from_str(r#"{"latencyMs":300}"#).unwrap();
+        assert_eq!((s.overhead_percent, s.overhead_to_ask()), (0, 25));
+    }
+
+    #[test]
+    fn bitrate_limits_are_per_host_and_kept_sane() {
+        let mut s = ReceiverSettings::default();
+        assert_eq!(s.bitrate_limit("hostA"), 0, "nothing asked: the host's setting");
+        s.set_bitrate_limit("hostA", 8000);
+        s.set_bitrate_limit("hostB", 200);
+        assert_eq!((s.bitrate_limit("hostA"), s.bitrate_limit("hostB")), (8000, 1000), "never below the floor");
+        s.set_bitrate_limit("hostA", 0);
+        assert_eq!(s.bitrate_limit("hostA"), 0);
+        assert!(!s.bitrate_limits.contains_key("hostA"), "taking it back leaves nothing behind");
+        // as written, and as a hand-edited file may have it
+        let text = serde_json::to_string(&s).unwrap();
+        assert!(text.ends_with(r#","bitrateLimits":{"hostB":1000}}"#), "{text}");
+        let read: ReceiverSettings =
+            serde_json::from_str(r#"{"bitrateLimits":{" hostC ":5000,"hostD":0,"":3000,"hostE":9999999}}"#).unwrap();
+        let read = read.normalized();
+        assert_eq!(read.bitrate_limits.into_iter().collect::<Vec<_>>(), [("hostC".to_string(), 5000), ("hostE".to_string(), 500_000)]);
+        let null: ReceiverSettings = serde_json::from_str(r#"{"bitrateLimits":null}"#).unwrap();
+        assert!(null.bitrate_limits.is_empty());
+        // a bounded list: the host being set stays
+        let mut many = ReceiverSettings::default();
+        for i in 0..100 {
+            many.set_bitrate_limit(&format!("host{i:03}"), 5000);
+        }
+        assert_eq!(many.bitrate_limits.len(), ReceiverSettings::MAX_BITRATE_LIMITS);
+        assert_eq!(many.bitrate_limit("host099"), 5000);
     }
 
     #[test]
@@ -1098,14 +1145,19 @@ mod receiver_settings {
             assert_eq!(s.latency_ms, preset.latency_ms);
             assert!(s.validate().is_empty());
             assert_eq!(
-                s.overhead_percent(),
+                s.overhead_to_ask(),
                 if preset.name == "China" { 50 } else { 25 }
             );
         }
         assert_eq!(
             serde_json::to_value(presets[0]).unwrap(),
-            json!({"name": "Fast", "latencyMs": 300})
+            json!({"name": "Fast", "latencyMs": 300, "bufferSeconds": 0.5})
         );
+        // the short delay comes with a short buffer; the regions keep the buffer of before
+        assert!(presets[0].buffer_seconds < 1.0);
+        assert!(presets[1..].iter().all(|p| p.buffer_seconds == ReceiverSettings::default().buffer_seconds));
+        assert_eq!(ReceiverSettings::preset_of(2000).map(|p| p.name), Some("Australia"));
+        assert_eq!(ReceiverSettings::preset_of(2001), None);
         assert_eq!(
             ReceiverSettings::TONE_MAPPING_ALGORITHMS[0],
             ReceiverSettings::DEFAULT_TONE_MAPPING

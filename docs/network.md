@@ -132,7 +132,7 @@ breaks), and they call the sharer "the host".
 
 ## 3. Delay presets per region, and why
 
-The viewer picks a preset under **Watch → Delay**. It goes with the join request to the sharer, whose remux process for
+The viewer picks a preset under **Watch → Connection → Delay**. It goes with the join request to the sharer, whose remux process for
 that viewer uses it (the China preset also raises oheadbw to 50 %). So in one session a viewer in Japan at 1.5 s and one
 in China at 3.5 s are both served as they should be. The presets were sized for a sharer in Japan:
 
@@ -144,7 +144,10 @@ in China at 3.5 s are both served as they should be. The presets were sized for 
 
 **Fast** (300 ms, oheadbw 25 %) is for remote control: the picture stays close behind, but there is little time for
 retransmissions, so it wants a clean connection over a short distance. With **Custom**, a delay of 3000 ms or more asks
-for oheadbw 50 % like China, anything shorter 25 %.
+for oheadbw 50 % like China, anything shorter 25 %. A preset sets the **Player buffer** too (Fast 0.5 s, the others
+1.5 s); the buffer and the **Resend headroom** (oheadbw: **Auto** is the rule just given, or a fixed 25 / 50 / 100 %) can
+also be set on their own, and **Behind live** adds it all up. The **Test** button next to a computer measures the line to
+it and suggests the figures (item 8).
 
 Why these values:
 
@@ -160,11 +163,16 @@ Why these values:
 4. The two ends negotiate the delay and the **larger** value wins (the sender's `peerlatency` against the receiver's
    `rcvlatency`). Both ends use the viewer's value, so what the viewer picks is what applies (measured:
    `msReceiveTsbPdDelay` / `msSendTsbPdDelay` in the API equal the value in the URL).
-5. End-to-end delay ≈ SRT on the receiving side (1.5-3.5 s) + mpv's `cache-pause-wait` (**Settings → Player buffer**,
-   1.5 s) + encoding (about 0.4 s), so about 3.5 s for Japan and 5.5 s for China. Measured on 2026-09-24 on one PC over
-   loopback (NVENC → SRT 1500 ms → mpv with the viewer's exact options; a UTC timestamp burnt into the picture, compared
-   through screenshots over IPC): **3.58 s**, the same three times, with mpv's `demuxer-cache-duration` steady at
-   1.55 s. The "ping 38 ms" in the app is the network round trip, not the picture delay.
+5. End-to-end delay ≈ SRT on the receiving side (1.5-3.5 s) + mpv's `cache-pause-wait` (**Watch → Connection → Player
+   buffer**, 1.5 s with the presets) + capturing, encoding and decoding (about 0.8 s), so about 3.8 s for Japan and
+   5.8 s for China. Measured on 2026-09-24 on one PC over loopback (NVENC → SRT 1500 ms → mpv with the viewer's exact
+   options; a UTC timestamp burnt into the picture, compared through screenshots over IPC): **3.58 s**, the same three
+   times, with mpv's `demuxer-cache-duration` steady at 1.55 s. Measured again on 2026-11-14 with a clock on the screen
+   (so the screen capture counts too) and the shortest settings a good line takes, 90 ms and 0.3 s: **1.19 s** with the
+   sharer's **Encoder preset** on **Balanced** and **0.84 s** on **Speed**, the same four times each. Besides the delay
+   and the buffer, that is the encoder's lookahead of 20 pictures and 2 B-frames on Balanced (0.35 s), mpv's sound
+   output, which holds 0.2 s that the picture waits for (the picture follows the sound), and about 0.25 s for capturing,
+   encoding, the pipes and decoding. The "ping 38 ms" in the app is the network round trip, not the picture delay.
 6. The delay decides how much **packet loss** the stream rides out (the retransmission window), not the picture quality:
    on a good line 1.5 s and 3.5 s look the same, one just runs two seconds later; quality only depends on the bitrate and
    the encoder preset. Viewers across the border in China should pick the China preset (3500 ms, oheadbw 50 %);
@@ -176,9 +184,20 @@ Why these values:
    reach twice the bitrate and packets wait up to 860 ms before their first send: with a delay of 1 s they arrived
    too late without any loss at all), and `inputbw` is the stream's real rate on the wire, not the video bitrate
    (docs/design.md §2.5, §2.6). Both logs now say how lossy the path is: the `[net]` lines (design.md §8.11).
+8. **The connection test** (**Test** next to each computer under **Watch**) joins the sharer like a viewer, with a delay
+   of 3000 ms so that nothing is cut short, and measures for 20 s how late each SRT packet arrives against its own
+   timestamp (first sends and resends apart), how many go missing, and the round trip. It suggests the shortest delay
+   that covers the latest first sends, one resend (34 ms to notice the gap + RTT + 4 × RTTVar) and as many more resends
+   as the loss rate calls for (in live mode libsrt asks again every max(20 ms, (RTT + 4 × RTTVar) / 2), not every
+   300 ms), plus 15 % and 10 ms, never below the table in item 2; a player buffer by how the line did (0.3 / 0.8 /
+   1.5 s); and a headroom of at least 1.65 × the loss rate. **Use These Settings** sets all three
+   (docs/design.md §5.1). On one PC it suggested 90 ms and 0.3 s, and watching with them held without a stall. That is
+   still far from the 21 ms of **Control mode**, which leaves out SRT's resends, the player's buffer and the encoder's
+   lookahead altogether.
 
-> Viewers can tune it themselves: if the picture keeps stalling (mpv buffering again and again), stop, add 500 ms under
-> **Watch → Delay → Custom** and connect again; on a good line go down instead.
+> Viewers can tune it themselves: run **Test** on the computer they watch (item 8), or, if the picture keeps stalling
+> (mpv buffering again and again), stop, add 500 ms under **Watch → Connection → Delay → Custom** and connect again; on
+> a good line go down instead.
 
 ## 4. Buffer size formula (a must, or high bitrates drop)
 

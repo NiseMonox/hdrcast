@@ -311,6 +311,7 @@ mod tests {
             device: None,
             keyframes: true,
             low_latency: false,
+            bitrate_kbps: None,
         }
     }
 

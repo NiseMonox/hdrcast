@@ -79,6 +79,12 @@ impl GroupKeys {
         self.sub(&format!("kf/{sid}"))
     }
 
+    /// `sub("br/" + sid)`: the key a session's bitrate requests and answers are signed with (docs/design.md
+    /// §8.13).
+    pub fn bitrate_key(&self, sid: &str) -> [u8; 32] {
+        self.sub(&format!("br/{sid}"))
+    }
+
     pub fn sub(&self, label: &str) -> [u8; 32] {
         sub(&self.group_key, label)
     }
@@ -187,6 +193,10 @@ mod tests {
         assert_eq!(keys.keyframe_key(&a), hmac_sha256(&[7u8; 32], format!("hdrcast/v1/kf/{a}").as_bytes()));
         assert_ne!(keys.keyframe_key(&a), keys.control_key(&a));
         assert_ne!(keys.keyframe_key(&a), keys.keyframe_key(&b));
+        // and the bitrate requests' key
+        assert_eq!(keys.bitrate_key(&a), hmac_sha256(&[7u8; 32], format!("hdrcast/v1/br/{a}").as_bytes()));
+        assert_ne!(keys.bitrate_key(&a), keys.keyframe_key(&a));
+        assert_ne!(keys.bitrate_key(&a), keys.bitrate_key(&b));
     }
 
     #[test]

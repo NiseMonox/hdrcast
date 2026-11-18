@@ -6,6 +6,7 @@ import { useStore, editSettings, editAccess, editDevice, flushSettings, openShee
 import {
   Avatar, Disclosure, Empty, NumberField, Row, Section, Segmented, Select, Sheet, Slider, Stepper, Switch, formatDuration,
 } from '../components.js';
+import { mbpsText } from '../bitrate.js';
 
 /** The screen is being captured (live, or on request for somebody watching). */
 export function isSharing(status) {
@@ -145,6 +146,9 @@ export function SharePage() {
           <${NumberField} value=${sender.bitrateMbps} min=${1} max=${500} onChange=${(v) => set({ bitrateMbps: v })} width=${56} />
           <span class="unit">Mbps</span>
         </div>
+      <//>
+      <${Row} name=${t('share.bitrateRequests')} hint=${t('share.bitrateRequestsHint')}>
+        <${Switch} on=${sender.bitrateRequests} onChange=${(v) => set({ bitrateRequests: v })} />
       <//>
       <${Row} name=${t('share.fps')}>
         <${Segmented} value=${sender.fps} onChange=${(v) => set({ fps: v })}
@@ -331,6 +335,8 @@ function LivePanel({ status, group, sender }) {
   const enc = share.encode;
   const p2p = share.p2p;
   const dropped = (cap?.dropped || 0) + (enc?.dropFrames || 0);
+  // a viewer asked for less than the setting (docs/design.md §8.13): the stream runs at that, for everyone
+  const lowered = share.bitrate?.taken && share.bitrate.watch.kbps < share.bitrate.watch.ceilingKbps ? share.bitrate.watch : null;
   const title = failed
     ? t('share.failed')
     : starting
@@ -355,7 +361,9 @@ function LivePanel({ status, group, sender }) {
     ${!failed && html`<div class="tiles">
       <div class="tile"><div class="k">${t('share.tBitrate')}</div>
         <div class="v">${enc && enc.bitrateKbps >= 0 ? (enc.bitrateKbps / 1000).toFixed(1) : '—'}<small>Mbps</small></div>
-        <div class="s">${t('share.tTarget', { mbps: sender.bitrateMbps })}</div></div>
+        <div class="s">${lowered
+          ? t('share.tLowered', { mbps: mbpsText(lowered.kbps), who: lowered.by.join(', ') })
+          : t('share.tTarget', { mbps: sender.bitrateMbps })}</div></div>
       <div class="tile"><div class="k">${t('share.tEncode')}</div>
         <div class="v">${enc ? enc.fps.toFixed(1) : '—'}<small>fps</small></div>
         <div class="s">${enc && enc.speed >= 0 ? t('share.tSpeed', { x: enc.speed.toFixed(2) }) : ' '}</div></div>
@@ -431,6 +439,7 @@ function Viewers({ share }) {
                       ${v.net?.lossPercent >= 0.05 && html`<span>· ${t('share.loss', { p: v.net.lossPercent.toFixed(1) })}</span>`}
                       ${v.net?.lostForGood > 0 && html`<span>· ${t('share.lostForGood', { n: v.net.lostForGood })}</span>`}`
                   : html`<span class="spinner"></span><span>${t('share.connecting')}</span>`}
+                ${v.state === 'watching' && v.bitrateAskKbps > 0 && html`<span>· ${t('share.asksBitrate', { mbps: mbpsText(v.bitrateAskKbps) })}</span>`}
                 ${v.control === 'granted' && html`<span class="badge orange"><${Icon} name="cursor" style="width:11px;height:11px" />${t('control.active')}</span>`}
               </div>
             </div>

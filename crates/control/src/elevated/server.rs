@@ -5,6 +5,7 @@
 //! is made before the previous one is taken, so there is always one to connect to; each connection has a thread
 //! of its own and its own [`Replay`], which lets go of the keys it holds when the connection ends.
 
+use std::os::windows::io::AsRawHandle;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -15,7 +16,7 @@ use windows::Win32::Foundation::{CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, HLOC
 use windows::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::Storage::FileSystem::{ReadFile, FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_INBOUND};
-use windows::Win32::System::IO::CancelIoEx;
+use windows::Win32::System::IO::{CancelIoEx, CancelSynchronousIo};
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
     PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
@@ -132,7 +133,6 @@ struct Shared {
 /// The pipe server. Dropping it does not stop it; [`Server::stop`] does.
 pub struct Server {
     stop: Arc<AtomicBool>,
-    pipe: String,
     shared: Arc<Shared>,
     accept: Option<JoinHandle<()>>,
 }
@@ -143,6 +143,11 @@ impl Server {
         let descriptor = Descriptor::parse(&sddl(user_sid))?;
         let name: Vec<u16> = pipe.encode_utf16().chain(std::iter::once(0)).collect();
         let first = create_instance(&name, &descriptor, true)?;
+        Self::serve(name, descriptor, first, make)
+    }
+
+    /// Takes clients, the first of them on `first`, an instance of the pipe `name`.
+    fn serve(name: Vec<u16>, descriptor: Descriptor, first: Pipe, make: MakeInjector) -> Result<Server, String> {
         let stop = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(Shared { clients: AtomicUsize::new(0), last_gone: Mutex::new(Instant::now()), open: Mutex::new(Vec::new()) });
         let accept = {
@@ -152,7 +157,7 @@ impl Server {
                 .spawn(move || accept_loop(name, descriptor, first, make, stop, shared))
                 .map_err(|e| format!("cannot start the server thread: {e}"))?
         };
-        Ok(Server { stop, pipe: pipe.to_string(), shared, accept: Some(accept) })
+        Ok(Server { stop, shared, accept: Some(accept) })
     }
 
     /// How long nobody has been connected, or `None` while somebody is. A server nobody ever connected to counts
@@ -167,10 +172,24 @@ impl Server {
     /// Stops listening and lets go of every client, which makes each of them let go of the keys it holds.
     pub fn stop(mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        // wakes the accept thread, which is waiting for somebody to connect
-        let _ = super::client::open(&self.pipe);
         if let Some(accept) = self.accept.take() {
-            let _ = accept.join();
+            // The accept thread waits in ConnectNamedPipe for somebody to connect. That wait is cancelled, and again
+            // until the thread has seen the flag and left: a cancel that comes while it is between two waits does
+            // nothing. (Connecting to the pipe is no sure way to wake it: a client gets the instance that has listened
+            // longest, which need not be the one the thread waits on.)
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !accept.is_finished() && Instant::now() < deadline {
+                // SAFETY: the handle of a thread not joined yet, which `accept` keeps open.
+                unsafe {
+                    let _ = CancelSynchronousIo(HANDLE(accept.as_raw_handle()));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if accept.is_finished() {
+                let _ = accept.join();
+            } else {
+                super::setup::log("input: the thread that takes clients did not stop");
+            }
         }
         // The readers of the clients that are still connected are waiting in ReadFile: tell them to give up (again,
         // for one that was between two reads), then wait for them to have let go.
@@ -297,11 +316,14 @@ fn accept_loop(
             return;
         }
         if !connected {
-            // a client that gave up before it was taken; the same instance serves the next one
-            // SAFETY: the instance is ours.
-            unsafe {
-                let _ = DisconnectNamedPipe(waiting.0);
-            }
+            // A client that gave up before it was taken. Its instance is closed, not made to listen again: a client
+            // gets the instance that has listened longest, so one listening again would come after the spare, and the
+            // next client would get the spare, which nobody waits on. The spare is waited on instead.
+            let Some(next) = spare.take().or_else(|| create_instance(&name, &descriptor, false).ok()) else {
+                return;
+            };
+            waiting = next;
+            spare = create_instance(&name, &descriptor, false).map_err(|e| super::setup::log(&format!("input: {e}"))).ok();
             continue;
         }
         let refilled = create_instance(&name, &descriptor, false).map_err(|e| super::setup::log(&format!("input: {e}"))).ok();
@@ -381,9 +403,39 @@ mod tests {
     fn start(tag: &str, rec: &Recorder) -> (Server, String) {
         let sid = setup::user_sid().unwrap();
         let pipe = format!("{}-test-{tag}-{}", pipe_name(&sid), std::process::id());
+        (Server::start(&pipe, &sid, recording(rec)).expect("the server starts"), pipe)
+    }
+
+    fn recording(rec: &Recorder) -> MakeInjector {
         let rec = rec.clone();
-        let make: MakeInjector = Arc::new(move |_display| Box::new(rec.clone()));
-        (Server::start(&pipe, &sid, make).expect("the server starts"), pipe)
+        Arc::new(move |_display| Box::new(rec.clone()))
+    }
+
+    /// What making instances of a pipe by hand takes: for tests that set the pipe up before the server takes it.
+    fn by_hand(tag: &str) -> (String, Vec<u16>, Descriptor) {
+        let sid = setup::user_sid().unwrap();
+        let pipe = format!("{}-test-{tag}-{}", pipe_name(&sid), std::process::id());
+        let name = pipe.encode_utf16().chain(std::iter::once(0)).collect();
+        (pipe, name, Descriptor::parse(&sddl(&sid)).unwrap())
+    }
+
+    /// Stops the server, failing the test (rather than hanging it) when that does not end.
+    fn stop_soon(server: Server) {
+        let (stopped, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            server.stop();
+            let _ = stopped.send(());
+        });
+        assert!(done.recv_timeout(Duration::from_secs(5)).is_ok(), "the server did not stop");
+    }
+
+    /// How many instances the pipe of `instance` has.
+    fn instances(instance: &Pipe) -> u32 {
+        use windows::Win32::System::Pipes::GetNamedPipeHandleStateW;
+        let mut count = 0;
+        // SAFETY: a live instance nobody waits on; only the count is asked for.
+        let _ = unsafe { GetNamedPipeHandleStateW(instance.0, None, Some(&mut count), None, None, None) };
+        count
     }
 
     /// Like the app does: an instance that is busy at this very moment is tried again.
@@ -474,6 +526,37 @@ mod tests {
         // the client is still connected, and the server has let go for it
         assert_eq!(rec.lines()[2..], ["Char('c') up", "mod2 up"]);
         drop(client);
+    }
+
+    /// A client gets the instance that has listened longest. One that came and went before its instance was taken (the
+    /// app does that when control is given back while the input program comes up) must not leave the next client on
+    /// an instance nobody waits on.
+    #[test]
+    fn a_client_that_left_before_it_was_taken_does_not_hold_up_the_next_one() {
+        let rec = Recorder::default();
+        let (pipe, name, descriptor) = by_hand("quitter");
+        let first = create_instance(&name, &descriptor, true).unwrap();
+        let mut quitter = connect(&pipe);
+        send(&mut quitter, &[Frame::Hello(SCREEN), Frame::Pointer(9, 9)]);
+        drop(quitter);
+        let server = Server::serve(name, descriptor, first, recording(&rec)).unwrap();
+        let mut next = connect(&pipe);
+        send(&mut next, &[Frame::Hello(SCREEN), Frame::Pointer(1, 1)]);
+        assert_eq!(rec.wait_for(1), ["move 1,1"], "the next client is served at once");
+        stop_soon(server);
+    }
+
+    /// Whichever instance a connection would get, stopping reaches the thread that waits for clients.
+    #[test]
+    fn stopping_does_not_depend_on_which_instance_a_connection_gets() {
+        let rec = Recorder::default();
+        let (_, name, descriptor) = by_hand("ahead");
+        // it has listened longer than the instance the server waits on: a connection gets it first
+        let ahead = create_instance(&name, &descriptor, true).unwrap();
+        let first = create_instance(&name, &descriptor, false).unwrap();
+        let server = Server::serve(name, descriptor, first, recording(&rec)).unwrap();
+        stop_soon(server);
+        assert_eq!(instances(&ahead), 1, "the server's own instances are closed: its thread has left");
     }
 
     #[test]

@@ -17,7 +17,7 @@ use crate::control_packet::{self, PeerRole};
 use crate::link_base::{LinkAddresses, LinkCore, LinkEvents};
 use crate::peer_session::{LinkState, PeerSession};
 use crate::side_channel;
-use crate::srt_monitor::{SrtMonitor, SrtStats};
+use crate::srt_monitor::{Lateness, SrtMonitor, SrtStats};
 use crate::udp_channel::{mono_clock, UdpChannel};
 use crate::util::{lock, round_half_even, Callbacks};
 
@@ -70,7 +70,7 @@ impl ViewerLink {
         let inner = Arc::new(Inner {
             core,
             local,
-            state: Mutex::new(State { session: None, mpv: None, reported: LinkState::Punching, srt: Arc::new(SrtMonitor::new()) }),
+            state: Mutex::new(State { session: None, mpv: None, reported: LinkState::Punching, srt: Arc::new(SrtMonitor::receiving()) }),
             bytes_from_host: AtomicU64::new(0),
             state_changed: Callbacks::new(),
             side_handler: Mutex::new(None),
@@ -167,6 +167,18 @@ impl ViewerLink {
         lock(&self.inner.state).srt.snapshot()
     }
 
+    /// How late the current session's SRT packets arrived (docs/design.md §5.1).
+    pub fn srt_lateness(&self) -> Lateness {
+        let srt = lock(&self.inner.state).srt.clone();
+        srt.lateness().unwrap_or_default()
+    }
+
+    /// Measures the lateness afresh from here on (see [`SrtMonitor::restart_lateness`]).
+    pub fn restart_srt_lateness(&self) {
+        let srt = lock(&self.inner.state).srt.clone();
+        srt.restart_lateness();
+    }
+
     pub fn bytes_from_host(&self) -> u64 {
         self.inner.bytes_from_host.load(Ordering::Relaxed)
     }
@@ -179,7 +191,7 @@ impl ViewerLink {
             let mut state = lock(&self.inner.state);
             state.reported = LinkState::Punching;
             if state.session.as_ref().is_none_or(|s| s.sid() != sid) {
-                state.srt = Arc::new(SrtMonitor::new());
+                state.srt = Arc::new(SrtMonitor::receiving());
             }
             state.session.replace(Arc::new(next))
         };

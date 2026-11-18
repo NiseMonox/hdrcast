@@ -7,6 +7,8 @@
 //!   mpv's last log lines and `receiver.json`.
 //! * [`keyframe`]: keyframes on request (§8.12), the datagrams a viewer and its host exchange about them and
 //!   when the host's encoder makes one.
+//! * [`bitrate`]: a lower bitrate on a viewer's request (§8.13), the datagrams about it and what each of the host's
+//!   streams runs at.
 //! * [`low_latency`]: control mode (§11), the stream for remote control without SRT and without a buffer: pictures
 //!   in sealed datagrams with Reed-Solomon parity, keyframe requests, reports, and the sound.
 //!
@@ -24,6 +26,7 @@ mod numfmt;
 mod settings_file;
 mod text;
 
+pub mod bitrate;
 pub mod keyframe;
 pub mod low_latency;
 pub mod receiver;
