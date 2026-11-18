@@ -281,10 +281,10 @@ fn macos_looks_in_the_bundle_then_path_then_homebrew_then_the_mpv_app() {
         ]
         .map(PathBuf::from)
     );
-    // only mpv has an app of its own
+    // only mpv has an app of its own (ffmpeg has Homebrew's ffmpeg-full instead: see the next test)
     let ffmpeg = tool_locator::candidates(Platform::MacOs, "ffmpeg", app_dir, None);
     assert_eq!(ffmpeg.last(), Some(&PathBuf::from("/usr/local/bin/ffmpeg")));
-    assert_eq!(ffmpeg.len(), 5);
+    assert_eq!(ffmpeg.len(), 7);
 
     // a Homebrew ffmpeg is found even with the bare PATH an app started from Finder gets
     let brew = files(&["/opt/homebrew/bin/ffmpeg"]);
@@ -299,4 +299,42 @@ fn macos_looks_in_the_bundle_then_path_then_homebrew_then_the_mpv_app() {
     for platform in [Platform::Windows, Platform::Other] {
         assert_eq!(tool_locator::candidates(platform, "mpv", app_dir, None).len(), 2, "{platform:?}");
     }
+}
+
+#[test]
+fn macos_takes_ffmpeg_from_homebrews_ffmpeg_full_before_path() {
+    // Homebrew's plain ffmpeg has no libsrt; ffmpeg-full has it, but is keg-only, so it is on nobody's PATH
+    let app_dir = Path::new("/Applications/HdrCast.app/Contents/MacOS");
+    let ffmpeg = tool_locator::candidates(Platform::MacOs, "ffmpeg", app_dir, Some("/usr/bin"));
+    assert_eq!(
+        ffmpeg,
+        [
+            "/Applications/HdrCast.app/Contents/MacOS/ffmpeg",
+            "/Applications/HdrCast.app/Contents/MacOS/tools/ffmpeg",
+            "/Applications/HdrCast.app/Contents/Resources/tools/ffmpeg",
+            "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg",
+            "/usr/local/opt/ffmpeg-full/bin/ffmpeg",
+            "/usr/bin/ffmpeg",
+            "/opt/homebrew/bin/ffmpeg",
+            "/usr/local/bin/ffmpeg",
+        ]
+        .map(PathBuf::from)
+    );
+    let ffprobe = tool_locator::candidates(Platform::MacOs, "ffprobe", app_dir, None);
+    assert_eq!(ffprobe[3], PathBuf::from("/opt/homebrew/opt/ffmpeg-full/bin/ffprobe"));
+
+    // with both installed ffmpeg-full is taken, even when a terminal's PATH has the plain one
+    let both = files(&["/opt/homebrew/bin/ffmpeg", "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg"]);
+    let found = tool_locator::find_in(Platform::MacOs, "ffmpeg", app_dir, Some("/opt/homebrew/bin:/usr/bin"), |p| both.contains(p));
+    assert_eq!(found, Some(PathBuf::from("/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg")));
+    // and a bundled one still wins over it
+    let bundled = files(&["/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg", "/Applications/HdrCast.app/Contents/Resources/tools/ffmpeg"]);
+    let found = tool_locator::find_in(Platform::MacOs, "ffmpeg", app_dir, None, |p| bundled.contains(p));
+    assert_eq!(found, Some(PathBuf::from("/Applications/HdrCast.app/Contents/Resources/tools/ffmpeg")));
+
+    // not for mpv, and not on the other platforms
+    let has_full = |list: Vec<PathBuf>| list.iter().any(|p| p.to_string_lossy().contains("ffmpeg-full"));
+    assert!(!has_full(tool_locator::candidates(Platform::MacOs, "mpv", app_dir, None)));
+    assert!(!has_full(tool_locator::candidates(Platform::Windows, "ffmpeg.exe", app_dir, None)));
+    assert!(!has_full(tool_locator::candidates(Platform::Other, "ffmpeg", app_dir, None)));
 }
